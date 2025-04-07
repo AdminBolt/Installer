@@ -16,7 +16,7 @@ wget https://license.adminbolt.com/mirrorlist/any/any/adminbolt-bash-installer-d
 
 FOR SPECIFIC VERSION:
 ```
-wget https://license.adminbolt.com/mirrorlist/any/any/adminbolt-bash-installer-0.2.7-dev.sh && chmod +x adminbolt-bash-installer-0.2.7-dev.sh && ./adminbolt-bash-installer-0.2.7-dev.sh
+wget https://license.adminbolt.com/mirrorlist/any/any/adminbolt-bash-installer-0.2.9-dev.sh && chmod +x adminbolt-bash-installer-0.2.9-dev.sh && ./adminbolt-bash-installer-0.2.9-dev.sh
 ```
 
 The admin panel can be opened on port: https://yourserver-ip.com:8443
