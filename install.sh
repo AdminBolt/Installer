@@ -79,6 +79,7 @@ DEPENDENCIES_LIST=(
 	"supervisor"
 	"libsodium"
 	"libsodium-devel"
+	"lsb_release"
     "bolt-php"
     "bolt-nginx"
     "bolt-updater"
