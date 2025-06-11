@@ -5,7 +5,7 @@ To install AdminBolt, you need to run this commands:
 
 FOR STABLE:
 ```
-wget https://license.adminbolt.com/mirrorlist/any/any/adminbolt-bash-installer-stable.sh && chmod +x adminbolt-bash-installer-stable.sh && ./adminbolt-bash-installer-stable.sh
+cd /home && curl -o install -L https://raw.githubusercontent.com/AdminBolt/Installer/refs/heads/main/install.sh && sh install
 ```
 
 The admin panel can be opened on port: https://yourserver-ip.com:8443
