@@ -1,312 +1,285 @@
 #!/bin/bash
+#
+# AdminBolt Install Script (AlmaLinux 9 only)
+#
+# Reorganizes the installation into three stages:
+#   Stage 1: Check that everything is in place and ready for installation
+#   Stage 2: (2.1) Prepare settings → (2.2) Install prerequisite packages → (2.3) Install all Bolt packages
+#   Stage 3: Execute bolt-cli / post-install actions (database, agent, services, profiles, etc.)
+#
+# Supported: AlmaLinux 9 only. Panel is installed from RPM; %pre/%post skipped.
+# Usage:
+#   sudo ./install.sh                          # install latest bolt-panel from repo
+#   sudo ./install.sh --version=1.0.0.beta3-v46.el9 # install specific bolt-panel version from repo
+#
+set -e
 
-# Color definitions
-RED="\e[31m"
-GREEN="\e[32m"
-YELLOW="\e[33m"
-BLUE="\e[34m"
-CYAN="\e[36m"
-BOLD="\e[1m"
-RESET="\e[0m"
+# ---------------------------------------------------------------------------
+# bolt-panel install: from repo (latest by default; --version= selects a specific version)
+# ---------------------------------------------------------------------------
+PANEL_VERSION=""
+readonly WEB_INSTALL_ROOT="/usr/local/bolt/web"
+readonly POST_INSTALL_DB_PATH="/var/lib/adminbolt/db.sqlite3"
 
-# Get terminal width or fallback to 80
-TERM_WIDTH=$(tput cols 2>/dev/null || echo 80)
-LINE=$(printf '%*s' "${TERM_WIDTH}" '' | tr ' ' '-')
+# Colors
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+CYAN='\033[0;36m'
+BOLD='\033[1m'
+NC='\033[0m'
 
-# Group and user parameters
-GROUP_NAME="boltweb"
-GROUP_ID="801"
-USER_NAME="boltweb"
-USER_ID="801"
-USER_HOME="/usr/local/bolt"
-USER_SHELL="/sbin/nologin"
+REPO_BASE_URL="https://cdn-mirror.adminbolt.com/pulp/content/adminbolt"
+REPO_PACKAGE="bolt-repo-1.0.7-1"
 
-# Check if the user is root
-if [[ ${EUID} -ne 0 ]]; then
-	echo "This script must be run as root. Exiting..."
-	exit 1
-fi
+print_error() { echo -e "${RED}ERROR:${NC} $1" >&2; }
+print_success() { echo -e "${GREEN}SUCCESS:${NC} $1"; }
+print_info() { echo -e "${YELLOW}INFO:${NC} $1"; }
 
-# Check if the user is running a 64-bit system
-if [[ $(uname -m) != "x86_64" ]]; then
-	echo "This script must be run on a 64-bit system. Exiting..."
-	exit 1
-fi
+time_section_end() {
+    local label="$1"
+    echo -e "${CYAN}[TIMING]${NC} ${label}: $(($(date +%s) - SECTION_START))s"
+}
+time_total_end() {
+    echo -e "\n${BOLD}${CYAN}[TIMING] Total install: $(($(date +%s) - TOTAL_START))s${NC}\n"
+}
 
-# Check if the user is running a supported shell
-if [[ $(echo ${SHELL}) != "/bin/bash" ]]; then
-	echo "This script must be run on a system running Bash. Exiting..."
-	exit 1
-fi
-
-# Check if the user is running a supported OS
-if [[ $(uname -s) != "Linux" ]]; then
-	echo "This script must be run on a Linux system. Exiting..."
-	exit 1
-fi
-
-echo -e ""
-echo -e "${LINE}"
-echo -e "${BOLD}INSTALLING REPOSITORIES ${RESET}"
-echo -e "${LINE}"
-# System Update and Repositories
-dnf update -y && echo "✅ System updated!" || echo "❌ System update failed!"
-dnf install epel-release -y && echo "✅ EPEL repository installed!" || echo "❌ EPEL repository install failed!"
-dnf config-manager --set-enabled epel && echo "✅ EPEL repository enabled!" || echo "❌ EPEL repository enable failed!"
-dnf config-manager --set-enabled crb && echo "✅ CRB repository enabled!" || echo "❌ CRB repository enable failed!"
-
-wget https://raw.githubusercontent.com/AdminBolt/Install/refs/heads/main/almalinux-9.5/repos/bolt.repo -q && echo "✅ Bolt repository downloaded!" || echo "❌ Bolt repository download failed!"
-mv bolt.repo /etc/yum.repos.d/bolt.repo && echo "✅ Bolt repository installed!" || echo "❌ Bolt repository install failed!"
-
-
-echo -e ""
-echo -e "${LINE}"
-echo -e "${BOLD}INSTALLING PACKAGES ${RESET}"
-echo -e "${LINE}"
-# Install Required Dependencies
-DEPENDENCIES_LIST=(
-	"sudo"
-	"apg"
-	"openssl"
-	"jq"
-	"curl"
-	"wget"
-	"unzip"
-	"zip"
-	"tar"
-	"gnupg2"
-	"ca-certificates"
-	"supervisor"
-	"libsodium"
-	"libsodium-devel"
-	"lsb_release"
-    "bolt-php"
-    "bolt-nginx"
-    "bolt-updater"
-)
-for DEP in "${DEPENDENCIES_LIST[@]}"; do
-    RPM_QUERY=$(rpm -q "$DEP" 2>&1)  # Capture both output and error
-    if [ $? -eq 0 ]; then
-        echo -e "✅ $DEP is already installed: ${RPM_QUERY}"
-    else
-        echo -e "⚠️ $DEP is not installed. rpm output: ${RPM_QUERY}"
-        echo -e "Installing $DEP..."
-        dnf install -y "$DEP"
+# Check if port 8443 is free, or already used by an existing bolt-nginx.
+# If used by some other service, abort installation early.
+check_port_8443() {
+    # ss is part of iproute2 on AlmaLinux 9
+    if ! command -v ss >/dev/null 2>&1; then
+        print_error "ss command not found; cannot check port 8443 usage"
+        exit 1
     fi
-done
 
-# Create boltweb User
-echo -e ""
-echo -e "${LINE}"
-echo -e "${BOLD}CREATING SYSTEM USER ${RESET}"
-echo -e "${LINE}"
+    local line
+    line=$(ss -tulpn 2>/dev/null | awk '$5 ~ /:8443$/ {print}')
+    if [ -z "$line" ]; then
+        # Port not in use
+        return 0
+    fi
 
-# Create system group
-if getent group "${GROUP_NAME}" >/dev/null; then
-	echo -e "✅ Group '${GROUP_NAME}' already exists."
-else
-	echo -e "Creating group '${GROUP_NAME}' with GID ${GROUP_ID}..."
-	if groupadd --system --gid "${GROUP_ID}" "${GROUP_NAME}"; then
-		echo -e "✅ Group '${GROUP_NAME}' created."
-	else
-		echo -e "❌ Failed to create group '${GROUP_NAME}'."
-		exit 1
-	fi
-fi
+    if echo "$line" | grep -q "nginx"; then
+        print_info "Port 8443 is already used by an existing bolt-nginx; proceeding with reinstall"
+        return 0
+    fi
 
-# Create system user
-if id "${USER_NAME}" >/dev/null 2>&1; then
-	echo -e "✅ User '${USER_NAME}' already exists."
-else
-	echo -e "Creating user '${USER_NAME}' with UID ${USER_ID}..."
-	if useradd --uid "${USER_ID}" --gid "${GROUP_ID}" --home "${USER_HOME}" --shell "${USER_SHELL}" "${USER_NAME}"; then
-		echo -e "✅ User '${USER_NAME}' created."
-	else
-		echo -e "❌ Failed to create user '${USER_NAME}'."
-		exit 1
-	fi
-fi
-
-echo -e ""
-echo -e "${LINE}"
-echo -e "${BOLD}INSTALLING BOLT REPOSITORIES ${RESET}"
-echo -e "${LINE}"
-# Atomic Repo (optional tools)
-# sudo wget -q -O - http://www.atomicorp.com/installers/atomic | sh
-
-# Add AdminBolt Greeting and Repos
-wget https://raw.githubusercontent.com/AdminBolt/Install/refs/heads/main/almalinux-9.5/greeting.sh -q && echo "✅ Greeting text downloaded!" || echo "❌ Greeting text download failed!"
-mv greeting.sh /etc/profile.d/bolt-greeting.sh && echo "✅ Greeting text installed!" || echo "❌ Greeting text install failed!"
-
-echo -e ""
-echo -e "${LINE}"
-echo -e "${BOLD}INSTALLING ADMINBOLT PANEL ${RESET}"
-echo -e "${LINE}"
-
-# Create folder if it doesn't exist
-if [ ! -d /usr/local/bolt ]; then
-    mkdir -p /usr/local/bolt
-    chown boltweb:boltweb /usr/local/bolt
-    chmod 750 /usr/local/bolt
-    dnf reinstall -y bolt-php bolt-nginx bolt-updater
-else
-    echo "✅ /usr/local/bolt exists..."
-fi
-
-# Find latest stable version of AdminBolt Panel
-GET_LATEST_ADMINBOLT_VERSION=$(curl -s "https://license.adminbolt.com/api/get-latest-version-of-package?os=any&os_version=any&name=adminbolt-web&branch=stable")
-ADMINBOLT_VERSION=$(echo "$GET_LATEST_ADMINBOLT_VERSION" | jq -r '.latest_version')
-DOWNLOAD_LINK=$(echo "$GET_LATEST_ADMINBOLT_VERSION" | jq -r '.package.download_link')
-if [[ -z "$ADMINBOLT_VERSION" || -z "$DOWNLOAD_LINK" ]]; then
-    echo -e "${RED}❌ Failed to retrieve the latest version or download link. Exiting...${RESET}"
+    print_error "Port 8443 is already in use by another service. Please free it before running this installer."
+    echo "Current listener:"
+    echo "$line"
     exit 1
-fi
+}
 
-echo -e "✅ Latest AdminBolt Panel version: ${ADMINBOLT_VERSION}"
+# ---------- Stage 1: Check ready for installation ----------
+stage_prerequisites() {
+    print_info "Stage 1: Checking that everything is in place and ready for installation"
+    # Root
+    if [ "$EUID" -ne 0 ]; then
+        print_error "This script must be run as root (use sudo)"
+        exit 1
+    fi
+    # Distro: AlmaLinux 9 only
+    local distro_info
+    if ! distro_info=$(detect_distribution); then
+        print_error "This script supports AlmaLinux 9 only. Current system is not AlmaLinux 9."
+        exit 1
+    fi
+    print_success "Detected: AlmaLinux 9"
+    # Required commands
+    for cmd in curl; do
+        if ! command -v "$cmd" >/dev/null 2>&1; then
+            print_error "Required command not found: $cmd"
+            exit 1
+        fi
+    done
+    check_port_8443
+    print_success "Stage 1 completed: ready for installation"
+}
 
-# Download and Extract AdminBolt Panel
-{
-    wget $DOWNLOAD_LINK -O adminbolt-cp.zip -q
-} && echo "✅ AdminBolt Panel downloaded!" || echo "❌ AdminBolt Panel download failed!"
+# Detect distribution: AlmaLinux 9 only
+detect_distribution() {
+    if [ ! -f /etc/os-release ]; then
+        return 1
+    fi
+    . /etc/os-release
+    [[ "$ID" != "almalinux" ]] && return 1
+    [[ "$VERSION_ID" =~ ^9(\.[0-9]*)?$ ]] || return 1
+    echo "almalinux|9"
+    return 0
+}
 
-{
-unzip -qq -o adminbolt-cp.zip -d /usr/local/bolt/web
-} && echo "✅ AdminBolt Panel deployed!" || echo "❌ AdminBolt Panel deploy failed!"
+# ---------- Stage 2: Install base packages ----------
+install_repo_rhel() {
+    local el_version=$1
+    local rpm_url="${REPO_BASE_URL}/rhel/${el_version}/noarch/Packages/b/${REPO_PACKAGE}.el${el_version}.noarch.rpm"
+    local temp_rpm="/tmp/bolt-repo-${el_version}.rpm"
+    print_info "Downloading repository package..."
+    curl -f -L -k -o "$temp_rpm" "$rpm_url" || { print_error "Failed to download repo"; exit 1; }
+    (command -v dnf >/dev/null 2>&1 && dnf install -y "$temp_rpm") || (command -v yum >/dev/null 2>&1 && yum install -y "$temp_rpm") || rpm -ivh "$temp_rpm"
+    rm -f "$temp_rpm"
+    print_success "Repository installed"
+}
 
-rm -rf adminbolt-cp.zip
+# Single package install helper: dnf or yum only (AlmaLinux). Skips already-installed. Optional leading args: dnf opts (e.g. --enablerepo=bolt, --exclude=bolt-bootstrap).
+install_packages() {
+    local dnf_opts=()
+    while [[ $# -gt 0 && "$1" == --* ]]; do dnf_opts+=("$1"); shift; done
+    [[ $# -eq 0 ]] && return 0
+    local missing=()
+    for p in "$@"; do rpm -q "$p" &>/dev/null || missing+=("$p"); done
+    [[ ${#missing[@]} -eq 0 ]] && { print_success "Packages already installed"; return 0; }
+    (command -v dnf >/dev/null 2>&1 && dnf install -y "${dnf_opts[@]}" "${missing[@]}") || (command -v yum >/dev/null 2>&1 && yum install -y "${dnf_opts[@]}" "${missing[@]}") || { print_error "dnf/yum not found"; exit 1; }
+    print_success "Packages installed"
+}
 
-echo -e ""
-echo -e "${LINE}"
-echo -e "${BOLD}INSTALLING ADMINBOLT PANEL ${RESET}"
-echo -e "${LINE}"
+run_or_warn() {
+    local cmd="$1" desc="${2:-Command}"
+    print_info "$desc"
+    if eval "$cmd"; then print_success "$desc completed"; else echo -e "${YELLOW}WARNING:${NC} $desc failed (continuing)"; fi
+    echo -e ""
+}
+run_or_fail() {
+    local cmd="$1" desc="${2:-Command}"
+    if ! eval "$cmd"; then print_error "${desc} failed"; exit 1; fi
+    print_success "${desc} completed"
+    echo -e ""
+}
 
-# Install SSL Certificates
-mkdir -p /usr/local/bolt/ssl
-{
-    cp /usr/local/bolt/web/server/ssl/bolt.crt /usr/local/bolt/ssl/bolt.crt
-    cp /usr/local/bolt/web/server/ssl/bolt.key /usr/local/bolt/ssl/bolt.key
-    cp /usr/local/bolt/web/server/ssl/bolt.chain /usr/local/bolt/ssl/bolt.chain
-} && echo "✅ Installed SSL Certificates!" || echo "❌ Install SSL Certificates failed!"
+# ---------- Stage 2: Prepare → Prerequisite packages → Bolt packages ----------
+# Step 2.1: Prepare all settings (no package installs)
+stage2_prepare_settings() {
+    print_info "Stage 2.1: Preparing settings"
+    run_or_warn "setenforce 0" "SELinux enforce"
+    run_or_warn "sed -i 's#^SELINUX=.*#SELINUX=disabled#' /etc/selinux/config" "SELinux config"
+    print_success "Stage 2.1 completed: settings prepared"
+}
 
-# Apply NGINX & PHP Configuration
-{
-    mkdir -p /usr/local/bolt/nginx/conf
-    cp /usr/local/bolt/web/server/nginx/nginx.conf /usr/local/bolt/nginx/conf/nginx.conf
+# Step 2.2: Install all prerequisite packages (EPEL, CRB, libsodium, traceroute, openssl, jq, etc.)
+stage2_install_prerequisite_packages() {
+    print_info "Stage 2.2: Installing prerequisite packages"
+    print_info "Enabling CRB (CodeReady Builder) repository"
+    install_packages epel-release dnf-plugins-core
+    run_or_warn "dnf config-manager --set-enabled crb" "Enable CRB repo"
+    install_packages \
+        libsodium traceroute openssl jq rsync ca-certificates wget curl tar gzip unzip zip sudo apg \
+        systemd openssl-libs libcurl libzip zlib gmp freetype libjpeg-turbo libpng libwebp libXpm gd \
+        gettext-libs libicu sqlite-libs oniguruma libxslt shadow-utils
+    run_or_warn "curl https://get.acme.sh | sh -s email=issue-ssl@adminbolt.com" "acme.sh"
+    print_success "Stage 2.2 completed: prerequisite packages installed"
+}
 
-    mkdir -p /usr/local/bolt/php/etc
-    cp /usr/local/bolt/web/server/php/php-fpm.conf /usr/local/bolt/php/etc/php-fpm.conf
+# Step 2.3: Install all Bolt packages (repo, bolt-nginx/php/agent, panel RPM)
+stage2_install_bolt_packages() {
+    print_info "Stage 2.3: Installing all Bolt packages"
+    install_repo_rhel 9
+    local panel_pkg="bolt-panel"
+    if [[ -n "$PANEL_VERSION" ]]; then
+        panel_pkg="bolt-panel-${PANEL_VERSION}"
+        print_info "Installing specific bolt-panel version: ${PANEL_VERSION}"
+    fi
+    install_packages --enablerepo=bolt bolt-agent bolt-nginx bolt-php "$panel_pkg"
+    systemctl enable --now bolt-nginx bolt-php
+    print_success "Stage 2.3 completed: all Bolt packages installed"
+}
 
-    mkdir -p /usr/local/bolt/php/lib
-    cp /usr/local/bolt/web/server/php/php.ini /usr/local/bolt/php/lib/php.ini
-} && echo "✅ NGINX & PHP Configuration applied!" || echo "❌ NGINX & PHP Configuration failed!"
+stage_install_base_packages() {
+    print_info "Stage 2: Prepare settings → Prerequisite packages → Bolt packages"
+    SECTION_START=$(date +%s)
+    stage2_prepare_settings
+    time_section_end "Stage 2.1: Prepare settings"
+    SECTION_START=$(date +%s)
+    stage2_install_prerequisite_packages
+    time_section_end "Stage 2.2: Prerequisite packages"
+    SECTION_START=$(date +%s)
+    stage2_install_bolt_packages
+    time_section_end "Stage 2.3: Bolt packages"
+    print_success "Stage 2 completed"
+}
 
-echo -e ""
-echo -e "${LINE}"
-echo -e "${BOLD}SET OWNERSHIP AND PERMISSIONS ${RESET}"
-echo -e "${LINE}"
+# ---------- Stage 3: Execute bolt-cli / Install services ----------
+stage_configuration() {
+    print_info "Stage 3: Executing bolt-cli / post-install actions"
+    run_or_fail "bolt-cli request-trial-license" "Request trial licence"
+    run_or_fail "bolt-cli connect-bolt-agent-with-panel" "Connect bolt-agent to panel"
 
-# Set Ownership and Permissions
-{
-    # Ensure the boltweb user owns the /usr/local/bolt directory
-    chown -R boltweb:boltweb /usr/local/bolt
-    chmod 750 /usr/local/bolt
-} && echo "✅ Ownership and permissions set for /usr/local/bolt!" || echo "❌ Ownership and permissions failed!"
+    run_or_warn "bolt-cli manage-nftable --action=install" "Nftable"
+    run_or_warn "bolt-cli manage-powerdns --action=install" "PowerDNS"
+    run_or_warn "bolt-cli manage-mariadb --action=install" "MariaDB"
+    run_or_warn "bolt-cli manage-postfix --action=install" "Postfix"
+    run_or_warn "bolt-cli manage-dovecot --action=install" "Dovecot"
+    run_or_warn "bolt-cli manage-redis --action=install" "Redis"
+    run_or_warn "bolt-cli manage-rspamd --action=install" "Rspamd"
+    run_or_warn "bolt-cli manage-mlmmj --action=install" "MLMMJ"
+    run_or_warn "bolt-cli manage-php --action=install --php-version=8.4" "PHP 8.4"
+    run_or_warn "bolt-cli manage-my-apache --action=install" "MyApache"
+    run_or_warn "bolt-cli manage-vsftpd --action=install" "Vsftpd"
+    run_or_warn "bolt-cli manage-fail2ban --action=install" "Fail2Ban"
+    for app in local-api filemanager phpmyadmin roundcube git metrics adminer; do
+        run_or_warn "bolt-php ${WEB_INSTALL_ROOT}/artisan bolt:manage-app --action=install --app-name=${app}" "App ${app}"
+    done
+    sleep 5
+    run_or_warn "bolt-cli manage-postfix-profiles --action=install" "Postfix profiles"
+    run_or_warn "bolt-cli manage-dovecot-profiles --action=install" "Dovecot profiles"
+    run_or_warn "bolt-cli manage-redis-profiles --action=install" "Redis profiles"
+    run_or_warn "bolt-cli manage-rspamd-profiles --action=install" "Rspamd profiles"
+    run_or_warn "bolt-cli setup-firewall" "Firewall setup"
+    run_or_warn "bolt-cli manage-mariadb-default-profile --action=install" "MariaDB profile"
+    run_or_warn "bolt-cli manage-my-apache-default-profile --action=install" "MyApache profile"
+    run_or_warn "bolt-cli manage-system-email-account --action=install" "System email"
+    run_or_warn "bolt-cli manage-dns-records-default-template --action=install" "DNS template"
+    run_or_warn "bolt-cli manage-php-default-profile --php-version=8.4 --action=install" "PHP 8.4 profile"
+    run_or_warn "bolt-cli manage-vsftpd-profiles --action=install" "Vsftpd profile"
+    run_or_warn "bolt-cli manage-fail2ban-profiles --action=install" "Fail2Ban profile"
+    run_or_warn "bolt-cli setup-cron-jobs" "Setup Cron jobs"
+    local SSO_URL=$(bolt-cli admin-sso-generate 2>/dev/null || echo "")
+    [ -z "${SSO_URL}" ] && echo -e "${YELLOW}WARNING:${NC} SSO URL not generated" || print_success "SSO URL generated"
+    echo -e "\n${BOLD}${GREEN}+----------------------------------------------------------+${NC}"
+    echo -e "${BOLD}${GREEN}|          Installation Completed Successfully             |${NC}"
+    echo -e "${BOLD}${GREEN}+----------------------------------------------------------+${NC}\n"
+    [ -n "${SSO_URL:-}" ] && echo -e "${BOLD}${CYAN}--- Access ---${NC}\n${GREEN}Admin Panel:${NC}\n${BOLD}${SSO_URL}${NC}\n"
+    echo -e "${GREEN}New SSO URL:${NC}\n${BOLD}bolt-cli admin-sso-generate${NC}"
+    print_success "Stage 3 completed: all post-install actions done"
+}
 
-{
-    # Set 750 for directories
-    find /usr/local/bolt -type d -exec chmod 750 {} \;
-    # Set 640 for regular files
-    find /usr/local/bolt -type f -exec chmod 640 {} \;
-} && echo "✅ Permissions set for directories and files!" || echo "❌ Permissions set for directories and files failed!"
+# ---------- Main ----------
+print_usage() {
+    echo "Usage: sudo $0 [--help] [--version=<PANEL_VERSION>]"
+    echo "AlmaLinux 9 only. Stages: 1=ready check, 2=(2.1 settings, 2.2 prereq packages, 2.3 bolt packages), 3=post-install."
+    echo "If --version is not provided, latest bolt-panel from repo is installed."
+}
 
-{
-    # Set +x for scripts and artisan
-    chmod +x /usr/local/bolt/php/sbin/bolt-php-fpm
-    chmod +x /usr/local/bolt/nginx/sbin/bolt-nginx
-    find /usr/local/bolt -type f -name "*.sh" -exec chmod +x {} \;
-    find /usr/local/bolt -type f -name "*artisan*" -exec chmod +x {} \;
-} && echo "✅ Permissions set for scripts and artisan!" || echo "❌ Permissions set for scripts and artisan failed!"
+main() {
+    case "${1:-}" in
+        -h|--help)
+            print_usage
+            exit 0
+            ;;
+    esac
 
-{
-    # Set Web Permissions
-    chmod -R o+w /usr/local/bolt/web/storage/
-    chmod -R o+w /usr/local/bolt/web/bootstrap/cache/
-} && echo "✅ Permissions set for webapp work directories!" || echo "❌ Permissions set for webapp directories failed!"
+    # Parse --version=... argument (simple key=value style)
+    local version_arg="${1:-}"
+    if [[ "$version_arg" == --version=* ]]; then
+        PANEL_VERSION="${version_arg#--version=}"
+    else
+        PANEL_VERSION=""
+    fi
+    echo -e "\n${BOLD}AdminBolt Staged Install (Stage 1 → 2 → 3)${NC}\n"
+    TOTAL_START=$(date +%s)
 
-{
-    # Set Permissions and Shell Tools
-    ln -sf /usr/local/bolt/php/bin/php /usr/bin/bolt-php
-    chmod +x /usr/local/bolt/php/bin/php
-    ln -sf /usr/local/bolt/web/bolt-shell.sh /usr/bin/bolt-shell
-    chmod +x /usr/local/bolt/web/bolt-shell.sh
-    ln -sf /usr/local/bolt/web/bolt-cli.sh /usr/bin/bolt-cli
-    chmod +x /usr/local/bolt/web/bolt-cli.sh
-} && echo "✅ Permissions set for Shell Tools!" || echo "❌ Permissions set for Shell Tools failed!"
+    SECTION_START=$(date +%s)
+    stage_prerequisites
+    time_section_end "Stage 1: Prerequisites"
 
-echo -e ""
-echo -e "${LINE}"
-echo -e "${BOLD}SENDING INSTALLATION STATS TO ADMINBOLT API... ${RESET}"
-echo -e "${LINE}"
+    SECTION_START=$(date +%s)
+    stage_install_base_packages
+    time_section_end "Stage 2: Base packages"
 
-# Log OS Info to AdminBolt API
-HOSTNAME=$(hostname)
-IP_ADDRESS=$(hostname -I | cut -d " " -f 1)
-DISTRO_VERSION=$(grep -w "VERSION_ID" /etc/os-release | cut -d '"' -f 2)
-DISTRO_NAME=$(grep -w "NAME" /etc/os-release | cut -d '"' -f 2)
-LOG_JSON='{"os": "'$DISTRO_NAME-$DISTRO_VERSION'", "host_name": "'$HOSTNAME'", "ip": "'$IP_ADDRESS'"}'
-RESPONSE=$(curl -s -o /dev/null -w "%{http_code}" https://adminbolt.com/api/bolt-installation-log \
-  -X POST -H "Content-Type: application/json" -d "$LOG_JSON")
+    SECTION_START=$(date +%s)
+    stage_configuration
+    time_section_end "Stage 3: Post-install actions"
 
-if [[ "${RESPONSE}" = "200" ]]; then
-    echo -e "✅ Installation log sent successfully."
-else
-    echo -e "❌ Failed to send log to AdminBolt API (HTTP ${RESPONSE})."
-fi
+    time_total_end
+}
 
-echo -e ""
-echo -e "${LINE}"
-echo -e "${BOLD}START BOLT SERVICES ${RESET}"
-echo -e "${LINE}"
-{
-    # Start Bolt Services
-    service bolt start
-} && echo "✅ Bolt Services started!" || echo "❌ Bolt Services failed to start!"
-
-echo -e ""
-echo -e "${LINE}"
-echo -e "${BOLD}INSTALLING HOSTING SERVICES... ${RESET}"
-echo -e "${LINE}"
-
-# Install all required packages in one go
-dnf install -y \
-  yum-utils \
-  supervisor \
-  bolt-securebox \
-  git \
-  fail2ban \
-  traceroute \
-  vsftpd \
-  pam-devel \
-  libdb-utils \
-  gcc \
-  make \
-  firewalld \
-  sscg \
-  mod_maxminddb \
-  mod_security \
-  mod_ssl \
-  mod_suphp \
-  php84 \
-  php84-php-fpm \
-  goaccess \
-  GeoIP \
-  GeoIP-devel \
-  GeoIP-data \
-  httpd --enablerepo=bolt
-
-dnf update -y
-dnf install https://dl.fedoraproject.org/pub/epel/epel-release-latest-9.noarch.rpm -y
-dnf install https://rpms.remirepo.net/enterprise/remi-release-9.rpm -y
-
-chmod +x /usr/local/bolt/web/bolt-install.sh
-/usr/local/bolt/web/bolt-install.sh
+main "$@"
