@@ -18,7 +18,7 @@ curl -fsSL https://raw.githubusercontent.com/AdminBolt/Installer/main/install.sh
 Install a specific version:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/AdminBolt/Installer/main/install.sh -o install.sh && sudo bash install.sh --version=1.0.0.beta3-v46.el9
+curl -fsSL https://raw.githubusercontent.com/AdminBolt/Installer/main/install.sh -o install.sh && sudo bash install.sh --version=1.0.0.beta3-v3
 ```
 
 ### Option 2: Clone repository and run
@@ -32,7 +32,7 @@ sudo ./install.sh
 For a specific version:
 
 ```bash
-sudo ./install.sh --version=1.0.0.beta3-v46.el9
+sudo ./install.sh --version=1.0.0.beta3-v3
 ```
 
 ### Command reference
