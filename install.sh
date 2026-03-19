@@ -202,7 +202,7 @@ stage_configuration() {
     print_info "Stage 3: Executing bolt-cli / post-install actions"
     run_or_fail "bolt-cli request-trial-license" "Request trial licence"
     run_or_fail "bolt-cli connect-bolt-agent-with-panel" "Connect bolt-agent to panel"
-
+    run_or_warn "bolt-cli add-bolt-greeting-message" "Add bolt greeting message"
     run_or_warn "bolt-cli manage-nftable --action=install" "Nftable"
     run_or_warn "bolt-cli manage-powerdns --action=install" "PowerDNS"
     run_or_warn "bolt-cli manage-mariadb --action=install" "MariaDB"
