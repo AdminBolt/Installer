@@ -35,6 +35,7 @@ REPO_PACKAGE="bolt-repo-1.0.7-1"
 print_error() { echo -e "${RED}ERROR:${NC} $1" >&2; }
 print_success() { echo -e "${GREEN}SUCCESS:${NC} $1"; }
 print_info() { echo -e "${YELLOW}INFO:${NC} $1"; }
+print_progress() { echo -e "${CYAN}PROGRESS:${NC} $1"; }
 
 time_section_end() {
     local label="$1"
@@ -95,6 +96,7 @@ stage_prerequisites() {
     done
     check_port_8443
     print_success "Stage 1 completed: ready for installation"
+    print_progress "33% — prerequisites"
 }
 
 # Detect distribution: AlmaLinux 9 only
@@ -195,6 +197,7 @@ stage_install_base_packages() {
     stage2_install_bolt_packages
     time_section_end "Stage 2.3: Bolt packages"
     print_success "Stage 2 completed"
+    print_progress "66% — base packages"
 }
 
 # ---------- Stage 3: Execute bolt-cli / Install services ----------
@@ -239,6 +242,7 @@ stage_configuration() {
     echo -e "${BOLD}${GREEN}+----------------------------------------------------------+${NC}\n"
     [ -n "${SSO_URL:-}" ] && echo -e "${BOLD}${CYAN}--- Access ---${NC}\n${GREEN}Admin Panel:${NC}\n${BOLD}${SSO_URL}${NC}\n"
     echo -e "${GREEN}New SSO URL:${NC}\n${BOLD}bolt-cli admin-sso-generate${NC}"
+    print_progress "100% — post-install"
     print_success "Stage 3 completed: all post-install actions done"
 }
 
