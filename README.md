@@ -2,7 +2,7 @@
 
 ## Requirements
 
-- **AlmaLinux 9** (only supported distribution)
+- **AlmaLinux 9** or **Rocky Linux 9**
 - Root access (run with `sudo`)
 
 ## Installation
@@ -12,27 +12,27 @@
 Install the latest version:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/AdminBolt/Installer/main/install.sh -o install.sh && sudo bash install.sh
+curl -fsSL https://raw.githubusercontent.com/adminbolt-inc/Installer/refs/heads/main/install.sh -o install.sh && sudo bash install.sh
 ```
 
-Install a specific version:
+Install from staging source:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/AdminBolt/Installer/main/install.sh -o install.sh && sudo bash install.sh --version=1.0.0.beta3-v3
+curl -fsSL https://raw.githubusercontent.com/adminbolt-inc/Installer/refs/heads/main/install.sh -o install.sh && sudo bash install.sh --source=staging
 ```
 
 ### Option 2: Clone repository and run
 
 ```bash
-git clone https://github.com/AdminBolt/Installer.git
+git clone https://github.com/adminbolt-inc/Installer.git
 cd Installer
 sudo ./install.sh
 ```
 
-For a specific version:
+Use a specific repository source:
 
 ```bash
-sudo ./install.sh --version=1.0.0.beta3-v3
+sudo ./install.sh --source=staging
 ```
 
 ### Command reference
@@ -40,13 +40,21 @@ sudo ./install.sh --version=1.0.0.beta3-v3
 | Command | Description |
 |---------|-------------|
 | `sudo ./install.sh` | Install latest bolt-panel from repo |
-| `sudo ./install.sh --version=<VERSION>` | Install specific bolt-panel version |
+| `sudo ./install.sh --source=<stable\|staging\|testing>` | Install from a specific repository source |
 | `sudo ./install.sh --help` | Show usage information |
+
+## Install flow
+
+The installer runs in 3 stages:
+
+1. Check prerequisites (root, supported OS, required commands, port 8443 availability)
+2. Prepare system and install prerequisite/Bolt packages
+3. Run `bolt-cli` post-install actions and print access details
 
 ## Access
 
-After installation, the admin panel is available at:
+After installation, the script prints an admin SSO URL.
 
-**https://your-server-ip:8443**
+If needed, you can generate a new one with:
 
-Or use `bolt-cli admin-sso-generate` to get a one-time SSO login URL.
+`bolt-cli admin-sso-generate`

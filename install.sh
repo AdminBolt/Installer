@@ -1,16 +1,17 @@
 #!/bin/bash
 #
-# AdminBolt Install Script (AlmaLinux 9 only)
+# AdminBolt Install Script (AlmaLinux 9, Rocky Linux 9)
 #
 # Reorganizes the installation into three stages:
 #   Stage 1: Check that everything is in place and ready for installation
 #   Stage 2: (2.1) Prepare settings → (2.2) Install prerequisite packages → (2.3) Install all Bolt packages
 #   Stage 3: Execute bolt-cli / post-install actions (database, agent, services, profiles, etc.)
 #
-# Supported: AlmaLinux 9 only. Panel is installed from RPM; %pre/%post skipped.
+# Supported: AlmaLinux 9, Rocky Linux 9. Panel is installed from RPM; %pre/%post skipped.
 # Usage:
 #   sudo ./install.sh                          # install latest bolt-panel from repo
 #   sudo ./install.sh --version=1.0.0.beta3-v46.el9 # install specific bolt-panel version from repo
+#   sudo ./install.sh --source=staging         # use staging pulp repos (stable|staging|testing); default unchanged
 #
 set -e
 
@@ -18,6 +19,8 @@ set -e
 # bolt-panel install: from repo (latest by default; --version= selects a specific version)
 # ---------------------------------------------------------------------------
 PANEL_VERSION=""
+# Empty = current behavior (bolt-repo RPM from adminbolt). stable|staging|testing = pulp content path segment.
+BOLT_SOURCE=""
 readonly WEB_INSTALL_ROOT="/usr/local/bolt/web"
 readonly POST_INSTALL_DB_PATH="/var/lib/adminbolt/db.sqlite3"
 
@@ -29,7 +32,7 @@ CYAN='\033[0;36m'
 BOLD='\033[1m'
 NC='\033[0m'
 
-REPO_BASE_URL="https://cdn-mirror.adminbolt.com/pulp/content/adminbolt"
+REPO_BASE_URL="https://mirror.adminbolt.com/pulp/content/adminbolt"
 REPO_PACKAGE="bolt-repo-1.0.7-1"
 
 print_error() { echo -e "${RED}ERROR:${NC} $1" >&2; }
@@ -80,13 +83,13 @@ stage_prerequisites() {
         print_error "This script must be run as root (use sudo)"
         exit 1
     fi
-    # Distro: AlmaLinux 9 only
+    # Distro: AlmaLinux 9 or Rocky Linux 9
     local distro_info
     if ! distro_info=$(detect_distribution); then
-        print_error "This script supports AlmaLinux 9 only. Current system is not AlmaLinux 9."
+        print_error "This script supports AlmaLinux 9 and Rocky Linux 9 only. Current system is not supported."
         exit 1
     fi
-    print_success "Detected: AlmaLinux 9"
+    print_success "Detected: $distro_info"
     # Required commands
     for cmd in curl; do
         if ! command -v "$cmd" >/dev/null 2>&1; then
@@ -99,21 +102,53 @@ stage_prerequisites() {
     print_progress "33% — prerequisites"
 }
 
-# Detect distribution: AlmaLinux 9 only
+# Detect distribution: AlmaLinux 9 or Rocky Linux 9
 detect_distribution() {
     if [ ! -f /etc/os-release ]; then
         return 1
     fi
     . /etc/os-release
-    [[ "$ID" != "almalinux" ]] && return 1
+    case "$ID" in
+        almalinux|rocky) ;;
+        *) return 1 ;;
+    esac
     [[ "$VERSION_ID" =~ ^9(\.[0-9]*)?$ ]] || return 1
-    echo "almalinux|9"
+    echo "${ID}|${VERSION_ID}"
     return 0
 }
 
 # ---------- Stage 2: Install base packages ----------
+# Write bolt / bolt-noarch repos for a pulp content tier (stable, staging, testing).
+install_bolt_repos_from_source() {
+    local tier="$1"
+    local repofile="/etc/yum.repos.d/bolt.repo"
+    print_info "Configuring Bolt repositories (source=${tier})..."
+    cat >"$repofile" <<EOF
+[bolt]
+name = Adminbolt RHEL - \$releasever - \$basearch
+baseurl = https://mirror.adminbolt.com/pulp/content/${tier}/rhel/\$releasever/\$basearch
+enabled = 1
+gpgcheck = 0
+priority = 300
+sslverify = 0
+
+[bolt-noarch]
+name = Adminbolt RHEL - \$releasever - noarch
+baseurl = https://mirror.adminbolt.com/pulp/content/${tier}/rhel/\$releasever/noarch
+enabled = 1
+gpgcheck = 0
+priority = 400
+sslverify = 0
+EOF
+    print_success "Repository file written: ${repofile}"
+}
+
 install_repo_rhel() {
     local el_version=$1
+    if [[ -n "$BOLT_SOURCE" ]]; then
+        install_bolt_repos_from_source "$BOLT_SOURCE"
+        return 0
+    fi
     local rpm_url="${REPO_BASE_URL}/rhel/${el_version}/noarch/Packages/b/${REPO_PACKAGE}.el${el_version}.noarch.rpm"
     local temp_rpm="/tmp/bolt-repo-${el_version}.rpm"
     print_info "Downloading repository package..."
@@ -166,7 +201,7 @@ stage2_install_prerequisite_packages() {
     install_packages \
         libsodium traceroute openssl jq rsync ca-certificates wget curl tar gzip unzip zip sudo apg \
         systemd openssl-libs libcurl libzip zlib gmp freetype libjpeg-turbo libpng libwebp libXpm gd \
-        gettext-libs libicu sqlite-libs oniguruma libxslt shadow-utils cronie chrony
+        gettext-libs libicu sqlite-libs oniguruma libxslt shadow-utils
     run_or_warn "curl https://get.acme.sh | sh -s email=issue-ssl@adminbolt.com" "acme.sh"
     print_success "Stage 2.2 completed: prerequisite packages installed"
 }
@@ -207,6 +242,7 @@ stage_configuration() {
     run_or_fail "bolt-cli connect-bolt-agent-with-panel" "Connect bolt-agent to panel"
     run_or_warn "bolt-cli add-bolt-greeting-message" "Add bolt greeting message"
     run_or_warn "bolt-cli manage-nftable --action=install" "Nftable"
+    run_or_warn "bolt-cli manage-sshd --action=install" "SSH server"
     run_or_warn "bolt-cli manage-powerdns --action=install" "PowerDNS"
     run_or_warn "bolt-cli manage-mariadb --action=install" "MariaDB"
     run_or_warn "bolt-cli manage-postfix --action=install" "Postfix"
@@ -222,6 +258,7 @@ stage_configuration() {
         run_or_warn "bolt-php ${WEB_INSTALL_ROOT}/artisan bolt:manage-app --action=install --app-name=${app}" "App ${app}"
     done
     sleep 5
+    run_or_warn "bolt-cli manage-sshd-profiles --action=install" "SSH server profiles"
     run_or_warn "bolt-cli manage-postfix-profiles --action=install" "Postfix profiles"
     run_or_warn "bolt-cli manage-dovecot-profiles --action=install" "Dovecot profiles"
     run_or_warn "bolt-cli manage-redis-profiles --action=install" "Redis profiles"
@@ -249,25 +286,37 @@ stage_configuration() {
 
 # ---------- Main ----------
 print_usage() {
-    echo "Usage: sudo $0 [--help] [--version=<PANEL_VERSION>]"
-    echo "AlmaLinux 9 only. Stages: 1=ready check, 2=(2.1 settings, 2.2 prereq packages, 2.3 bolt packages), 3=post-install."
+    echo "Usage: sudo $0 [--help] [--version=<PANEL_VERSION>] [--source=<stable|staging|testing>]"
+    echo "AlmaLinux 9 / Rocky Linux 9. Stages: 1=ready check, 2=(2.1 settings, 2.2 prereq packages, 2.3 bolt packages), 3=post-install."
     echo "If --version is not provided, latest bolt-panel from repo is installed."
+    echo "If --source is not provided, the bolt-repo RPM from adminbolt is used (default). Otherwise repos point at pulp content stable/staging/testing."
 }
 
 main() {
-    case "${1:-}" in
-        -h|--help)
-            print_usage
-            exit 0
-            ;;
-    esac
+    for arg in "$@"; do
+        case "$arg" in
+            -h|--help)
+                print_usage
+                exit 0
+                ;;
+            --version=*)
+                PANEL_VERSION="${arg#--version=}"
+                ;;
+            --source=*)
+                BOLT_SOURCE="${arg#--source=}"
+                ;;
+        esac
+    done
 
-    # Parse --version=... argument (simple key=value style)
-    local version_arg="${1:-}"
-    if [[ "$version_arg" == --version=* ]]; then
-        PANEL_VERSION="${version_arg#--version=}"
-    else
-        PANEL_VERSION=""
+    if [[ -n "$BOLT_SOURCE" ]]; then
+        case "$BOLT_SOURCE" in
+            stable|staging|testing) ;;
+            *)
+                print_error "Invalid --source=${BOLT_SOURCE} (allowed: stable, staging, testing)"
+                print_usage
+                exit 1
+                ;;
+        esac
     fi
     echo -e "\n${BOLD}AdminBolt Staged Install (Stage 1 → 2 → 3)${NC}\n"
     TOTAL_START=$(date +%s)
