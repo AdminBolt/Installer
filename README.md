@@ -12,19 +12,19 @@
 Install the latest version:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/adminbolt-inc/Installer/refs/heads/main/install.sh -o install.sh && sudo bash install.sh
+curl -fsSL https://raw.githubusercontent.com/AdminBolt/Installer/refs/heads/main/install.sh -o install.sh && sudo bash install.sh
 ```
 
 Install from staging source:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/adminbolt-inc/Installer/refs/heads/main/install.sh -o install.sh && sudo bash install.sh --source=staging
+curl -fsSL https://raw.githubusercontent.com/AdminBolt/Installer/refs/heads/main/install.sh -o install.sh && sudo bash install.sh --source=staging
 ```
 
 ### Option 2: Clone repository and run
 
 ```bash
-git clone https://github.com/adminbolt-inc/Installer.git
+git clone https://github.com/AdminBolt/Installer.git
 cd Installer
 sudo ./install.sh
 ```
