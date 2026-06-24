@@ -45,11 +45,12 @@ sudo ./install.sh --source=staging
 
 ## Install flow
 
-The installer runs in 3 stages:
+The installer runs in 4 stages:
 
 1. Check prerequisites (root, supported OS, required commands, port 8443 availability)
-2. Prepare system and install prerequisite/Bolt packages
-3. Run `bolt-cli` post-install actions and print access details
+2. Perform a full system update (`dnf update -y`); the installer aborts if it fails
+3. Prepare system and install prerequisite/Bolt packages
+4. Run `bolt-cli` post-install actions and print access details
 
 ## Access
 
