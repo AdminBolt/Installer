@@ -2,11 +2,10 @@
 #
 # AdminBolt Install Script (AlmaLinux 9, Rocky Linux 9)
 #
-# Reorganizes the installation into four stages:
+# Reorganizes the installation into three stages:
 #   Stage 1: Check that everything is in place and ready for installation
-#   Stage 2: Full system update (dnf update -y) — must succeed before AdminBolt is installed
-#   Stage 3: (3.1) Prepare settings → (3.2) Install prerequisite packages → (3.3) Install all Bolt packages
-#   Stage 4: Execute bolt-cli / post-install actions (database, agent, services, profiles, etc.)
+#   Stage 2: (2.1) Prepare settings → (2.2) Install prerequisite packages → (2.3) Install all Bolt packages
+#   Stage 3: Execute bolt-cli / post-install actions (database, agent, services, profiles, etc.)
 #
 # Supported: AlmaLinux 9, Rocky Linux 9. Panel is installed from RPM; %pre/%post skipped.
 # Usage:
@@ -22,8 +21,6 @@ set -e
 PANEL_VERSION=""
 # Empty = current behavior (bolt-repo RPM from adminbolt). stable|staging|testing = pulp content path segment.
 BOLT_SOURCE=""
-# Set to "true" once the full system update (Stage 2) completes successfully.
-SYSTEM_UPDATED="false"
 readonly WEB_INSTALL_ROOT="/usr/local/bolt/web"
 readonly POST_INSTALL_DB_PATH="/var/lib/adminbolt/db.sqlite3"
 
@@ -102,7 +99,7 @@ stage_prerequisites() {
     done
     check_port_8443
     print_success "Stage 1 completed: ready for installation"
-    print_progress "25% — prerequisites"
+    print_progress "33% — prerequisites"
 }
 
 # Detect distribution: AlmaLinux 9 or Rocky Linux 9
@@ -120,29 +117,7 @@ detect_distribution() {
     return 0
 }
 
-# ---------- Stage 2: Full system update ----------
-# Bring every installed package up to date BEFORE any AdminBolt-specific
-# installation commands run, so dependencies resolve against the latest
-# package versions and the risk of conflicts during setup is reduced.
-# Mandatory: if the update fails the installer aborts with a non-zero exit
-# code and no AdminBolt packages are touched.
-stage_system_update() {
-    print_info "Stage 2: Performing full system update before installing AdminBolt"
-    print_info "Running 'dnf update -y' — this may take a while, please wait..."
-    if command -v dnf >/dev/null 2>&1; then
-        run_or_fail "dnf update -y" "Full system update (dnf update -y)"
-    elif command -v yum >/dev/null 2>&1; then
-        run_or_fail "yum update -y" "Full system update (yum update -y)"
-    else
-        print_error "Neither dnf nor yum is available; cannot perform the required system update"
-        exit 1
-    fi
-    SYSTEM_UPDATED="true"
-    print_success "Stage 2 completed: system fully updated, proceeding with AdminBolt installation"
-    print_progress "50% — system update"
-}
-
-# ---------- Stage 3: Install base packages ----------
+# ---------- Stage 2: Install base packages ----------
 # Write bolt / bolt-noarch repos for a pulp content tier (stable, staging, testing).
 install_bolt_repos_from_source() {
     local tier="$1"
@@ -208,18 +183,18 @@ run_or_fail() {
     echo -e ""
 }
 
-# ---------- Stage 3: Prepare → Prerequisite packages → Bolt packages ----------
-# Step 3.1: Prepare all settings (no package installs)
-stage3_prepare_settings() {
-    print_info "Stage 3.1: Preparing settings"
+# ---------- Stage 2: Prepare → Prerequisite packages → Bolt packages ----------
+# Step 2.1: Prepare all settings (no package installs)
+stage2_prepare_settings() {
+    print_info "Stage 2.1: Preparing settings"
     run_or_warn "setenforce 0" "SELinux enforce"
     run_or_warn "sed -i 's#^SELINUX=.*#SELINUX=disabled#' /etc/selinux/config" "SELinux config"
-    print_success "Stage 3.1 completed: settings prepared"
+    print_success "Stage 2.1 completed: settings prepared"
 }
 
-# Step 3.2: Install all prerequisite packages (EPEL, CRB, libsodium, traceroute, openssl, jq, etc.)
-stage3_install_prerequisite_packages() {
-    print_info "Stage 3.2: Installing prerequisite packages"
+# Step 2.2: Install all prerequisite packages (EPEL, CRB, libsodium, traceroute, openssl, jq, etc.)
+stage2_install_prerequisite_packages() {
+    print_info "Stage 2.2: Installing prerequisite packages"
     print_info "Enabling CRB (CodeReady Builder) repository"
     install_packages epel-release dnf-plugins-core
     run_or_warn "dnf config-manager --set-enabled crb" "Enable CRB repo"
@@ -228,12 +203,12 @@ stage3_install_prerequisite_packages() {
         systemd openssl-libs libcurl libzip zlib gmp freetype libjpeg-turbo libpng libwebp libXpm gd \
         gettext-libs libicu sqlite-libs oniguruma libxslt shadow-utils
     run_or_warn "curl https://get.acme.sh | sh -s email=issue-ssl@adminbolt.com" "acme.sh"
-    print_success "Stage 3.2 completed: prerequisite packages installed"
+    print_success "Stage 2.2 completed: prerequisite packages installed"
 }
 
-# Step 3.3: Install all Bolt packages (repo, bolt-nginx/php/agent, panel RPM)
-stage3_install_bolt_packages() {
-    print_info "Stage 3.3: Installing all Bolt packages"
+# Step 2.3: Install all Bolt packages (repo, bolt-nginx/php/agent, panel RPM)
+stage2_install_bolt_packages() {
+    print_info "Stage 2.3: Installing all Bolt packages"
     install_repo_rhel 9
     local panel_pkg="bolt-panel"
     if [[ -n "$PANEL_VERSION" ]]; then
@@ -242,27 +217,27 @@ stage3_install_bolt_packages() {
     fi
     install_packages --enablerepo=bolt bolt-agent bolt-nginx bolt-php "$panel_pkg"
     systemctl enable --now bolt-nginx bolt-php
-    print_success "Stage 3.3 completed: all Bolt packages installed"
+    print_success "Stage 2.3 completed: all Bolt packages installed"
 }
 
 stage_install_base_packages() {
-    print_info "Stage 3: Prepare settings → Prerequisite packages → Bolt packages"
+    print_info "Stage 2: Prepare settings → Prerequisite packages → Bolt packages"
     SECTION_START=$(date +%s)
-    stage3_prepare_settings
-    time_section_end "Stage 3.1: Prepare settings"
+    stage2_prepare_settings
+    time_section_end "Stage 2.1: Prepare settings"
     SECTION_START=$(date +%s)
-    stage3_install_prerequisite_packages
-    time_section_end "Stage 3.2: Prerequisite packages"
+    stage2_install_prerequisite_packages
+    time_section_end "Stage 2.2: Prerequisite packages"
     SECTION_START=$(date +%s)
-    stage3_install_bolt_packages
-    time_section_end "Stage 3.3: Bolt packages"
-    print_success "Stage 3 completed"
-    print_progress "75% — base packages"
+    stage2_install_bolt_packages
+    time_section_end "Stage 2.3: Bolt packages"
+    print_success "Stage 2 completed"
+    print_progress "66% — base packages"
 }
 
-# ---------- Stage 4: Execute bolt-cli / Install services ----------
+# ---------- Stage 3: Execute bolt-cli / Install services ----------
 stage_configuration() {
-    print_info "Stage 4: Executing bolt-cli / post-install actions"
+    print_info "Stage 3: Executing bolt-cli / post-install actions"
     run_or_fail "bolt-cli request-trial-license" "Request trial licence"
     run_or_fail "bolt-cli connect-bolt-agent-with-panel" "Connect bolt-agent to panel"
     run_or_warn "bolt-cli add-bolt-greeting-message" "Add bolt greeting message"
@@ -303,19 +278,16 @@ stage_configuration() {
     echo -e "\n${BOLD}${GREEN}+----------------------------------------------------------+${NC}"
     echo -e "${BOLD}${GREEN}|          Installation Completed Successfully             |${NC}"
     echo -e "${BOLD}${GREEN}+----------------------------------------------------------+${NC}\n"
-    if [ "$SYSTEM_UPDATED" = "true" ]; then
-        print_success "AdminBolt was installed after a successful full system update (dnf update -y)"
-    fi
     [ -n "${SSO_URL:-}" ] && echo -e "${BOLD}${CYAN}--- Access ---${NC}\n${GREEN}Admin Panel:${NC}\n${BOLD}${SSO_URL}${NC}\n"
     echo -e "${GREEN}New SSO URL:${NC}\n${BOLD}bolt-cli admin-sso-generate${NC}"
     print_progress "100% — post-install"
-    print_success "Stage 4 completed: all post-install actions done"
+    print_success "Stage 3 completed: all post-install actions done"
 }
 
 # ---------- Main ----------
 print_usage() {
     echo "Usage: sudo $0 [--help] [--version=<PANEL_VERSION>] [--source=<stable|staging|testing>]"
-    echo "AlmaLinux 9 / Rocky Linux 9. Stages: 1=ready check, 2=full system update, 3=(3.1 settings, 3.2 prereq packages, 3.3 bolt packages), 4=post-install."
+    echo "AlmaLinux 9 / Rocky Linux 9. Stages: 1=ready check, 2=(2.1 settings, 2.2 prereq packages, 2.3 bolt packages), 3=post-install."
     echo "If --version is not provided, latest bolt-panel from repo is installed."
     echo "If --source is not provided, the bolt-repo RPM from adminbolt is used (default). Otherwise repos point at pulp content stable/staging/testing."
 }
@@ -346,7 +318,7 @@ main() {
                 ;;
         esac
     fi
-    echo -e "\n${BOLD}AdminBolt Staged Install (Stage 1 → 2 → 3 → 4)${NC}\n"
+    echo -e "\n${BOLD}AdminBolt Staged Install (Stage 1 → 2 → 3)${NC}\n"
     TOTAL_START=$(date +%s)
 
     SECTION_START=$(date +%s)
@@ -354,16 +326,12 @@ main() {
     time_section_end "Stage 1: Prerequisites"
 
     SECTION_START=$(date +%s)
-    stage_system_update
-    time_section_end "Stage 2: Full system update"
-
-    SECTION_START=$(date +%s)
     stage_install_base_packages
-    time_section_end "Stage 3: Base packages"
+    time_section_end "Stage 2: Base packages"
 
     SECTION_START=$(date +%s)
     stage_configuration
-    time_section_end "Stage 4: Post-install actions"
+    time_section_end "Stage 3: Post-install actions"
 
     time_total_end
 }
