@@ -201,7 +201,8 @@ stage2_install_prerequisite_packages() {
     install_packages \
         libsodium traceroute openssl jq rsync ca-certificates wget curl tar gzip unzip zip sudo apg \
         systemd openssl-libs libcurl libzip zlib gmp freetype libjpeg-turbo libpng libwebp libXpm gd \
-        gettext-libs libicu sqlite-libs oniguruma libxslt shadow-utils
+        gettext-libs libicu sqlite-libs oniguruma libxslt shadow-utils chrony
+    run_or_warn "systemctl enable --now chronyd" "Time synchronization (chronyd)"
     run_or_warn "curl https://get.acme.sh | sh -s email=issue-ssl@adminbolt.com" "acme.sh"
     print_success "Stage 2.2 completed: prerequisite packages installed"
 }
