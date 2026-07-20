@@ -35,12 +35,19 @@ Use a specific repository source:
 sudo ./install.sh --source=staging
 ```
 
+Install a PR build from a repopin session:
+
+```bash
+sudo ./install.sh --repopin-session=77c16cae80910a4b5cd4daeea4e3d221
+```
+
 ### Command reference
 
 | Command | Description |
 |---------|-------------|
 | `sudo ./install.sh` | Install latest bolt-panel from repo |
 | `sudo ./install.sh --source=<stable\|staging\|testing>` | Install from a specific repository source |
+| `sudo ./install.sh --repopin-session=<id>` | Install a PR build from a repopin session (source defaults to `testing`) |
 | `sudo ./install.sh --help` | Show usage information |
 
 ## Install flow

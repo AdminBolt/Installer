@@ -12,6 +12,7 @@
 #   sudo ./install.sh                          # install latest bolt-panel from repo
 #   sudo ./install.sh --version=1.0.0.beta3-v46.el9 # install specific bolt-panel version from repo
 #   sudo ./install.sh --source=staging         # use staging pulp repos (stable|staging|testing); default unchanged
+#   sudo ./install.sh --repopin-session=<id>   # use a repopin PR-testing session instead of the mirror
 #
 set -e
 
@@ -21,6 +22,8 @@ set -e
 PANEL_VERSION=""
 # Empty = current behavior (bolt-repo RPM from adminbolt). stable|staging|testing = pulp content path segment.
 BOLT_SOURCE=""
+# Empty = use the public mirror. Otherwise a repopin session id, serving PR builds from repopin.adminbolt.com.
+REPOPIN_SESSION=""
 readonly WEB_INSTALL_ROOT="/usr/local/bolt/web"
 readonly POST_INSTALL_DB_PATH="/var/lib/adminbolt/db.sqlite3"
 
@@ -122,19 +125,27 @@ detect_distribution() {
 install_bolt_repos_from_source() {
     local tier="$1"
     local repofile="/etc/yum.repos.d/bolt.repo"
-    print_info "Configuring Bolt repositories (source=${tier})..."
+    local content_root="https://mirror.adminbolt.com/pulp/content"
+    local label="Adminbolt RHEL"
+    if [[ -n "$REPOPIN_SESSION" ]]; then
+        content_root="http://repopin.adminbolt.com/s/${REPOPIN_SESSION}/pulp/content"
+        label="Adminbolt RHEL PR Testing"
+        print_info "Configuring Bolt repositories (repopin session, source=${tier})..."
+    else
+        print_info "Configuring Bolt repositories (source=${tier})..."
+    fi
     cat >"$repofile" <<EOF
 [bolt]
-name = Adminbolt RHEL - \$releasever - \$basearch
-baseurl = https://mirror.adminbolt.com/pulp/content/${tier}/rhel/\$releasever/\$basearch
+name = ${label} - \$releasever - \$basearch
+baseurl = ${content_root}/${tier}/rhel/\$releasever/\$basearch
 enabled = 1
 gpgcheck = 0
 priority = 300
 sslverify = 0
 
 [bolt-noarch]
-name = Adminbolt RHEL - \$releasever - noarch
-baseurl = https://mirror.adminbolt.com/pulp/content/${tier}/rhel/\$releasever/noarch
+name = ${label} - \$releasever - noarch
+baseurl = ${content_root}/${tier}/rhel/\$releasever/noarch
 enabled = 1
 gpgcheck = 0
 priority = 400
@@ -287,10 +298,11 @@ stage_configuration() {
 
 # ---------- Main ----------
 print_usage() {
-    echo "Usage: sudo $0 [--help] [--version=<PANEL_VERSION>] [--source=<stable|staging|testing>]"
+    echo "Usage: sudo $0 [--help] [--version=<PANEL_VERSION>] [--source=<stable|staging|testing>] [--repopin-session=<SESSION_ID>]"
     echo "AlmaLinux 9 / Rocky Linux 9. Stages: 1=ready check, 2=(2.1 settings, 2.2 prereq packages, 2.3 bolt packages), 3=post-install."
     echo "If --version is not provided, latest bolt-panel from repo is installed."
     echo "If --source is not provided, the bolt-repo RPM from adminbolt is used (default). Otherwise repos point at pulp content stable/staging/testing."
+    echo "If --repopin-session is provided, repos point at that repopin session on repopin.adminbolt.com (PR builds) and --source defaults to testing."
 }
 
 main() {
@@ -306,8 +318,20 @@ main() {
             --source=*)
                 BOLT_SOURCE="${arg#--source=}"
                 ;;
+            --repopin-session=*)
+                REPOPIN_SESSION="${arg#--repopin-session=}"
+                ;;
         esac
     done
+
+    if [[ -n "$REPOPIN_SESSION" ]]; then
+        if [[ ! "$REPOPIN_SESSION" =~ ^[A-Za-z0-9]+$ ]]; then
+            print_error "Invalid --repopin-session (expected an alphanumeric session id)"
+            exit 1
+        fi
+        # repopin serves PR builds; testing is the tier unless the caller picks another.
+        [[ -z "$BOLT_SOURCE" ]] && BOLT_SOURCE="testing"
+    fi
 
     if [[ -n "$BOLT_SOURCE" ]]; then
         case "$BOLT_SOURCE" in
