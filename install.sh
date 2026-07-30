@@ -12,6 +12,7 @@
 #   sudo ./install.sh                          # install latest bolt-panel from repo
 #   sudo ./install.sh --version=1.0.0.beta3-v46.el9 # install specific bolt-panel version from repo
 #   sudo ./install.sh --source=staging         # use staging pulp repos (stable|staging|testing); default unchanged
+#   sudo ./install.sh --email=user@example.com # activate a 24h trial license for this e-mail (extended after e-mail verification)
 #
 set -e
 
@@ -21,6 +22,8 @@ set -e
 PANEL_VERSION=""
 # Empty = current behavior (bolt-repo RPM from adminbolt). stable|staging|testing = pulp content path segment.
 BOLT_SOURCE=""
+# E-mail for the trial license; empty = skip the trial request (activate manually on the License page).
+ADMIN_EMAIL=""
 readonly WEB_INSTALL_ROOT="/usr/local/bolt/web"
 readonly POST_INSTALL_DB_PATH="/var/lib/adminbolt/db.sqlite3"
 
@@ -239,7 +242,11 @@ stage_install_base_packages() {
 # ---------- Stage 3: Execute bolt-cli / Install services ----------
 stage_configuration() {
     print_info "Stage 3: Executing bolt-cli / post-install actions"
-    run_or_fail "bolt-cli request-trial-license" "Request trial licence"
+    if [[ -n "$ADMIN_EMAIL" ]]; then
+        run_or_fail "bolt-cli request-trial-license --email=${ADMIN_EMAIL}" "Request trial licence"
+    else
+        print_info "No --email= provided; skipping trial licence request. Activate a licence later on the panel's License page."
+    fi
     run_or_fail "bolt-cli connect-bolt-agent-with-panel" "Connect bolt-agent to panel"
     run_or_warn "bolt-cli add-bolt-greeting-message" "Add bolt greeting message"
     run_or_warn "bolt-cli manage-nftable --action=install" "Nftable"
@@ -287,10 +294,12 @@ stage_configuration() {
 
 # ---------- Main ----------
 print_usage() {
-    echo "Usage: sudo $0 [--help] [--version=<PANEL_VERSION>] [--source=<stable|staging|testing>]"
+    echo "Usage: sudo $0 [--help] [--version=<PANEL_VERSION>] [--source=<stable|staging|testing>] [--email=<address>]"
     echo "AlmaLinux 9 / Rocky Linux 9. Stages: 1=ready check, 2=(2.1 settings, 2.2 prereq packages, 2.3 bolt packages), 3=post-install."
     echo "If --version is not provided, latest bolt-panel from repo is installed."
     echo "If --source is not provided, the bolt-repo RPM from adminbolt is used (default). Otherwise repos point at pulp content stable/staging/testing."
+    echo "If --email is provided, a 24h trial licence is activated for that address (the e-mailed code extends it to the full trial period)."
+    echo "Without --email the install proceeds unlicensed; activate on the panel's License page."
 }
 
 main() {
@@ -306,8 +315,17 @@ main() {
             --source=*)
                 BOLT_SOURCE="${arg#--source=}"
                 ;;
+            --email=*)
+                ADMIN_EMAIL="${arg#--email=}"
+                ;;
         esac
     done
+
+    if [[ -n "$ADMIN_EMAIL" && ! "$ADMIN_EMAIL" =~ ^[^[:space:]@]+@[^[:space:]@]+\.[^[:space:]@]+$ ]]; then
+        print_error "Invalid --email=${ADMIN_EMAIL}"
+        print_usage
+        exit 1
+    fi
 
     if [[ -n "$BOLT_SOURCE" ]]; then
         case "$BOLT_SOURCE" in
