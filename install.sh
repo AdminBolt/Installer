@@ -273,6 +273,7 @@ stage_configuration() {
     run_or_warn "bolt-cli manage-vsftpd-profiles --action=install" "Vsftpd profile"
     run_or_warn "bolt-cli manage-fail2ban-profiles --action=install" "Fail2Ban profile"
     run_or_warn "bolt-cli setup-cron-jobs" "Setup Cron jobs"
+    run_or_warn "bolt-cli setup-hidepid" "Harden /proc (hidepid)"
     systemctl restart rspamd
     local SSO_URL=$(bolt-cli admin-sso-generate 2>/dev/null || echo "")
     [ -z "${SSO_URL}" ] && echo -e "${YELLOW}WARNING:${NC} SSO URL not generated" || print_success "SSO URL generated"
