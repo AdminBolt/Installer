@@ -12,7 +12,7 @@
 #   sudo ./install.sh                          # install latest bolt-panel from repo
 #   sudo ./install.sh --version=1.0.0.beta3-v46.el9 # install specific bolt-panel version from repo
 #   sudo ./install.sh --source=staging         # use staging pulp repos (stable|staging|testing); default unchanged
-#   sudo ./install.sh --email=user@example.com # activate a 24h trial license for this e-mail (extended after e-mail verification)
+#   sudo ./install.sh --email=user@example.com # activate a 24h trial license for this e-mail (confirmation link extends it to 30 days)
 #
 set -e
 
@@ -299,7 +299,7 @@ print_usage() {
     echo "AlmaLinux 9 / Rocky Linux 9. Stages: 1=ready check, 2=(2.1 settings, 2.2 prereq packages, 2.3 bolt packages), 3=post-install."
     echo "If --version is not provided, latest bolt-panel from repo is installed."
     echo "If --source is not provided, the bolt-repo RPM from adminbolt is used (default). Otherwise repos point at pulp content stable/staging/testing."
-    echo "If --email is provided, a 24h trial licence is activated for that address (the e-mailed code extends it to the full trial period)."
+    echo "If --email is provided, a 24h trial licence is activated for that address (clicking the e-mailed confirmation link extends it to the full trial period)."
     echo "Without --email the install proceeds unlicensed; activate on the panel's License page."
 }
 
