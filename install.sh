@@ -280,6 +280,8 @@ stage_configuration() {
     run_or_warn "bolt-cli manage-vsftpd-profiles --action=install" "Vsftpd profile"
     run_or_warn "bolt-cli manage-fail2ban-profiles --action=install" "Fail2Ban profile"
     run_or_warn "bolt-cli setup-cron-jobs" "Setup Cron jobs"
+    # Only records a provisioning plan and returns; the panel scheduler (installed by setup-cron-jobs) executes it in the background.
+    run_or_warn "bolt-cli post-install-provision" "Queue post-install provisioning (remaining PHP versions, SecureBox, SymLock)"
     run_or_warn "bolt-cli setup-hidepid" "Harden /proc (hidepid)"
     systemctl restart rspamd
     local SSO_URL=$(bolt-cli admin-sso-generate 2>/dev/null || echo "")
