@@ -242,11 +242,6 @@ stage_install_base_packages() {
 # ---------- Stage 3: Execute bolt-cli / Install services ----------
 stage_configuration() {
     print_info "Stage 3: Executing bolt-cli / post-install actions"
-    if [[ -n "$ADMIN_EMAIL" ]]; then
-        run_or_fail "bolt-cli request-trial-license --email=${ADMIN_EMAIL}" "Request trial licence"
-    else
-        print_info "No --email= provided; skipping trial licence request. Activate a licence later on the panel's License page."
-    fi
     run_or_fail "bolt-cli connect-bolt-agent-with-panel" "Connect bolt-agent to panel"
     run_or_warn "bolt-cli add-bolt-greeting-message" "Add bolt greeting message"
     run_or_warn "bolt-cli manage-nftable --action=install" "Nftable"
@@ -284,11 +279,21 @@ stage_configuration() {
     run_or_warn "bolt-cli post-install-provision" "Queue post-install provisioning (remaining PHP versions, SecureBox, SymLock)"
     run_or_warn "bolt-cli setup-hidepid" "Harden /proc (hidepid)"
     systemctl restart rspamd
+    # Trial licence last: nothing in the install depends on it, and the licence server refuses repeats
+    # per e-mail and per IP, which must never abort an otherwise complete installation.
+    local TRIAL_LICENCE_OK=0
+    if [[ -n "$ADMIN_EMAIL" ]]; then
+        # run_or_warn evaluates the command in this shell, so the assignment records the outcome.
+        run_or_warn "bolt-cli request-trial-license --email=${ADMIN_EMAIL} && TRIAL_LICENCE_OK=1" "Request trial licence"
+    else
+        print_info "No --email= provided; skipping trial licence request. Activate a licence later on the panel's License page."
+    fi
     local SSO_URL=$(bolt-cli admin-sso-generate 2>/dev/null || echo "")
     [ -z "${SSO_URL}" ] && echo -e "${YELLOW}WARNING:${NC} SSO URL not generated" || print_success "SSO URL generated"
     echo -e "\n${BOLD}${GREEN}+----------------------------------------------------------+${NC}"
     echo -e "${BOLD}${GREEN}|          Installation Completed Successfully             |${NC}"
     echo -e "${BOLD}${GREEN}+----------------------------------------------------------+${NC}\n"
+    [ -n "${ADMIN_EMAIL}" ] && [ "${TRIAL_LICENCE_OK}" -eq 0 ] && echo -e "${YELLOW}NOTE:${NC} Trial licence not issued (request refused or licence server unreachable). The installation itself succeeded and the panel is usable; activate a licence on its License page.\n"
     [ -n "${SSO_URL:-}" ] && echo -e "${BOLD}${CYAN}--- Access ---${NC}\n${GREEN}Admin Panel:${NC}\n${BOLD}${SSO_URL}${NC}\n"
     echo -e "${GREEN}New SSO URL:${NC}\n${BOLD}bolt-cli admin-sso-generate${NC}"
     print_progress "100% — post-install"
@@ -301,7 +306,7 @@ print_usage() {
     echo "AlmaLinux 9 / Rocky Linux 9. Stages: 1=ready check, 2=(2.1 settings, 2.2 prereq packages, 2.3 bolt packages), 3=post-install."
     echo "If --version is not provided, latest bolt-panel from repo is installed."
     echo "If --source is not provided, the bolt-repo RPM from adminbolt is used (default). Otherwise repos point at pulp content stable/staging/testing."
-    echo "If --email is provided, a 24h trial licence is activated for that address (clicking the e-mailed confirmation link extends it to the full trial period)."
+    echo "If --email is provided, a 24h trial licence is requested for that address at the very end of the install (clicking the e-mailed confirmation link extends it to the full trial period); the install completes even if the request is refused."
     echo "Without --email the install proceeds unlicensed; activate on the panel's License page."
 }
 
