@@ -12,6 +12,7 @@
 #   sudo ./install.sh                          # install latest bolt-panel from repo
 #   sudo ./install.sh --version=1.0.0.beta3-v46.el9 # install specific bolt-panel version from repo
 #   sudo ./install.sh --source=staging         # use staging pulp repos (stable|staging|testing); default unchanged
+#   sudo ./install.sh --email=user@example.com # activate a 24h trial license for this e-mail (confirmation link extends it to 30 days)
 #
 set -e
 
@@ -21,6 +22,8 @@ set -e
 PANEL_VERSION=""
 # Empty = current behavior (bolt-repo RPM from adminbolt). stable|staging|testing = pulp content path segment.
 BOLT_SOURCE=""
+# E-mail for the trial license; empty = skip the trial request (activate manually on the License page).
+ADMIN_EMAIL=""
 readonly WEB_INSTALL_ROOT="/usr/local/bolt/web"
 readonly POST_INSTALL_DB_PATH="/var/lib/adminbolt/db.sqlite3"
 
@@ -239,7 +242,6 @@ stage_install_base_packages() {
 # ---------- Stage 3: Execute bolt-cli / Install services ----------
 stage_configuration() {
     print_info "Stage 3: Executing bolt-cli / post-install actions"
-    run_or_fail "bolt-cli request-trial-license" "Request trial licence"
     run_or_fail "bolt-cli connect-bolt-agent-with-panel" "Connect bolt-agent to panel"
     run_or_warn "bolt-cli add-bolt-greeting-message" "Add bolt greeting message"
     run_or_warn "bolt-cli manage-nftable --action=install" "Nftable"
@@ -273,13 +275,25 @@ stage_configuration() {
     run_or_warn "bolt-cli manage-vsftpd-profiles --action=install" "Vsftpd profile"
     run_or_warn "bolt-cli manage-fail2ban-profiles --action=install" "Fail2Ban profile"
     run_or_warn "bolt-cli setup-cron-jobs" "Setup Cron jobs"
+    # Only records a provisioning plan and returns; the panel scheduler (installed by setup-cron-jobs) executes it in the background.
+    run_or_warn "bolt-cli post-install-provision" "Queue post-install provisioning (remaining PHP versions, SecureBox, SymLock)"
     run_or_warn "bolt-cli setup-hidepid" "Harden /proc (hidepid)"
     systemctl restart rspamd
+    # Trial licence last: nothing in the install depends on it, and the licence server refuses repeats
+    # per e-mail and per IP, which must never abort an otherwise complete installation.
+    local TRIAL_LICENCE_OK=0
+    if [[ -n "$ADMIN_EMAIL" ]]; then
+        # run_or_warn evaluates the command in this shell, so the assignment records the outcome.
+        run_or_warn "bolt-cli request-trial-license --email=${ADMIN_EMAIL} && TRIAL_LICENCE_OK=1" "Request trial licence"
+    else
+        print_info "No --email= provided; skipping trial licence request. Activate a licence later on the panel's License page."
+    fi
     local SSO_URL=$(bolt-cli admin-sso-generate 2>/dev/null || echo "")
     [ -z "${SSO_URL}" ] && echo -e "${YELLOW}WARNING:${NC} SSO URL not generated" || print_success "SSO URL generated"
     echo -e "\n${BOLD}${GREEN}+----------------------------------------------------------+${NC}"
     echo -e "${BOLD}${GREEN}|          Installation Completed Successfully             |${NC}"
     echo -e "${BOLD}${GREEN}+----------------------------------------------------------+${NC}\n"
+    [ -n "${ADMIN_EMAIL}" ] && [ "${TRIAL_LICENCE_OK}" -eq 0 ] && echo -e "${YELLOW}NOTE:${NC} Trial licence not issued (request refused or licence server unreachable). The installation itself succeeded and the panel is usable; activate a licence on its License page.\n"
     [ -n "${SSO_URL:-}" ] && echo -e "${BOLD}${CYAN}--- Access ---${NC}\n${GREEN}Admin Panel:${NC}\n${BOLD}${SSO_URL}${NC}\n"
     echo -e "${GREEN}New SSO URL:${NC}\n${BOLD}bolt-cli admin-sso-generate${NC}"
     print_progress "100% — post-install"
@@ -288,10 +302,12 @@ stage_configuration() {
 
 # ---------- Main ----------
 print_usage() {
-    echo "Usage: sudo $0 [--help] [--version=<PANEL_VERSION>] [--source=<stable|staging|testing>]"
+    echo "Usage: sudo $0 [--help] [--version=<PANEL_VERSION>] [--source=<stable|staging|testing>] [--email=<address>]"
     echo "AlmaLinux 9 / Rocky Linux 9. Stages: 1=ready check, 2=(2.1 settings, 2.2 prereq packages, 2.3 bolt packages), 3=post-install."
     echo "If --version is not provided, latest bolt-panel from repo is installed."
     echo "If --source is not provided, the bolt-repo RPM from adminbolt is used (default). Otherwise repos point at pulp content stable/staging/testing."
+    echo "If --email is provided, a 24h trial licence is requested for that address at the very end of the install (clicking the e-mailed confirmation link extends it to the full trial period); the install completes even if the request is refused."
+    echo "Without --email the install proceeds unlicensed; activate on the panel's License page."
 }
 
 main() {
@@ -307,8 +323,17 @@ main() {
             --source=*)
                 BOLT_SOURCE="${arg#--source=}"
                 ;;
+            --email=*)
+                ADMIN_EMAIL="${arg#--email=}"
+                ;;
         esac
     done
+
+    if [[ -n "$ADMIN_EMAIL" && ! "$ADMIN_EMAIL" =~ ^[^[:space:]@]+@[^[:space:]@]+\.[^[:space:]@]+$ ]]; then
+        print_error "Invalid --email=${ADMIN_EMAIL}"
+        print_usage
+        exit 1
+    fi
 
     if [[ -n "$BOLT_SOURCE" ]]; then
         case "$BOLT_SOURCE" in
