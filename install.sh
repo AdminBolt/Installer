@@ -251,7 +251,24 @@ stage_configuration() {
     # AB-1446: the MariaDB series is a choice; without --mariadb-version the
     # panel's default series is installed.
     if [[ -n "$MARIADB_SERIES" ]]; then
-        run_or_warn "bolt-cli manage-mariadb --action=install --series=${MARIADB_SERIES}" "MariaDB ${MARIADB_SERIES}"
+        # QA F1: a panel that predates the --series option (an older channel
+        # head, a pinned older version) refused the flag and the box was left
+        # without a database. Fall back to the panel's default series, loudly,
+        # rather than install nothing.
+        print_info "MariaDB ${MARIADB_SERIES}"
+        local MARIADB_OUT
+        if MARIADB_OUT=$(bolt-cli manage-mariadb --action=install --series="${MARIADB_SERIES}" 2>&1); then
+            echo "$MARIADB_OUT"
+            print_success "MariaDB ${MARIADB_SERIES} completed"
+        elif grep -qi 'option does not exist' <<<"$MARIADB_OUT"; then
+            echo "$MARIADB_OUT"
+            echo -e "${YELLOW}WARNING:${NC} the installed panel does not support --mariadb-version yet; installing its default MariaDB series instead"
+            run_or_warn "bolt-cli manage-mariadb --action=install" "MariaDB (default series)"
+        else
+            echo "$MARIADB_OUT"
+            echo -e "${YELLOW}WARNING:${NC} MariaDB ${MARIADB_SERIES} failed (continuing)"
+        fi
+        echo -e ""
     else
         run_or_warn "bolt-cli manage-mariadb --action=install" "MariaDB"
     fi
@@ -285,7 +302,9 @@ stage_configuration() {
     # Only records a provisioning plan and returns; the panel scheduler (installed by setup-cron-jobs) executes it in the background.
     run_or_warn "bolt-cli post-install-provision" "Queue post-install provisioning (remaining PHP versions, SecureBox, SymLock)"
     run_or_warn "bolt-cli setup-hidepid" "Harden /proc (hidepid)"
-    systemctl restart rspamd
+    # QA F2: a bare restart under set -e aborted the whole run (no trial
+    # licence, no SSO URL, no banner) whenever rspamd was not installed.
+    run_or_warn "systemctl restart rspamd" "Rspamd restart"
     # Trial licence last: nothing in the install depends on it, and the licence server refuses repeats
     # per e-mail and per IP, which must never abort an otherwise complete installation.
     local TRIAL_LICENCE_OK=0
