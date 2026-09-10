@@ -24,6 +24,7 @@ PANEL_VERSION=""
 BOLT_SOURCE=""
 # E-mail for the trial license; empty = skip the trial request (activate manually on the License page).
 ADMIN_EMAIL=""
+MARIADB_SERIES=""
 readonly WEB_INSTALL_ROOT="/usr/local/bolt/web"
 readonly POST_INSTALL_DB_PATH="/var/lib/adminbolt/db.sqlite3"
 
@@ -247,7 +248,30 @@ stage_configuration() {
     run_or_warn "bolt-cli manage-nftable --action=install" "Nftable"
     run_or_warn "bolt-cli manage-sshd --action=install" "SSH server"
     run_or_warn "bolt-cli manage-powerdns --action=install" "PowerDNS"
-    run_or_warn "bolt-cli manage-mariadb --action=install" "MariaDB"
+    # AB-1446: the MariaDB series is a choice; without --mariadb-version the
+    # panel's default series is installed.
+    if [[ -n "$MARIADB_SERIES" ]]; then
+        # QA F1: a panel that predates the --series option (an older channel
+        # head, a pinned older version) refused the flag and the box was left
+        # without a database. Fall back to the panel's default series, loudly,
+        # rather than install nothing.
+        print_info "MariaDB ${MARIADB_SERIES}"
+        local MARIADB_OUT
+        if MARIADB_OUT=$(bolt-cli manage-mariadb --action=install --series="${MARIADB_SERIES}" 2>&1); then
+            echo "$MARIADB_OUT"
+            print_success "MariaDB ${MARIADB_SERIES} completed"
+        elif grep -qi 'option does not exist' <<<"$MARIADB_OUT"; then
+            echo "$MARIADB_OUT"
+            echo -e "${YELLOW}WARNING:${NC} the installed panel does not support --mariadb-version yet; installing its default MariaDB series instead"
+            run_or_warn "bolt-cli manage-mariadb --action=install" "MariaDB (default series)"
+        else
+            echo "$MARIADB_OUT"
+            echo -e "${YELLOW}WARNING:${NC} MariaDB ${MARIADB_SERIES} failed (continuing)"
+        fi
+        echo -e ""
+    else
+        run_or_warn "bolt-cli manage-mariadb --action=install" "MariaDB"
+    fi
     run_or_warn "bolt-cli manage-postfix --action=install" "Postfix"
     run_or_warn "bolt-cli manage-dovecot --action=install" "Dovecot"
     run_or_warn "bolt-cli manage-redis --action=install" "Redis"
@@ -284,7 +308,9 @@ stage_configuration() {
     # Only records a provisioning plan and returns; the panel scheduler (installed by setup-cron-jobs) executes it in the background.
     run_or_warn "bolt-cli post-install-provision" "Queue post-install provisioning (remaining PHP versions, SecureBox, SymLock)"
     run_or_warn "bolt-cli setup-hidepid" "Harden /proc (hidepid)"
-    systemctl restart rspamd
+    # QA F2: a bare restart under set -e aborted the whole run (no trial
+    # licence, no SSO URL, no banner) whenever rspamd was not installed.
+    run_or_warn "systemctl restart rspamd" "Rspamd restart"
     # Trial licence last: nothing in the install depends on it, and the licence server refuses repeats
     # per e-mail and per IP, which must never abort an otherwise complete installation.
     local TRIAL_LICENCE_OK=0
@@ -308,10 +334,11 @@ stage_configuration() {
 
 # ---------- Main ----------
 print_usage() {
-    echo "Usage: sudo $0 [--help] [--version=<PANEL_VERSION>] [--source=<stable|staging|testing>] [--email=<address>]"
+    echo "Usage: sudo $0 [--help] [--version=<PANEL_VERSION>] [--source=<stable|staging|testing>] [--email=<address>] [--mariadb-version=<10.11|11.4>]"
     echo "AlmaLinux 9 / Rocky Linux 9. Stages: 1=ready check, 2=(2.1 settings, 2.2 prereq packages, 2.3 bolt packages), 3=post-install."
     echo "If --version is not provided, latest bolt-panel from repo is installed."
     echo "If --source is not provided, the bolt-repo RPM from adminbolt is used (default). Otherwise repos point at pulp content stable/staging/testing."
+    echo "If --mariadb-version is not provided, MariaDB 10.11 is installed; 11.4 is the newer long-term series (supported until 2029)."
     echo "If --email is provided, a 24h trial licence is requested for that address at the very end of the install (clicking the e-mailed confirmation link extends it to the full trial period); the install completes even if the request is refused."
     echo "Without --email the install proceeds unlicensed; activate on the panel's License page."
 }
@@ -332,8 +359,22 @@ main() {
             --email=*)
                 ADMIN_EMAIL="${arg#--email=}"
                 ;;
+            --mariadb-version=*)
+                MARIADB_SERIES="${arg#--mariadb-version=}"
+                ;;
         esac
     done
+
+    if [[ -n "$MARIADB_SERIES" ]]; then
+        case "$MARIADB_SERIES" in
+            10.11|11.4) ;;
+            *)
+                print_error "Invalid --mariadb-version=${MARIADB_SERIES} (supported: 10.11, 11.4)"
+                print_usage
+                exit 1
+                ;;
+        esac
+    fi
 
     if [[ -n "$ADMIN_EMAIL" && ! "$ADMIN_EMAIL" =~ ^[^[:space:]@]+@[^[:space:]@]+\.[^[:space:]@]+$ ]]; then
         print_error "Invalid --email=${ADMIN_EMAIL}"
