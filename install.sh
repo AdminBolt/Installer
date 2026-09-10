@@ -280,12 +280,7 @@ stage_configuration() {
     run_or_warn "bolt-cli manage-php --action=install --php-version=8.4" "PHP 8.4"
     run_or_warn "bolt-cli manage-my-apache --action=install" "MyApache"
     run_or_warn "bolt-cli manage-vsftpd --action=install" "Vsftpd"
-    # Disk quota, on a box that has no accounts yet: the accounting pass is
-    # instant here and enforcement is on from the first account, rather than
-    # being switched on later under accounts that are already over their
-    # plans. Warn-only - a filesystem that cannot carry quota is a reason to
-    # tell the administrator, not to fail the install.
-    run_or_warn "bolt-cli manage-disk-quota --action=install" "Disk quota enforcement"
+
     run_or_warn "bolt-cli manage-fail2ban --action=install" "Fail2Ban"
     for app in local-api filemanager phpmyadmin roundcube git metrics adminer; do
         run_or_warn "bolt-php ${WEB_INSTALL_ROOT}/artisan bolt:manage-app --action=install --app-name=${app}" "App ${app}"
