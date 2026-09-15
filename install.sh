@@ -387,6 +387,22 @@ main() {
                 ;;
         esac
     fi
+
+    # bolt-agent's %post (Stage 2) starts the box with a self-signed
+    # certificate and requests the real one in the background, so a slow or
+    # unreachable ACME endpoint never blocks this script (AB-1652). That
+    # background task waits for this marker to go away before it hot-swaps
+    # the certificate or restarts the agent, so its own reload can never land
+    # in the middle of a later stage of this whole panel-plus-agent install -
+    # Stage 3 included - and break it. Always removed on exit, success or
+    # failure, so a box never gets stuck with a marker nothing will ever
+    # clear. Lives under /var/lib/adminbolt (POST_INSTALL_DB_PATH's own
+    # directory) since it marks this install.sh run as a whole, not
+    # anything specific to the agent package.
+    mkdir -p /var/lib/adminbolt
+    touch /var/lib/adminbolt/install-in-progress
+    trap 'rm -f /var/lib/adminbolt/install-in-progress' EXIT
+
     echo -e "\n${BOLD}AdminBolt Staged Install (Stage 1 → 2 → 3)${NC}\n"
     TOTAL_START=$(date +%s)
 
