@@ -211,6 +211,51 @@ stage2_install_prerequisite_packages() {
     print_success "Stage 2.2 completed: prerequisite packages installed"
 }
 
+# dnf reports a failed %post scriptlet as a warning but the package
+# transaction still exits 0, so install_packages()'s exit-code check cannot
+# see it - bolt-agent's %post ends with `systemctl enable/restart/start
+# bolt-agent`, and a failure earlier in the script (permissions, disk space,
+# a real certificate issuance failure the self-signed fallback did not
+# catch) aborts before reaching that. Left undetected here, the only symptom
+# shows up later in Stage 3 as a bare agent connection error, which does not
+# name the actual cause. Kept separate from install_packages() (used by
+# every other package install in this script) so this check only ever
+# applies to bolt-agent, and every other install keeps its existing
+# behavior unchanged.
+install_bolt_agent_and_check_post() {
+    if rpm -q bolt-agent &>/dev/null; then
+        print_success "bolt-agent already installed"
+        return 0
+    fi
+
+    local log dnf_status
+    log=$(mktemp)
+    if command -v dnf >/dev/null 2>&1; then
+        dnf install -y --enablerepo=bolt bolt-agent 2>&1 | tee "$log"
+        dnf_status=${PIPESTATUS[0]}
+    elif command -v yum >/dev/null 2>&1; then
+        yum install -y --enablerepo=bolt bolt-agent 2>&1 | tee "$log"
+        dnf_status=${PIPESTATUS[0]}
+    else
+        rm -f "$log"
+        print_error "dnf/yum not found"
+        exit 1
+    fi
+
+    if [[ "$dnf_status" -ne 0 ]]; then
+        rm -f "$log"
+        print_error "Installing bolt-agent failed"
+        exit 1
+    fi
+    if grep -Eq '%post\(bolt-agent[^)]*\) scriptlet failed' "$log"; then
+        rm -f "$log"
+        print_error "bolt-agent's post-install script (%post) failed. Check the output above (or 'journalctl -u bolt-agent') for the cause, fix it, then rerun this installer."
+        exit 1
+    fi
+    rm -f "$log"
+    print_success "bolt-agent installed"
+}
+
 # Step 2.3: Install all Bolt packages (repo, bolt-nginx/php/agent, panel RPM)
 stage2_install_bolt_packages() {
     print_info "Stage 2.3: Installing all Bolt packages"
@@ -220,7 +265,8 @@ stage2_install_bolt_packages() {
         panel_pkg="bolt-panel-${PANEL_VERSION}"
         print_info "Installing specific bolt-panel version: ${PANEL_VERSION}"
     fi
-    install_packages --enablerepo=bolt bolt-agent bolt-nginx bolt-php "$panel_pkg"
+    install_bolt_agent_and_check_post
+    install_packages --enablerepo=bolt bolt-nginx bolt-php "$panel_pkg"
     systemctl enable --now bolt-nginx bolt-php
     print_success "Stage 2.3 completed: all Bolt packages installed"
 }
@@ -387,6 +433,22 @@ main() {
                 ;;
         esac
     fi
+
+    # bolt-agent's %post (Stage 2) starts the box with a self-signed
+    # certificate and requests the real one in the background, so a slow or
+    # unreachable ACME endpoint never blocks this script (AB-1652). That
+    # background task waits for this marker to go away before it hot-swaps
+    # the certificate or restarts the agent, so its own reload can never land
+    # in the middle of a later stage of this whole panel-plus-agent install -
+    # Stage 3 included - and break it. Always removed on exit, success or
+    # failure, so a box never gets stuck with a marker nothing will ever
+    # clear. Lives under /var/lib/adminbolt (POST_INSTALL_DB_PATH's own
+    # directory) since it marks this install.sh run as a whole, not
+    # anything specific to the agent package.
+    mkdir -p /var/lib/adminbolt
+    touch /var/lib/adminbolt/install-in-progress
+    trap 'rm -f /var/lib/adminbolt/install-in-progress' EXIT
+
     echo -e "\n${BOLD}AdminBolt Staged Install (Stage 1 → 2 → 3)${NC}\n"
     TOTAL_START=$(date +%s)
 
