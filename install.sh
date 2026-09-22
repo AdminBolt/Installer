@@ -170,7 +170,18 @@ install_packages() {
     local missing=()
     for p in "$@"; do rpm -q "$p" &>/dev/null || missing+=("$p"); done
     [[ ${#missing[@]} -eq 0 ]] && { print_success "Packages already installed"; return 0; }
-    (command -v dnf >/dev/null 2>&1 && dnf install -y "${dnf_opts[@]}" "${missing[@]}") || (command -v yum >/dev/null 2>&1 && yum install -y "${dnf_opts[@]}" "${missing[@]}") || { print_error "dnf/yum not found"; exit 1; }
+    # Pick the package manager once: chaining dnf || yum reran a failed install
+    # through yum and then reported "dnf/yum not found", hiding dnf's error.
+    local pm
+    if command -v dnf >/dev/null 2>&1; then pm=dnf
+    elif command -v yum >/dev/null 2>&1; then pm=yum
+    else print_error "dnf/yum not found"; exit 1
+    fi
+    "$pm" install -y "${dnf_opts[@]}" "${missing[@]}" || {
+        local status=$?
+        print_error "Installing packages failed ($pm exit $status): ${missing[*]}. See $pm's output above."
+        exit "$status"
+    }
     print_success "Packages installed"
 }
 
@@ -202,6 +213,13 @@ stage2_install_prerequisite_packages() {
     print_info "Enabling CRB (CodeReady Builder) repository"
     install_packages epel-release dnf-plugins-core
     run_or_warn "dnf config-manager --set-enabled crb" "Enable CRB repo"
+    # Container and minimal AlmaLinux/Rocky 9 images ship curl-minimal and
+    # libcurl-minimal, which conflict with the full curl/libcurl below. Replace
+    # them first; --allowerasing is scoped to this one install.
+    if rpm -q curl-minimal &>/dev/null || rpm -q libcurl-minimal &>/dev/null; then
+        print_info "Replacing curl-minimal/libcurl-minimal with curl/libcurl"
+        install_packages --allowerasing curl libcurl
+    fi
     install_packages \
         libsodium traceroute openssl jq rsync ca-certificates wget curl tar gzip unzip zip sudo apg \
         systemd openssl-libs libcurl libzip zlib gmp freetype libjpeg-turbo libpng libwebp libXpm gd \
