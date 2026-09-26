@@ -123,6 +123,11 @@ detect_distribution() {
 
 # ---------- Stage 2: Install base packages ----------
 # Write bolt / bolt-noarch repos for a pulp content tier (stable, staging, testing).
+#
+# Priorities below dnf's default of 99 (lower wins, AB-1407): the AdminBolt
+# repositories carry their own builds of packages the distribution also ships
+# (httpd, httpd-core, ...), and with the previous 300/400 every such name
+# resolved to appstream/baseos instead - hosts ran the distribution Apache.
 install_bolt_repos_from_source() {
     local tier="$1"
     local repofile="/etc/yum.repos.d/bolt.repo"
@@ -133,7 +138,7 @@ name = Adminbolt RHEL - \$releasever - \$basearch
 baseurl = https://mirror.adminbolt.com/pulp/content/${tier}/rhel/\$releasever/\$basearch
 enabled = 1
 gpgcheck = 0
-priority = 300
+priority = 30
 sslverify = 0
 
 [bolt-noarch]
@@ -141,7 +146,7 @@ name = Adminbolt RHEL - \$releasever - noarch
 baseurl = https://mirror.adminbolt.com/pulp/content/${tier}/rhel/\$releasever/noarch
 enabled = 1
 gpgcheck = 0
-priority = 400
+priority = 40
 sslverify = 0
 EOF
     print_success "Repository file written: ${repofile}"
