@@ -25,6 +25,12 @@ BOLT_SOURCE=""
 # E-mail for the trial license; empty = skip the trial request (activate manually on the License page).
 ADMIN_EMAIL=""
 MARIADB_SERIES=""
+# AB-1379: steps that failed (run_or_warn), "<step>: <last error line>", and
+# the components without which the server cannot serve sites, mail or
+# databases. A failed critical component ends the install with a non-zero
+# exit status; every failure is listed in the closing summary either way.
+FAILED_STEPS=()
+readonly CRITICAL_COMPONENTS=("MariaDB" "Postfix" "Dovecot" "PHP 8.4")
 readonly WEB_INSTALL_ROOT="/usr/local/bolt/web"
 readonly POST_INSTALL_DB_PATH="/var/lib/adminbolt/db.sqlite3"
 
@@ -79,6 +85,27 @@ check_port_8443() {
     exit 1
 }
 
+# SELinux turned off on the kernel command line (selinux=0) while
+# /etc/selinux/config still says enforcing or permissive leaves the policy
+# tooling without a store: every package step that manages SELinux policy
+# (Postfix, Dovecot, Rspamd) aborts with "SELinux policy is not managed or
+# store cannot be accessed", and the install used to go on without them
+# (AB-1379). Refuse to start instead. The paths are overridable for tests.
+check_selinux_state() {
+    local cmdline="${SELINUX_CMDLINE_FILE:-/proc/cmdline}" config="${SELINUX_CONFIG_FILE:-/etc/selinux/config}" mode
+    grep -qw 'selinux=0' "$cmdline" 2>/dev/null || return 0
+    mode=$(sed -n 's/^SELINUX=//p' "$config" 2>/dev/null | tail -n 1)
+    case "$mode" in
+        enforcing|permissive)
+            print_error "SELinux is disabled on the kernel command line (selinux=0) but ${config} sets SELINUX=${mode}."
+            echo "Package steps that manage SELinux policy fail in this state, so Postfix, Dovecot and Rspamd would not install."
+            echo "Set SELINUX=disabled in ${config} (this installer disables SELinux anyway), then run the installer again."
+            exit 1
+            ;;
+    esac
+    return 0
+}
+
 # ---------- Stage 1: Check ready for installation ----------
 stage_prerequisites() {
     print_info "Stage 1: Checking that everything is in place and ready for installation"
@@ -102,6 +129,7 @@ stage_prerequisites() {
         fi
     done
     check_port_8443
+    check_selinux_state
     print_success "Stage 1 completed: ready for installation"
     print_progress "33% — prerequisites"
 }
@@ -175,9 +203,64 @@ install_packages() {
 }
 
 run_or_warn() {
-    local cmd="$1" desc="${2:-Command}"
+    local cmd="$1" desc="${2:-Command}" out rc=0
     print_info "$desc"
-    if eval "$cmd"; then print_success "$desc completed"; else echo -e "${YELLOW}WARNING:${NC} $desc failed (continuing)"; fi
+    out=$(mktemp)
+    # tee through a process substitution rather than a pipe: the command still
+    # runs in this shell, so an assignment it makes (TRIAL_LICENCE_OK) survives,
+    # and its output still streams live while a copy is kept for the summary.
+    eval "$cmd" > >(tee "$out") 2>&1 || rc=$?
+    wait $! 2>/dev/null || true
+    if [ "$rc" -eq 0 ]; then
+        print_success "$desc completed"
+    else
+        echo -e "${YELLOW}WARNING:${NC} $desc failed (continuing)"
+        record_failure "$desc" "$out"
+    fi
+    rm -f "$out"
+    echo -e ""
+}
+
+# Remember a failed step with the line of its output that says why: the last
+# line mentioning an error, or else its last non-empty line (AB-1379).
+record_failure() {
+    local desc="$1" out="$2" reason
+    reason=$(sed 's/\x1b\[[0-9;]*m//g' "$out" 2>/dev/null | grep -v '^[[:space:]]*$' | grep -iE 'error|fail|exception|cannot|not found|denied' | tail -n 1)
+    [ -n "$reason" ] || reason=$(sed 's/\x1b\[[0-9;]*m//g' "$out" 2>/dev/null | grep -v '^[[:space:]]*$' | tail -n 1)
+    reason=$(echo "${reason:-no output}" | sed 's/^[[:space:]]*//' | cut -c1-200)
+    FAILED_STEPS+=("${desc}: ${reason}")
+}
+
+# True when a failed step ("<step>: <reason>") is the install of a critical
+# component. The name must match exactly: "PHP 8.4 profile" or "Postfix
+# profiles" are follow-up steps, not the component. The MariaDB install is
+# also named after its series ("MariaDB 11.4", "MariaDB (default series)").
+is_critical_step() {
+    local step="${1%%: *}" component
+    for component in "${CRITICAL_COMPONENTS[@]}"; do
+        [ "$step" = "$component" ] && return 0
+    done
+    [[ "$step" =~ ^MariaDB\ ([0-9][0-9.]*|\(default\ series\))$ ]] && return 0
+    return 1
+}
+
+# Closing summary of every failed step, whatever the outcome (AB-1379).
+# Sets CRITICAL_FAILED=1 when a critical component is among them.
+print_failure_summary() {
+    CRITICAL_FAILED=0
+    [ "${#FAILED_STEPS[@]}" -gt 0 ] || return 0
+    local step
+    # printf %s, not echo -e: a reason is the step's own output and may carry a
+    # literal "\n" (an agent's JSON error) that must not become a line break.
+    echo -e "${BOLD}${YELLOW}--- Failed steps (${#FAILED_STEPS[@]}) ---${NC}"
+    for step in "${FAILED_STEPS[@]}"; do
+        if is_critical_step "$step"; then
+            CRITICAL_FAILED=1
+            printf '%b %s\n' "${RED}CRITICAL${NC}" "$step"
+        else
+            printf '%b  %s\n' "${YELLOW}WARNING${NC}" "$step"
+        fi
+    done
     echo -e ""
 }
 run_or_fail() {
@@ -313,6 +396,11 @@ stage_configuration() {
         else
             echo "$MARIADB_OUT"
             echo -e "${YELLOW}WARNING:${NC} MariaDB ${MARIADB_SERIES} failed (continuing)"
+            local mariadb_out_file
+            mariadb_out_file=$(mktemp)
+            printf '%s\n' "$MARIADB_OUT" > "$mariadb_out_file"
+            record_failure "MariaDB ${MARIADB_SERIES}" "$mariadb_out_file"
+            rm -f "$mariadb_out_file"
         fi
         echo -e ""
     else
@@ -368,14 +456,31 @@ stage_configuration() {
     fi
     local SSO_URL=$(bolt-cli admin-sso-generate 2>/dev/null || echo "")
     [ -z "${SSO_URL}" ] && echo -e "${YELLOW}WARNING:${NC} SSO URL not generated" || print_success "SSO URL generated"
-    echo -e "\n${BOLD}${GREEN}+----------------------------------------------------------+${NC}"
-    echo -e "${BOLD}${GREEN}|          Installation Completed Successfully             |${NC}"
-    echo -e "${BOLD}${GREEN}+----------------------------------------------------------+${NC}\n"
+    echo -e ""
+    print_failure_summary
+    if [ "$CRITICAL_FAILED" -eq 1 ]; then
+        echo -e "${BOLD}${RED}+----------------------------------------------------------+${NC}"
+        echo -e "${BOLD}${RED}|  Installation Incomplete: critical components failed     |${NC}"
+        echo -e "${BOLD}${RED}+----------------------------------------------------------+${NC}\n"
+        echo -e "${RED}This server cannot host mail, databases or PHP sites until the CRITICAL steps above are fixed and installed again (bolt-cli manage-<component> --action=install).${NC}\n"
+    elif [ "${#FAILED_STEPS[@]}" -gt 0 ]; then
+        echo -e "${BOLD}${YELLOW}+----------------------------------------------------------+${NC}"
+        echo -e "${BOLD}${YELLOW}|          Installation Completed With Warnings            |${NC}"
+        echo -e "${BOLD}${YELLOW}+----------------------------------------------------------+${NC}\n"
+    else
+        echo -e "${BOLD}${GREEN}+----------------------------------------------------------+${NC}"
+        echo -e "${BOLD}${GREEN}|          Installation Completed Successfully             |${NC}"
+        echo -e "${BOLD}${GREEN}+----------------------------------------------------------+${NC}\n"
+    fi
     [ -n "${ADMIN_EMAIL}" ] && [ "${TRIAL_LICENCE_OK}" -eq 0 ] && echo -e "${YELLOW}NOTE:${NC} Trial licence not issued (request refused or licence server unreachable). The installation itself succeeded and the panel is usable; activate a licence on its License page.\n"
     [ -n "${SSO_URL:-}" ] && echo -e "${BOLD}${CYAN}--- Access ---${NC}\n${GREEN}Admin Panel:${NC}\n${BOLD}${SSO_URL}${NC}\n"
     echo -e "${GREEN}New SSO URL:${NC}\n${BOLD}bolt-cli admin-sso-generate${NC}"
     print_progress "100% — post-install"
-    print_success "Stage 3 completed: all post-install actions done"
+    if [ "$CRITICAL_FAILED" -eq 1 ]; then
+        print_error "Stage 3 finished with failed critical components"
+    else
+        print_success "Stage 3 completed: all post-install actions done"
+    fi
 }
 
 # ---------- Main ----------
@@ -470,6 +575,11 @@ main() {
     time_section_end "Stage 3: Post-install actions"
 
     time_total_end
+
+    # AB-1379: a failed critical component makes the whole install fail, after
+    # the summary and the access details have been printed.
+    [ "${CRITICAL_FAILED:-0}" -eq 1 ] && exit 1
+    return 0
 }
 
 main "$@"
