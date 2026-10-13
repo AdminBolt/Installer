@@ -373,7 +373,17 @@ stage_configuration() {
     echo -e "${BOLD}${GREEN}+----------------------------------------------------------+${NC}\n"
     [ -n "${ADMIN_EMAIL}" ] && [ "${TRIAL_LICENCE_OK}" -eq 0 ] && echo -e "${YELLOW}NOTE:${NC} Trial licence not issued (request refused or licence server unreachable). The installation itself succeeded and the panel is usable; activate a licence on its License page.\n"
     [ -n "${SSO_URL:-}" ] && echo -e "${BOLD}${CYAN}--- Access ---${NC}\n${GREEN}Admin Panel:${NC}\n${BOLD}${SSO_URL}${NC}\n"
-    echo -e "${GREEN}New SSO URL:${NC}\n${BOLD}bolt-cli admin-sso-generate${NC}"
+    # AB-2069: nothing here used to say which login the panel takes, and the
+    # guesses (root, the hosting username, an e-mail) each counted towards a
+    # Fail2Ban ban. The link above signs in once; this is for every time after.
+    echo -e "${BOLD}${CYAN}--- Signing in later ---${NC}"
+    echo -e "${GREEN}Admin username:${NC} ${BOLD}admin${NC} (or the e-mail you enter in the setup wizard)"
+    echo -e "${GREEN}Password:${NC} the one you set in the setup wizard that opens with the link above"
+    echo -e "${GREEN}Root's system password does not sign in to the panel.${NC}\n"
+    echo -e "${BOLD}${CYAN}--- If you get locked out ---${NC}"
+    echo -e "${GREEN}New one-time sign-in link:${NC} ${BOLD}bolt-cli admin-sso-generate${NC}"
+    echo -e "${GREEN}Reset the admin password:${NC}  ${BOLD}bolt-cli reset-admin-account-password${NC}"
+    echo -e "${GREEN}Lift a Fail2Ban ban:${NC}       ${BOLD}bolt-cli fail2ban-unban <your-ip> --whitelist${NC}"
     print_progress "100% — post-install"
     print_success "Stage 3 completed: all post-install actions done"
 }
