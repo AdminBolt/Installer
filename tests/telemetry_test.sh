@@ -22,7 +22,16 @@ if ! stat -c %u / >/dev/null 2>&1; then echo "GNU stat required (see the header 
 if ! command -v jq >/dev/null 2>&1; then echo "jq required" >&2; exit 2; fi
 
 T=$(mktemp -d)
-trap 'rm -rf "$T"' EXIT
+# Fakes that hang record their PID in <child>/fake/pids; only those are stopped.
+cleanup() {
+    local f pid
+    for f in "$T"/*/fake/pids; do
+        [[ -f "$f" ]] || continue
+        while read -r pid; do [[ "$pid" =~ ^[0-9]+$ ]] && kill "$pid" 2>/dev/null; done <"$f"
+    done
+    rm -rf "$T"
+}
+trap cleanup EXIT
 export LC_ALL=C
 
 PASS=0
@@ -41,6 +50,13 @@ cat >"$T/bin/curl" <<'EOF'
 # Fake curl: records each POST body under $FAKE_DIR/req and answers with the
 # status in $FAKE_DIR/http_code. -k (the readiness check) answers panel_code.
 [[ -f "$FAKE_DIR/real_curl" ]] && exec "$(cat "$FAKE_DIR/real_curl")" "$@"
+case " $* " in
+    *get.acme.sh*)
+        # acme.sh download: acme_rc != 0 = the download fails with no output
+        rc=$(cat "$FAKE_DIR/acme_rc" 2>/dev/null || echo 0)
+        ((rc == 0)) && echo true
+        exit "$rc" ;;
+esac
 data="" insecure=0
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -53,7 +69,12 @@ if ((insecure)); then
     printf '%s' "$(cat "$FAKE_DIR/panel_code" 2>/dev/null || echo 302)"
     exit 0
 fi
-[[ -f "$FAKE_DIR/curl_sleep" ]] && sleep "$(cat "$FAKE_DIR/curl_sleep")"
+# A receiver that never answers: the process is recorded so the test can stop it.
+if [[ -f "$FAKE_DIR/curl_sleep" ]]; then
+    echo "$$" >>"$FAKE_DIR/pids"
+    exec sleep "$(cat "$FAKE_DIR/curl_sleep")"
+fi
+[[ -f "$FAKE_DIR/curl_delay" ]] && sleep "$(cat "$FAKE_DIR/curl_delay")"
 mkdir -p "$FAKE_DIR/req"
 out=$(mktemp "$FAKE_DIR/req/r.XXXXXX")
 case "$data" in
@@ -69,19 +90,55 @@ EOF
 cat >"$T/bin/systemctl" <<'EOF'
 #!/usr/bin/env bash
 echo "$*" >>"$FAKE_DIR/systemctl.log"
+# A hanging systemd: recorded so the test can stop it.
+if [[ -f "$FAKE_DIR/slow" ]]; then echo "$$" >>"$FAKE_DIR/pids"; exec sleep 6; fi
 case "$1" in
     is-system-running) cat "$FAKE_DIR/system_state" 2>/dev/null || echo running ;;
-    is-active) grep -qx "${@: -1}" "$FAKE_DIR/inactive" 2>/dev/null && exit 3; exit 0 ;;
+    is-active)
+        shift
+        rc=0 any=0
+        for u in "$@"; do
+            [[ "$u" == --* ]] && continue
+            if grep -qx "$u" "$FAKE_DIR/inactive" 2>/dev/null; then echo inactive; rc=3; else echo active; any=1; fi
+        done
+        # like systemctl: 0 when at least one of the units is active
+        ((any)) && exit 0
+        exit "$rc" ;;
 esac
 exit 0
 EOF
 cat >"$T/bin/rpm" <<'EOF'
 #!/usr/bin/env bash
-case "${@: -1}" in
-    bolt-panel) printf '1.9.3-1.el9' ;;
-    bolt-agent) printf '2.4.0-1.el9' ;;
-    *) exit 1 ;;
-esac
+if [[ -f "$FAKE_DIR/slow" ]]; then echo "$$" >>"$FAKE_DIR/pids"; exec sleep 6; fi
+fmt=""
+names=()
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        -q) ;;
+        --qf) fmt="$2"; shift ;;
+        *) names+=("$1") ;;
+    esac
+    shift
+done
+rc=0
+for n in "${names[@]}"; do
+    case "$n" in
+        bolt-panel) v=1.9.3-1.el9 ;;
+        bolt-agent) v=2.4.0-1.el9 ;;
+        *) echo "package $n is not installed"; rc=1; continue ;;
+    esac
+    if [[ "$fmt" == *NAME* ]]; then printf '%s %s\n' "$n" "$v"; else printf '%s' "$v"; fi
+done
+exit "$rc"
+EOF
+cat >"$T/bin/getenforce" <<'EOF'
+#!/usr/bin/env bash
+cat "$FAKE_DIR/selinux" 2>/dev/null || echo Enforcing
+EOF
+cat >"$T/bin/setenforce" <<'EOF'
+#!/usr/bin/env bash
+echo "setenforce $*" >>"$FAKE_DIR/setenforce.log"
+exit "$(cat "$FAKE_DIR/setenforce_rc" 2>/dev/null || echo 0)"
 EOF
 chmod +x "$T/bin/"*
 FAKEPATH="$T/bin:$PATH"
@@ -97,7 +154,7 @@ new_child() {
     cat >"$CHILD_DIR/child.sh" <<EOF
 ADMINBOLT_INSTALL_SOURCE_ONLY=1
 . "$INSTALL_SH"
-REPORT_DIR="$CHILD_DIR/spool/install-report"
+REPORT_DIR="$CHILD_DIR/spool/adminbolt-install-report"
 REPORT_SENDER="$CHILD_DIR/libexec/adminbolt/install-report-send"
 REPORT_UNIT_DIR="$CHILD_DIR/units"
 REPORT_BOLT_CONFIG="$CHILD_DIR/etc/bolt/bolt-config.ini"
@@ -116,7 +173,7 @@ run_child() {
 child() { new_child "$1" "$2"; run_child; }
 
 # Events of the last child: the spool copy when there is one, otherwise what the fake curl received.
-spool_events() { cat "$CHILD_DIR"/spool/install-report/*/events/*.json 2>/dev/null | jq -cs 'sort_by(.event_id)[]'; }
+spool_events() { cat "$CHILD_DIR"/spool/adminbolt-install-report/*/events/*.json 2>/dev/null | jq -cs 'sort_by(.event_id)[]'; }
 sent_events() { cat "$CHILD_DIR"/fake/req/* 2>/dev/null | jq -cs 'sort_by(.event_id)[]'; }
 event() { spool_events | jq -c "select(.type == \"$1\")" | tail -n 1; }
 sent_event() { sent_events | jq -c "select(.type == \"$1\")" | tail -n 1; }
@@ -125,13 +182,18 @@ field() { jq -r "$2 | if type == \"array\" then join(\",\") else tostring end" <
 # Loaded here as well, for the pure functions.
 ADMINBOLT_INSTALL_SOURCE_ONLY=1 . "$INSTALL_SH"
 set +e
-trap 'rm -rf "$T"' EXIT
+trap cleanup EXIT
 trap - INT TERM HUP
 
 # ---------------------------------------------------------------------------
 echo "# loading and the curl | bash path"
 # ---------------------------------------------------------------------------
 check "sourcing does not run the install" test "${REPORT_MODE:-}" = off
+# The panel's database install takes over the database directory recursively
+# (chown -R boltweb), so the spool must not live under it.
+eq "spool is its own directory under /var/lib" /var/lib/adminbolt-install-report "${REPORT_DIR:-}"
+rd="${REPORT_DIR:-}"
+check "spool is outside the panel database directory" test -n "$rd" -a "$rd" = "${rd#/var/lib/adminbolt/}"
 out=$( { cat "$INSTALL_SH"; } | PATH="$FAKEPATH" "$BASH" -s -- --help 2>&1)
 check "piped to bash (curl | bash), main still runs" grep -q '^Usage:' <<<"$out"
 check "usage lists --channel and --no-telemetry" grep -q -- '--channel=<name>\] \[--no-telemetry\]' <<<"$out"
@@ -291,15 +353,15 @@ eq "installer_rev" "$(sha256sum <"$INSTALL_SH" | cut -c1-64)" "$(field "$st" .in
 eq "stages reported in order" "prerequisites:ok packages:ok configuration:ok readiness:ok" "$(spool_events | jq -r 'select(.type=="stage_finished") | "\(.stage):\(.result)"' | tr '\n' ' ' | sed 's/ $//')"
 eq "event ids 1..n without gaps" "1 2 3 4 5 6" "$(spool_events | jq -r .event_id | tr '\n' ' ' | sed 's/ $//')"
 check "install_id is a v4 UUID" _report_valid_uuid "$(field "$st" .install_id)"
-all="$(cat "$CHILD_DIR"/spool/install-report/*/events/*.json "$CHILD_DIR"/fake/req/* 2>/dev/null)"
+all="$(cat "$CHILD_DIR"/spool/adminbolt-install-report/*/events/*.json "$CHILD_DIR"/fake/req/* 2>/dev/null)"
 check "no e-mail address in any event" bash -c '! grep -q "@" <<<"$1"' _ "$all"
 check "no hostname from os-release in any event" bash -c '! grep -q "host.example.com" <<<"$1"' _ "$all"
 check "no hostname of this machine in any event" bash -c '! grep -qF -- "$(hostname)" <<<"$1"' _ "$all"
 eq "every event was delivered" 6 "$(sent_events | jq -s 'map(.event_id) | unique | length')"
-eq "all marked sent" 6 "$(ls "$CHILD_DIR"/spool/install-report/*/sent | wc -l | tr -d ' ')"
+eq "all marked sent" 6 "$(ls "$CHILD_DIR"/spool/adminbolt-install-report/*/sent | wc -l | tr -d ' ')"
 check "marker removed by the EXIT trap" test ! -e "$CHILD_DIR/marker"
-idir=$(echo "$CHILD_DIR"/spool/install-report/*/)
-eq "spool root private" "700" "$(stat -c %a "$CHILD_DIR/spool/install-report")"
+idir=$(echo "$CHILD_DIR"/spool/adminbolt-install-report/*/)
+eq "spool root private" "700" "$(stat -c %a "$CHILD_DIR/spool/adminbolt-install-report")"
 eq "install dir private" "700" "$(stat -c %a "$idir")"
 eq "event file private" "600" "$(stat -c %a "$idir/events/1.json")"
 check "spool keeps the install start time" grep -qE '^[0-9]+$' "$idir/started"
@@ -522,6 +584,10 @@ eq "invalid --channel: invalid_argument" "failed parse_arguments invalid_argumen
 eq "invalid --channel reported as direct" direct "$(field "$(event install_started)" .channel)"
 child badsource 'main --channel=web-installer --source=nope'
 eq "invalid --source: invalid_argument, channel kept" "invalid_argument web-installer" "$(field "$(event install_finished)" .reason) $(field "$(event install_started)" .channel)"
+child twochannels "main '--channel=direct get-script'"
+eq "--channel with two names: invalid_argument" "1 invalid_argument direct" "$CHILD_RC $(field "$(event install_finished)" .reason) $(field "$(event install_started)" .channel)"
+child spacechannel "main '--channel= direct'"
+eq "--channel with a space: invalid_argument" "1 invalid_argument" "$CHILD_RC $(field "$(event install_finished)" .reason)"
 child help 'main --help'
 check "--help: nothing reported" test ! -e "$CHILD_DIR/spool"
 child unknownflag 'main --whatever=1 --source=nope'
@@ -591,7 +657,7 @@ report_readiness_check
 exit 0'
     echo "$code" >"$CHILD_DIR/fake/http_code"
     run_child
-    n=$(ls "$CHILD_DIR"/spool/install-report/*/sent | wc -l | tr -d ' ')
+    n=$(ls "$CHILD_DIR"/spool/adminbolt-install-report/*/sent | wc -l | tr -d ' ')
     case "$code" in 2*|400|409|413) eq "HTTP $code: all events marked sent" 5 "$n" ;; *) eq "HTTP $code: nothing marked sent" 0 "$n" ;; esac
 done
 for code in 429 507 409; do
@@ -603,7 +669,7 @@ exit 1'
     echo "$code" >"$CHILD_DIR/fake/http_code"
     SENDER="$CHILD_DIR/libexec/adminbolt/install-report-send"
     (cd / && FAKE_DIR="$CHILD_DIR/fake" PATH="$FAKEPATH" "$SENDER")
-    n=$(ls "$CHILD_DIR"/spool/install-report/*/sent | wc -l | tr -d ' ')
+    n=$(ls "$CHILD_DIR"/spool/adminbolt-install-report/*/sent | wc -l | tr -d ' ')
     if [[ "$code" == 409 ]]; then
         eq "timer, HTTP 409: delivered, sender removed" "3 gone" "$n $([[ -e "$SENDER" ]] && echo kept || echo gone)"
     else
@@ -621,11 +687,11 @@ report_step_start repo_setup
 report_fail repo_setup repo_download_failed
 exit 1'
 echo 503 >"$CHILD_DIR/fake/http_code"
-rm -rf "$CHILD_DIR/fake/req" "$CHILD_DIR"/spool/install-report/*/sent/*
+rm -rf "$CHILD_DIR/fake/req" "$CHILD_DIR"/spool/adminbolt-install-report/*/sent/*
 SENDER="$CHILD_DIR/libexec/adminbolt/install-report-send"
 run_sender() { (cd / && FAKE_DIR="$CHILD_DIR/fake" PATH="$FAKEPATH" "$@" "$SENDER"); }
 run_sender env
-eq "receiver down: nothing marked sent" 0 "$(ls "$CHILD_DIR"/spool/install-report/*/sent | wc -l | tr -d ' ')"
+eq "receiver down: nothing marked sent" 0 "$(ls "$CHILD_DIR"/spool/adminbolt-install-report/*/sent | wc -l | tr -d ' ')"
 check "receiver down: sender keeps itself" test -x "$SENDER"
 check "receiver down: timer kept" test -e "$CHILD_DIR/units/adminbolt-install-report.timer"
 echo 202 >"$CHILD_DIR/fake/http_code"
@@ -637,34 +703,34 @@ check "all delivered and finished: sender removed" test ! -e "$SENDER"
 check "timer unit removed" test ! -e "$CHILD_DIR/units/adminbolt-install-report.timer"
 check "service unit removed" test ! -e "$CHILD_DIR/units/adminbolt-install-report.service"
 check "timer disabled" grep -q 'disable --now adminbolt-install-report.timer' "$CHILD_DIR/fake/systemctl.log"
-check "spool kept" test -n "$(ls "$CHILD_DIR"/spool/install-report/*/events/*.json)"
+check "spool kept" test -n "$(ls "$CHILD_DIR"/spool/adminbolt-install-report/*/events/*.json)"
 
 child sender_old '
 report_init
 exit 1'
 echo 503 >"$CHILD_DIR/fake/http_code"
-rm -rf "$CHILD_DIR/fake/req" "$CHILD_DIR"/spool/install-report/*/sent/*
+rm -rf "$CHILD_DIR/fake/req" "$CHILD_DIR"/spool/adminbolt-install-report/*/sent/*
 echo 202 >"$CHILD_DIR/fake/http_code"
 SENDER="$CHILD_DIR/libexec/adminbolt/install-report-send"
 run_sender env ADMINBOLT_REPORT_NOW=$(($(date +%s) + 25 * 3600))
 check "after 24 h: nothing sent any more" test ! -e "$CHILD_DIR/fake/req"
 check "after 24 h: sender removed itself" test ! -e "$SENDER"
 check "after 24 h: timer removed" test ! -e "$CHILD_DIR/units/adminbolt-install-report.timer"
-check "after 24 h: spool kept" test -n "$(ls "$CHILD_DIR"/spool/install-report/*/events/*.json)"
+check "after 24 h: spool kept" test -n "$(ls "$CHILD_DIR"/spool/adminbolt-install-report/*/events/*.json)"
 
 child sender_running '
 report_init
 exit 0'
 SENDER="$CHILD_DIR/libexec/adminbolt/install-report-send"
-rm -f "$CHILD_DIR"/spool/install-report/*/finished
+rm -f "$CHILD_DIR"/spool/adminbolt-install-report/*/finished
 run_sender env
 check "install not finished (killed, rebooted): sender stays for the 24 h" test -x "$SENDER"
 
 child sender_unsafe '
 report_init
 exit 1'
-rm -rf "$CHILD_DIR/fake/req" "$CHILD_DIR"/spool/install-report/*/sent/*
-chmod 0755 "$CHILD_DIR/spool/install-report"
+rm -rf "$CHILD_DIR/fake/req" "$CHILD_DIR"/spool/adminbolt-install-report/*/sent/*
+chmod 0755 "$CHILD_DIR/spool/adminbolt-install-report"
 SENDER="$CHILD_DIR/libexec/adminbolt/install-report-send"
 run_sender env
 check "spool not private (not 0700): sender sends nothing from it" test ! -e "$CHILD_DIR/fake/req"
@@ -676,7 +742,7 @@ mkdir -m 0755 "$REPORT_DIR"; mkdir -m 0700 "$REPORT_DIR/$id" "$REPORT_DIR/$id/ev
 report_stage_begin packages
 report_stage_end
 exit 0'
-check "spool swapped for a non-private directory: installer writes nothing into it" test -z "$(ls -A "$CHILD_DIR"/spool/install-report/*/events)"
+check "spool swapped for a non-private directory: installer writes nothing into it" test -z "$(ls -A "$CHILD_DIR"/spool/adminbolt-install-report/*/events)"
 
 # ---------------------------------------------------------------------------
 echo "# event ids stay within 1..48"
@@ -710,13 +776,13 @@ echo 30 >"$CHILD_DIR/fake/curl_sleep"
 timed_child
 check "receiver hangs: final wait capped at 5 s (took ${ELAPSED}s)" awk -v e="$ELAPSED" 'BEGIN { exit !(e < 7) }'
 eq "receiver hangs: exit code unchanged" 1 "$CHILD_RC"
-pkill -f "sleep 30" 2>/dev/null
+while read -r pid; do kill "$pid" 2>/dev/null; done <"$CHILD_DIR/fake/pids"
 if [[ -n "$REAL_CURL" ]]; then
     new_child refused "ADMINBOLT_INSTALL_REPORT_URL=http://127.0.0.1:9/install-events; $flow"
     echo "$REAL_CURL" >"$CHILD_DIR/fake/real_curl"
     timed_child
     check "real curl, port closed: adds under 10 s (took ${ELAPSED}s)" awk -v e="$ELAPSED" 'BEGIN { exit !(e < 10) }'
-    eq "real curl, port closed: events stay unsent for the timer" 0 "$(ls "$CHILD_DIR"/spool/install-report/*/sent | wc -l | tr -d ' ')"
+    eq "real curl, port closed: events stay unsent for the timer" 0 "$(ls "$CHILD_DIR"/spool/adminbolt-install-report/*/sent | wc -l | tr -d ' ')"
     if command -v python3 >/dev/null 2>&1; then
         python3 -c 'import socket,sys,time
 s=socket.socket(); s.bind(("127.0.0.1",0)); s.listen(64)
@@ -731,6 +797,213 @@ print(s.getsockname()[1], flush=True); time.sleep(40)' >"$T/blackhole.port" &
         kill "$bh" 2>/dev/null
     fi
 fi
+
+# ---------------------------------------------------------------------------
+echo "# bolt-panel wrapper without a usable temporary file"
+# ---------------------------------------------------------------------------
+child nomktemp '
+report_init
+report_stage_begin packages
+install_packages() { echo "Packages already installed"; }
+mktemp() { return 1; }
+install_bolt_panel_and_check_post bolt-panel
+echo CONTINUED'
+check "mktemp fails: install goes on as before" grep -q CONTINUED "$CHILD_DIR/out"
+eq "mktemp fails: exit code 0" 0 "$CHILD_RC"
+child notee '
+report_init
+report_stage_begin packages
+install_packages() { echo "Packages installed"; }
+tee() { cat >/dev/null; return 1; }
+install_bolt_panel_and_check_post bolt-panel
+echo CONTINUED'
+check "tee fails: install goes on as before" grep -q CONTINUED "$CHILD_DIR/out"
+eq "tee fails: exit code 0" 0 "$CHILD_RC"
+child notee_dnf '
+report_init
+report_stage_begin packages
+install_packages() { exit 1; }
+tee() { cat >/dev/null; return 1; }
+install_bolt_panel_and_check_post bolt-panel
+echo NOT-REACHED'
+eq "tee fails and dnf fails: still stops with dnf's code" "1 package_install_failed" "$CHILD_RC $(field "$(event install_finished)" .reason)"
+
+# ---------------------------------------------------------------------------
+echo "# acme.sh download"
+# ---------------------------------------------------------------------------
+acme_child() {
+    new_child "acme$1" '
+report_init
+report_stage_begin packages
+install_packages() { :; }
+stage2_install_prerequisite_packages
+report_stage_end
+exit 0'
+    echo "$1" >"$CHILD_DIR/fake/acme_rc"
+    run_child
+}
+acme_child 7
+check "download fails: acme_sh is a failed optional step" grep -qw acme_sh <<<"$(field "$(event install_finished)" .failed_optional_steps)"
+acme_child 0
+check "download works: acme_sh not failed" bash -c '! grep -qw acme_sh <<<"$1"' _ "$(field "$(event install_finished)" .failed_optional_steps)"
+
+# ---------------------------------------------------------------------------
+echo "# SELinux already off"
+# ---------------------------------------------------------------------------
+selinux_child() { # $1 getenforce output, $2 setenforce exit code
+    new_child "selinux$1$2" '
+report_init
+report_stage_begin packages
+stage2_prepare_settings
+report_stage_end
+exit 0'
+    echo "$1" >"$CHILD_DIR/fake/selinux"
+    echo "$2" >"$CHILD_DIR/fake/setenforce_rc"
+    run_child
+    SEL_FAILED=$(field "$(event install_finished)" .failed_optional_steps)
+    SEL_CALLED=$([[ -e "$CHILD_DIR/fake/setenforce.log" ]] && echo called || echo not-called)
+}
+selinux_child Disabled 1
+eq "SELinux Disabled: step ok, setenforce not called" "ok not-called" "$(grep -qw selinux_enforce <<<"$SEL_FAILED" && echo failed || echo ok) $SEL_CALLED"
+selinux_child Permissive 1
+eq "SELinux Permissive: step ok, setenforce not called" "ok not-called" "$(grep -qw selinux_enforce <<<"$SEL_FAILED" && echo failed || echo ok) $SEL_CALLED"
+selinux_child Enforcing 0
+eq "SELinux Enforcing: setenforce called, step ok" "ok called" "$(grep -qw selinux_enforce <<<"$SEL_FAILED" && echo failed || echo ok) $SEL_CALLED"
+selinux_child Enforcing 1
+eq "SELinux Enforcing, setenforce fails: step failed" "failed called" "$(grep -qw selinux_enforce <<<"$SEL_FAILED" && echo failed || echo ok) $SEL_CALLED"
+
+# ---------------------------------------------------------------------------
+echo "# Ctrl+C behaves as in bash without the report (base 59535f2 had no INT trap)"
+# ---------------------------------------------------------------------------
+set -m
+# $1 name, $2 "report" or "plain", $3 body of the step script, $4 (optional)
+# the install code that runs it. Sends SIGINT to the whole process group, as
+# Ctrl+C in a terminal does.
+int_child() {
+    local init="" call="${4:-run_or_warn \"\$BASH step.sh\" \"Step\" greeting}"
+    [[ "$2" == report ]] && init="report_init; report_stage_begin configuration"
+    new_child "$1" "$init
+touch \"\$FAKE_DIR/ready\"
+$call
+echo CONTINUED
+exit 0"
+    printf '%s\n' "$3" >"$CHILD_DIR/step.sh"
+    (cd "$CHILD_DIR" && FAKE_DIR="$CHILD_DIR/fake" PATH="$FAKEPATH" exec "$BASH" child.sh >"$CHILD_DIR/out" 2>&1) &
+    local pid=$!
+    for _ in $(seq 1 50); do [[ -e "$CHILD_DIR/fake/ready" ]] && break; sleep 0.1; done
+    sleep 0.5
+    kill -INT -- "-$pid"
+    wait "$pid"
+    CHILD_RC=$?
+    INT_OUTCOME="$CHILD_RC $(grep -q CONTINUED "$CHILD_DIR/out" && echo continued || echo stopped)"
+}
+dies='sleep 20'
+handles='trap "exit 0" INT; sleep 20 & echo $! >>"$FAKE_DIR/pids"; wait $!'
+int_child int_dies_plain plain "$dies"; base_dies="$INT_OUTCOME"
+int_child int_dies_report report "$dies"
+eq "child killed by Ctrl+C: same as without the report ($base_dies)" "$base_dies" "$INT_OUTCOME"
+eq "child killed by Ctrl+C: cancelled, INT" "cancelled INT 130" "$(field "$(event install_finished)" .result) $(field "$(event install_finished)" .signal) $(field "$(event install_finished)" .exit_code)"
+int_child int_handles_plain plain "$handles"; base_handles="$INT_OUTCOME"
+int_child int_handles_report report "$handles"
+eq "child handles Ctrl+C and returns 0: same as without the report ($base_handles)" "$base_handles" "$INT_OUTCOME"
+eq "child handles Ctrl+C: install goes on, no signal recorded" "0 continued " "$INT_OUTCOME $(field "$(event install_finished)" .signal)"
+# dnf catches Ctrl+C and exits 1; the step fails, the install goes on as before,
+# and when the install then ends with an error it shows as cancelled.
+handles1='trap "exit 1" INT; sleep 20 & echo $! >>"$FAKE_DIR/pids"; wait $!'
+int_child int_handles1_plain plain "$handles1"; base_handles1="$INT_OUTCOME"
+int_child int_handles1_report report "$handles1"
+eq "child handles Ctrl+C and exits 1 (like dnf): same as without the report ($base_handles1)" "$base_handles1" "$INT_OUTCOME"
+# bolt-panel: the package step behind the %post log copy (tee) handles Ctrl+C
+# and keeps writing; base 59535f2 ran it directly, without the copy.
+pkg_step='install_packages() { "$BASH" step.sh; echo after the interruption; echo more output; }'
+int_child int_panel_plain plain "$handles" "$pkg_step
+install_packages --enablerepo=bolt bolt-nginx bolt-php bolt-panel"; base_panel="$INT_OUTCOME"
+int_child int_panel_report report "$handles" "report_stage_begin packages
+$pkg_step
+install_bolt_panel_and_check_post bolt-panel"
+eq "bolt-panel step handles Ctrl+C and keeps writing: same as without the report ($base_panel)" "$base_panel" "$INT_OUTCOME"
+check "bolt-panel step: its output after Ctrl+C still shown" grep -q 'more output' "$CHILD_DIR/out"
+new_child int_then_fail '
+report_init
+report_stage_begin packages
+REPORT_INT_SEEN=1
+report_step_start prerequisite_packages
+report_fail
+exit 1'
+run_child
+fin=$(event install_finished)
+eq "Ctrl+C absorbed, install then fails: cancelled, exit code kept" "cancelled INT interrupted 1 1" "$(field "$fin" .result) $(field "$fin" .signal) $(field "$fin" .reason) $(field "$fin" .exit_code) $CHILD_RC"
+set +m
+
+# ---------------------------------------------------------------------------
+echo "# old resend run against a new install"
+# ---------------------------------------------------------------------------
+new_child race_old '
+report_init
+exit 1'
+echo 503 >"$CHILD_DIR/fake/http_code"
+run_child
+echo 202 >"$CHILD_DIR/fake/http_code"
+echo 1 >"$CHILD_DIR/fake/curl_delay"
+SENDER="$CHILD_DIR/libexec/adminbolt/install-report-send"
+(cd / && FAKE_DIR="$CHILD_DIR/fake" PATH="$FAKEPATH" "$SENDER") &
+sender_pid=$!
+sleep 0.5
+# A new install starts while the old run is still sending, and is still going when it ends.
+sed 's/^report_init$/report_init; sleep 5; exit 0/' "$CHILD_DIR/child.sh" >"$CHILD_DIR/child2.sh"
+(cd "$CHILD_DIR" && rm -f fake/curl_delay.new; FAKE_DIR="$CHILD_DIR/fake" PATH="$FAKEPATH" "$BASH" child2.sh >"$CHILD_DIR/out2" 2>&1) &
+new_pid=$!
+wait "$sender_pid"
+check "new install running: old resend run keeps the sender" test -x "$SENDER"
+check "new install running: old resend run keeps the timer" test -e "$CHILD_DIR/units/adminbolt-install-report.timer"
+wait "$new_pid"
+eq "two installs in the spool" 2 "$(ls -d "$CHILD_DIR"/spool/adminbolt-install-report/*/ | wc -l | tr -d ' ')"
+if command -v flock >/dev/null 2>&1; then
+    check "sender takes the lock file" test -e "$CHILD_DIR/spool/adminbolt-install-report/.lock"
+    # A resend run in the middle of removing the timer (holding the lock) while
+    # a new install starts: the install puts its timer back only afterwards.
+    child lockrace '
+report_init
+exit 0'
+    (
+        flock 9
+        touch "$CHILD_DIR/fake/locked"
+        sleep 1.5
+        rm -f "$CHILD_DIR/units/adminbolt-install-report.timer" "$CHILD_DIR/units/adminbolt-install-report.service" "$CHILD_DIR/libexec/adminbolt/install-report-send"
+    ) 9>>"$CHILD_DIR/spool/adminbolt-install-report/.lock" &
+    holder=$!
+    for _ in $(seq 1 30); do [[ -e "$CHILD_DIR/fake/locked" ]] && break; sleep 0.1; done
+    run_child
+    wait "$holder"
+    check "timer removal under the lock does not take the new install's timer" test -e "$CHILD_DIR/units/adminbolt-install-report.timer"
+    check "nor its sender" test -x "$CHILD_DIR/libexec/adminbolt/install-report-send"
+else
+    echo "# skipped: flock not available (lock tests)"
+fi
+
+# ---------------------------------------------------------------------------
+echo "# slow rpm and systemd"
+# ---------------------------------------------------------------------------
+new_child slow "$flow"
+touch "$CHILD_DIR/fake/slow"
+echo 30 >"$CHILD_DIR/fake/curl_sleep"
+start=$(date +%s.%N)
+(cd "$CHILD_DIR" && FAKE_DIR="$CHILD_DIR/fake" PATH="$FAKEPATH" timeout 60 "$BASH" child.sh >"$CHILD_DIR/out" 2>&1)
+CHILD_RC=$?
+ELAPSED=$(awk -v a="$start" -v b="$(date +%s.%N)" 'BEGIN { printf "%.1f", b - a }')
+check "rpm, systemctl and receiver all hang: report adds under 10 s (took ${ELAPSED}s)" awk -v e="$ELAPSED" 'BEGIN { exit !(e < 10) }'
+eq "rpm, systemctl and receiver all hang: exit code unchanged" 1 "$CHILD_RC"
+new_child slow_ready '
+report_init
+report_stage_begin configuration; report_stage_end
+report_readiness_check
+exit 0'
+touch "$CHILD_DIR/fake/slow"
+echo 30 >"$CHILD_DIR/fake/curl_sleep"
+start=$(date +%s.%N)
+(cd "$CHILD_DIR" && FAKE_DIR="$CHILD_DIR/fake" PATH="$FAKEPATH" timeout 90 "$BASH" child.sh >"$CHILD_DIR/out" 2>&1)
+ELAPSED=$(awk -v a="$start" -v b="$(date +%s.%N)" 'BEGIN { printf "%.1f", b - a }')
+check "same with the readiness check: under 10 s (took ${ELAPSED}s)" awk -v e="$ELAPSED" 'BEGIN { exit !(e < 10) }'
 
 # ---------------------------------------------------------------------------
 echo "# every event of every run above against the KONTRAKT field rules"

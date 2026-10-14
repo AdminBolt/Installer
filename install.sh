@@ -64,8 +64,9 @@ time_total_end() {
 #
 # Reporting never changes the install: every report_* call ignores its own
 # errors, intermediate events go out in the background, and only the final
-# event waits, at most REPORT_FINAL_WAIT seconds. As root, events are also
-# kept in a root-only spool, and a systemd timer resends whatever did not get
+# event waits, at most REPORT_FINAL_WAIT seconds; all of it together adds at
+# most REPORT_BUDGET_MS to a run. As root, events are also kept in a root-only
+# spool (REPORT_DIR), and a systemd timer resends whatever did not get
 # through, every 15 minutes for 24 hours, then removes itself (the spool stays).
 # Not root: no spool and no timer; the start and the result are sent once, at
 # exit. --no-telemetry or ADMINBOLT_NO_TELEMETRY=1: nothing is sent or kept,
@@ -76,7 +77,9 @@ time_total_end() {
 # never from the message printed for it.
 # ---------------------------------------------------------------------------
 REPORT_URL="https://ai-hub.adminbolt.com/install-events"
-REPORT_DIR="/var/lib/adminbolt/install-report"
+# Not under /var/lib/adminbolt: the panel's database install hands that
+# directory, recursively, to its web user.
+REPORT_DIR="/var/lib/adminbolt-install-report"
 REPORT_SENDER="/usr/local/libexec/adminbolt/install-report-send"
 REPORT_UNIT_DIR="/etc/systemd/system"
 REPORT_UNIT_NAME="adminbolt-install-report"
@@ -87,6 +90,12 @@ REPORT_UUID_FILE="/proc/sys/kernel/random/uuid"
 REPORT_PANEL_URL="https://127.0.0.1:8443/"
 REPORT_MARKER="/var/lib/adminbolt/install-in-progress"
 REPORT_FINAL_WAIT=5
+# Upper bound, in milliseconds, on the time all reporting may add to a run;
+# every call to rpm or systemctl is cut off after REPORT_CALL_TIMEOUT seconds.
+REPORT_BUDGET_MS=8000
+REPORT_SPENT_MS=0
+REPORT_FINISH_START=0
+REPORT_CALL_TIMEOUT=2
 # Event ids 49 and 50 belong to the panel and the hub.
 REPORT_MAX_EVENT_ID=48
 REPORT_EUID=$EUID
@@ -155,7 +164,41 @@ report_reason_for_step() {
     esac
 }
 
-_report_in_list() { [[ " $2 " == *" $1 "* ]]; }
+# Exact match of one word against a space-separated list.
+_report_in_list() {
+    local w
+    for w in $2; do [[ "$w" == "$1" ]] && return 0; done
+    return 1
+}
+
+# rpm and systemctl can hang on a locked database or a busy systemd; the
+# report never waits on them for longer than REPORT_CALL_TIMEOUT seconds.
+_report_bounded() {
+    if command -v timeout >/dev/null 2>&1; then
+        timeout -k 1 "$REPORT_CALL_TIMEOUT" "$@"
+    else
+        "$@"
+    fi
+}
+
+_report_now_ms() {
+    if [[ -n "${EPOCHREALTIME:-}" ]]; then
+        local t="${EPOCHREALTIME//[.,]/}"
+        printf '%s' $((10#$t / 1000))
+    else
+        printf '%s' $(($(date +%s) * 1000))
+    fi
+}
+
+# Runs a report function and adds the time it took to REPORT_SPENT_MS.
+_report_timed() {
+    local t0 rc
+    t0=$(_report_now_ms)
+    "$@"
+    rc=$?
+    REPORT_SPENT_MS=$((REPORT_SPENT_MS + $(_report_now_ms) - t0))
+    return "$rc"
+}
 _report_valid_uuid() { [[ "$1" =~ ^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$ ]]; }
 # Value if it matches the pattern, otherwise the fallback.
 _report_clean() { if [[ "$1" =~ $2 ]]; then printf '%s' "$1"; else printf '%s' "${3:-}"; fi; }
@@ -260,15 +303,24 @@ _report_os_field() {
     )
 }
 
-_report_pkg_version() {
+# Sets REPORT_PANEL_VERSION and REPORT_AGENT_VERSION with one bounded rpm call.
+REPORT_PANEL_VERSION=""
+REPORT_AGENT_VERSION=""
+_report_pkg_versions() {
+    local name version
     command -v rpm >/dev/null 2>&1 || return 0
-    _report_clean "$(rpm -q --qf '%{VERSION}-%{RELEASE}' "$1" 2>/dev/null </dev/null)" '^[0-9A-Za-z.+~_-]{1,40}$' ""
+    while read -r name version _; do
+        version=$(_report_clean "$version" '^[0-9A-Za-z.+~_-]{1,40}$' "")
+        case "$name" in
+            bolt-panel) REPORT_PANEL_VERSION="$version" ;;
+            bolt-agent) REPORT_AGENT_VERSION="$version" ;;
+        esac
+    done < <(_report_bounded rpm -q --qf '%{NAME} %{VERSION}-%{RELEASE}\n' bolt-panel bolt-agent 2>/dev/null </dev/null)
 }
 
 # Subshell helper: cd into this install's spool directory and make sure it,
-# and the spool root, are this user's and private. /var/lib/adminbolt is
-# handed to the panel's web user once bolt-panel is installed, so the path
-# alone is not trusted: the checks run on the directory actually entered.
+# and the spool root, are this user's and private. The path alone is not
+# trusted: the checks run on the directory actually entered.
 _report_dir_private() { [[ "$(stat -c '%u %a' "$1" 2>/dev/null)" == "$REPORT_OWNER_UID 700" ]]; }
 _report_cd_install_dir() {
     cd -P "$REPORT_DIR" 2>/dev/null && _report_dir_private . \
@@ -352,9 +404,11 @@ _report_emit() {
 
 # Send everything not yet delivered (spool) or not yet sent (otherwise), in
 # parallel, and wait for those sends - and any still running - at most
-# REPORT_FINAL_WAIT seconds in total.
+# REPORT_FINAL_WAIT seconds, and never past the overall REPORT_BUDGET_MS.
 _report_flush() {
-    local id pid i running
+    local id pid i running ticks
+    ticks=$(((REPORT_BUDGET_MS - REPORT_SPENT_MS) / 100))
+    ((ticks <= REPORT_FINAL_WAIT * 10)) || ticks=$((REPORT_FINAL_WAIT * 10))
     for id in "${!REPORT_EVENTS[@]}"; do
         if [[ "$REPORT_MODE" == spool ]]; then
             [[ -e "$REPORT_DIR/$INSTALL_ID/sent/$id" ]] && continue
@@ -363,7 +417,7 @@ _report_flush() {
         fi
         _report_send_bg "$id"
     done
-    for ((i = 0; i < REPORT_FINAL_WAIT * 10; i++)); do
+    for ((i = 0; i < ticks; i++)); do
         running=0
         for pid in $REPORT_PIDS; do
             if kill -0 "$pid" 2>/dev/null; then running=1; break; fi
@@ -418,11 +472,7 @@ _report_step_result() {
 _report_system_stopping() {
     local state
     command -v systemctl >/dev/null 2>&1 || return 1
-    if command -v timeout >/dev/null 2>&1; then
-        state=$(timeout 2 systemctl is-system-running 2>/dev/null </dev/null)
-    else
-        state=$(systemctl is-system-running 2>/dev/null </dev/null)
-    fi
+    state=$(_report_bounded systemctl is-system-running 2>/dev/null </dev/null)
     [[ "$state" == stopping ]]
 }
 
@@ -434,8 +484,23 @@ _report_system_stopping() {
 _report_on_signal() {
     local sig="$1"
     REPORT_SIGNAL="$sig"
-    if [[ "$sig" != INT ]] && _report_system_stopping; then REPORT_SUPPRESS=1; fi
+    if [[ "$sig" != INT ]] && _report_timed _report_system_stopping; then REPORT_SUPPRESS=1; fi
     case "$sig" in INT) exit 130 ;; TERM) exit 143 ;; *) exit 129 ;; esac
+}
+
+# SIGINT as bash handles it without a trap: bash waits for the command in the
+# foreground and stops only when that command was itself ended by SIGINT
+# (status 130). A command that handles the interruption and returns normally
+# lets the install carry on, as it did before. dnf is one: it catches Ctrl+C
+# and exits 1. So the interruption is only remembered: if the install then
+# ends with an error it is reported as cancelled (with the real exit code);
+# if it still succeeds, it is reported as it ended.
+REPORT_INT_SEEN=0
+_report_on_int() {
+    local rc="$1"
+    REPORT_INT_SEEN=1
+    ((rc == 130)) || return 0
+    _report_on_signal INT
 }
 
 _report_finish() {
@@ -446,7 +511,10 @@ _report_finish() {
         _report_spool_mark_finished
         return 0
     fi
-    if [[ -n "$REPORT_SIGNAL" ]]; then
+    local sig="$REPORT_SIGNAL"
+    if [[ -n "$sig" ]] || ((REPORT_INT_SEEN && rc != 0)); then
+        # An absorbed Ctrl+C is only reported; the exit code stays the script's.
+        sig="${sig:-INT}"
         result="cancelled"
         failed_step="$REPORT_STEP"
         reason="interrupted"
@@ -485,12 +553,14 @@ _report_finish() {
         REPORT_STAGE_RESULT="failed"
     fi
     _report_stage_end final
+    _report_pkg_versions
     local duration=$(($(date +%s) - REPORT_START))
     ((duration >= 0 && duration <= 86400)) || duration=0
     local trial
     trial=$(_report_clean "$REPORT_TRIAL" '^(ok|failed|skipped)$' "")
-    _report_emit install_finished "\"result\":$(_report_json_str "$result"),\"failed_step\":$(_report_json_str "$failed_step"),\"reason\":$(_report_json_str "$reason"),\"exit_code\":${rc},\"signal\":$(_report_json_str "$REPORT_SIGNAL"),\"failed_optional_steps\":$(_report_json_steps "$REPORT_FAILED_OPTIONAL"),\"failed_required_steps\":$(_report_json_steps "$REPORT_FAILED_REQUIRED"),\"panel_version\":$(_report_json_str "$(_report_pkg_version bolt-panel)"),\"agent_version\":$(_report_json_str "$(_report_pkg_version bolt-agent)"),\"trial_licence\":$(_report_json_str "$trial"),\"duration_s\":${duration}" final
+    _report_emit install_finished "\"result\":$(_report_json_str "$result"),\"failed_step\":$(_report_json_str "$failed_step"),\"reason\":$(_report_json_str "$reason"),\"exit_code\":${rc},\"signal\":$(_report_json_str "$sig"),\"failed_optional_steps\":$(_report_json_steps "$REPORT_FAILED_OPTIONAL"),\"failed_required_steps\":$(_report_json_steps "$REPORT_FAILED_REQUIRED"),\"panel_version\":$(_report_json_str "$REPORT_PANEL_VERSION"),\"agent_version\":$(_report_json_str "$REPORT_AGENT_VERSION"),\"trial_licence\":$(_report_json_str "$trial"),\"duration_s\":${duration}" final
     _report_spool_mark_finished
+    REPORT_SPENT_MS=$((REPORT_SPENT_MS + $(_report_now_ms) - REPORT_FINISH_START))
     _report_flush
 }
 
@@ -502,6 +572,7 @@ report_on_exit() {
     trap '' PIPE INT TERM HUP
     set +e
     if ((INSTALL_MARKER_CREATED)); then rm -f "$REPORT_MARKER"; fi
+    REPORT_FINISH_START=$(_report_now_ms)
     [[ "$REPORT_MODE" == off ]] || _report_finish "$rc" </dev/null >/dev/null 2>&1
     if [[ -n "$REPORT_SIGNAL" ]]; then
         trap - "$REPORT_SIGNAL"
@@ -520,26 +591,25 @@ _report_write_sender() {
         printf '#!/bin/bash\n'
         printf '# AdminBolt install report: resends undelivered install events (AB-2067).\n'
         printf '# Written by install.sh; removes itself, its timer and its service after 24 hours\n'
-        printf '# or once everything is delivered. The spool directory is kept.\n'
+        printf '# or once nothing is left to send. The spool directory is kept.\n'
         printf 'SPOOL=%q\nURL=%q\nUNIT_DIR=%q\nUNIT_NAME=%q\nSELF=%q\nOWNER_UID=%q\n' \
             "$REPORT_DIR" "$REPORT_URL" "$REPORT_UNIT_DIR" "$REPORT_UNIT_NAME" "$dest" "$REPORT_OWNER_UID"
         cat <<'SENDER'
 umask 077
 MAX_AGE=86400
 now=${ADMINBOLT_REPORT_NOW:-$(date +%s)}
-pending=0
 
 private_dir() { [ "$(stat -c '%u %a' "$1" 2>/dev/null)" = "$OWNER_UID 700" ]; }
+valid_id() { [[ "$1" =~ ^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$ ]]; }
+bounded() { if command -v timeout >/dev/null 2>&1; then timeout -k 1 2 "$@"; else "$@"; fi; }
 
-# Runs in a subshell from the spool directory; returns 1 while anything of
-# this install may still need sending.
+# Run from the spool directory, in a subshell: tries every undelivered event
+# of one install younger than 24 hours.
 send_install() {
-    local started f n code left=0
+    local started f n code
     cd -P "./$1" 2>/dev/null && private_dir . || return 0
     started=$(cat started 2>/dev/null)
-    [[ "$started" =~ ^[0-9]+$ ]] || return 0
-    ((now - started <= MAX_AGE)) || return 0
-    [ -e finished ] || left=1
+    [[ "$started" =~ ^[0-9]+$ ]] && ((now - started <= MAX_AGE)) || return 0
     for f in events/*.json; do
         [ -f "$f" ] && [ ! -L "$f" ] || continue
         n=${f#events/}
@@ -549,26 +619,52 @@ send_install() {
         code=$(curl -s -o /dev/null -w '%{http_code}' --connect-timeout 2 --max-time 5 \
             -H 'Content-Type: application/json' --data-binary "@$f" "$URL" </dev/null 2>/dev/null) || true
         # 2xx and 400/409/413 are final; 429, 507, 5xx and no answer are retried.
-        if [[ "$code" =~ ^(2[0-9][0-9]|400|409|413)$ ]]; then : >"sent/$n"; else left=1; fi
+        if [[ "$code" =~ ^(2[0-9][0-9]|400|409|413)$ ]]; then : >"sent/$n"; fi
     done
-    return "$left"
+    return 0
+}
+
+# Run from the spool directory, in a subshell: succeeds while this install,
+# younger than 24 hours, is still running or has events not yet delivered.
+needs_timer() {
+    local started f n
+    cd -P "./$1" 2>/dev/null && private_dir . || return 1
+    started=$(cat started 2>/dev/null)
+    [[ "$started" =~ ^[0-9]+$ ]] && ((now - started <= MAX_AGE)) || return 1
+    [ -e finished ] || return 0
+    for f in events/*.json; do
+        [ -f "$f" ] || continue
+        n=${f#events/}
+        n=${n%.json}
+        [ -e "sent/$n" ] || return 0
+    done
+    return 1
 }
 
 remove_self() {
-    systemctl disable --now "$UNIT_NAME.timer" </dev/null >/dev/null 2>&1
+    bounded systemctl disable --now "$UNIT_NAME.timer" </dev/null >/dev/null 2>&1
     rm -f "$UNIT_DIR/$UNIT_NAME.timer" "$UNIT_DIR/$UNIT_NAME.service"
-    systemctl daemon-reload </dev/null >/dev/null 2>&1
+    bounded systemctl daemon-reload </dev/null >/dev/null 2>&1
     rm -f "$SELF"
     rmdir "${SELF%/*}" 2>/dev/null
 }
 
 if cd -P "$SPOOL" 2>/dev/null && private_dir .; then
+    # The installer takes the same lock to put the timer in place, so this run
+    # never removes the timer of an install that has just started.
+    if command -v flock >/dev/null 2>&1 && exec 9>>.lock; then
+        flock -w 60 9 || exit 0
+    fi
     for d in *; do
-        [[ "$d" =~ ^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$ ]] || continue
-        (send_install "$d") || pending=1
+        valid_id "$d" && (send_install "$d")
+    done
+    # Looked at again, after sending: an install that started meanwhile
+    # keeps the timer.
+    for d in *; do
+        valid_id "$d" && (needs_timer "$d") && exit 0
     done
 fi
-((pending)) || remove_self
+remove_self
 exit 0
 SENDER
     } >"$tmp" && chmod 0700 "$tmp" && mv -f "$tmp" "$dest" && return 0
@@ -576,9 +672,22 @@ SENDER
     return 1
 }
 
+# In the background: it waits for a resend run that holds the spool lock, and
+# systemd can be slow, neither of which the install should wait for.
 _report_install_timer() {
     command -v systemctl >/dev/null 2>&1 || return 1
     [[ -d "$REPORT_UNIT_DIR" ]] || return 1
+    (
+        set +e
+        if command -v flock >/dev/null 2>&1 && exec 9>>"$REPORT_DIR/.lock"; then
+            flock -w 60 9
+        fi
+        _report_put_timer
+    ) </dev/null >/dev/null 2>&1 &
+    REPORT_PIDS+=" $!"
+}
+
+_report_put_timer() {
     _report_write_sender "$REPORT_SENDER" || return 1
     local svc="$REPORT_UNIT_DIR/$REPORT_UNIT_NAME.service" tim="$REPORT_UNIT_DIR/$REPORT_UNIT_NAME.timer"
     printf '[Unit]\nDescription=AdminBolt install report: resend undelivered events\nWants=network-online.target\nAfter=network-online.target\n\n[Service]\nType=oneshot\nExecStart=%s\n' \
@@ -586,8 +695,8 @@ _report_install_timer() {
     # OnActiveSec covers this boot, OnBootSec the boots after a restart.
     printf '[Unit]\nDescription=AdminBolt install report: resend undelivered events every 15 minutes for 24 hours\n\n[Timer]\nOnBootSec=5min\nOnActiveSec=15min\nOnUnitActiveSec=15min\n\n[Install]\nWantedBy=timers.target\n' \
         >"$tim.tmp" && chmod 0644 "$tim.tmp" && mv -f "$tim.tmp" "$tim" || return 1
-    systemctl daemon-reload </dev/null >/dev/null 2>&1
-    systemctl enable --now "$REPORT_UNIT_NAME.timer" </dev/null >/dev/null 2>&1
+    _report_bounded systemctl daemon-reload </dev/null >/dev/null 2>&1
+    _report_bounded systemctl enable --now "$REPORT_UNIT_NAME.timer" </dev/null >/dev/null 2>&1
 }
 
 _report_init() {
@@ -615,7 +724,7 @@ _report_init() {
             REPORT_MODE="memory"
         fi
     fi
-    trap '_report_on_signal INT' INT
+    trap '_report_on_int "$?"' INT
     trap '_report_on_signal TERM' TERM
     trap '_report_on_signal HUP' HUP
     local host="${REPORT_URL#*://}"
@@ -683,11 +792,11 @@ _report_write_panel_settings() {
 }
 
 _report_ready() {
-    local svc code
-    for svc in bolt-agent bolt-nginx bolt-php mariadb postfix dovecot; do
-        systemctl is-active --quiet "$svc" </dev/null 2>/dev/null || return 1
-    done
-    code=$(curl -k -s -o /dev/null -w '%{http_code}' --connect-timeout 2 --max-time 5 "$REPORT_PANEL_URL" </dev/null 2>/dev/null) || true
+    local states code
+    # One bounded call; it prints one state per unit, all must be "active".
+    states=$(_report_bounded systemctl is-active bolt-agent bolt-nginx bolt-php mariadb postfix dovecot </dev/null 2>/dev/null)
+    [[ "$(printf '%s\n' "$states" | grep -cx active)" -eq 6 ]] || return 1
+    code=$(curl -k -s -o /dev/null -w '%{http_code}' --connect-timeout 2 --max-time 3 "$REPORT_PANEL_URL" </dev/null 2>/dev/null) || true
     [[ "$code" =~ ^[1-4][0-9][0-9]$ ]]
 }
 
@@ -708,7 +817,7 @@ _report_readiness_check() {
 # Hook points used by the install steps. None of them can fail or print
 # (apart from the start notice and a --no-telemetry warning).
 report_init() {
-    _report_init 2>/dev/null || true
+    _report_timed _report_init 2>/dev/null || true
     trap report_on_exit EXIT
 }
 report_stage_begin() { [[ "$REPORT_MODE" == off ]] || { _report_stage_end 2>/dev/null; _report_stage_begin "$1"; } || true; }
@@ -719,7 +828,7 @@ report_step_result() { _report_step_result "$@" 2>/dev/null || true; }
 report_fail() { _report_step_result "${1:-$REPORT_STEP}" failed "${2:-}" 2>/dev/null || true; }
 report_trial_licence() { REPORT_TRIAL="$1"; }
 report_write_panel_settings() { _report_write_panel_settings 2>/dev/null || true; }
-report_readiness_check() { _report_readiness_check 2>/dev/null || true; }
+report_readiness_check() { _report_timed _report_readiness_check 2>/dev/null || true; }
 
 # Check if port 8443 is free, or already used by an existing bolt-nginx.
 # If used by some other service, abort installation early.
@@ -869,11 +978,21 @@ run_or_fail() {
     echo -e ""
 }
 
+# SELinux already Disabled or Permissive: nothing to switch off (setenforce
+# would fail on a Disabled system and report a warning for nothing).
+selinux_not_enforcing() {
+    command -v getenforce >/dev/null 2>&1 || return 1
+    case "$(getenforce 2>/dev/null)" in
+        Disabled|Permissive) return 0 ;;
+    esac
+    return 1
+}
+
 # ---------- Stage 2: Prepare → Prerequisite packages → Bolt packages ----------
 # Step 2.1: Prepare all settings (no package installs)
 stage2_prepare_settings() {
     print_info "Stage 2.1: Preparing settings"
-    run_or_warn "setenforce 0" "SELinux enforce" selinux_enforce
+    run_or_warn "selinux_not_enforcing || setenforce 0" "SELinux enforce" selinux_enforce
     run_or_warn "sed -i 's#^SELINUX=.*#SELINUX=disabled#' /etc/selinux/config" "SELinux config" selinux_config
     print_success "Stage 2.1 completed: settings prepared"
 }
@@ -891,7 +1010,8 @@ stage2_install_prerequisite_packages() {
         systemd openssl-libs libcurl libzip zlib gmp freetype libjpeg-turbo libpng libwebp libXpm gd \
         gettext-libs libicu sqlite-libs oniguruma libxslt shadow-utils chrony restic rclone git
     run_or_warn "systemctl enable --now chronyd" "Time synchronization (chronyd)" chronyd
-    run_or_warn "curl https://get.acme.sh | sh -s email=issue-ssl@adminbolt.com" "acme.sh" acme_sh
+    # pipefail: a failed download feeds sh nothing, which sh reports as success.
+    run_or_warn "(set -o pipefail; curl https://get.acme.sh | sh -s email=issue-ssl@adminbolt.com)" "acme.sh" acme_sh
     print_success "Stage 2.2 completed: prerequisite packages installed"
 }
 
@@ -951,12 +1071,30 @@ install_bolt_agent_and_check_post() {
 # installer - when to stop is a separate decision (AB-2067 reports, it does
 # not change the flow) - it is reported as panel_scriptlet_failed and the
 # install carries on exactly as before.
+#
+# The log copy is only for this check: when no temporary file can be made the
+# packages are installed exactly as before and the check is skipped, and a
+# failing tee cannot stop the install either (the pipeline runs without
+# set -e, the package step itself still with it). A skipped or incomplete
+# log means the %post failure goes unreported, never a false one.
 install_bolt_panel_and_check_post() {
-    local log status
+    local log status errexit=0
     report_step_start panel_install
-    log=$(mktemp)
-    install_packages --enablerepo=bolt bolt-nginx bolt-php "$1" 2>&1 | tee "$log"
+    if ! log=$(mktemp 2>/dev/null); then
+        install_packages --enablerepo=bolt bolt-nginx bolt-php "$1"
+        report_step_result panel_install ok
+        return 0
+    fi
+    [[ $- == *e* ]] && errexit=1
+    set +e
+    # tee ignores Ctrl+C: dnf may handle it and go on writing, and a tee killed
+    # by it would turn that into a broken pipe the install never had before.
+    (
+        ((errexit)) && set -e
+        install_packages --enablerepo=bolt bolt-nginx bolt-php "$1"
+    ) 2>&1 | { trap '' INT; tee "$log"; }
     status=${PIPESTATUS[0]}
+    ((errexit)) && set -e
     if [[ "$status" -ne 0 ]]; then
         rm -f "$log"
         report_fail panel_install package_install_failed
@@ -1147,7 +1285,7 @@ main() {
     report_init
     report_step_start parse_arguments
 
-    if [[ -n "$REPORT_CHANNEL_ARG" ]] && ! [[ " $REPORT_CHANNELS " == *" $REPORT_CHANNEL_ARG "* ]]; then
+    if [[ -n "$REPORT_CHANNEL_ARG" ]] && ! _report_in_list "$REPORT_CHANNEL_ARG" "$REPORT_CHANNELS"; then
         print_error "Invalid --channel=${REPORT_CHANNEL_ARG} (allowed: ${REPORT_CHANNELS// /, })"
         print_usage
         report_fail parse_arguments invalid_argument
