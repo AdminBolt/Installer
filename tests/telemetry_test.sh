@@ -96,7 +96,11 @@ echo "$*" >>"$FAKE_DIR/systemctl.log"
 # A hanging systemd: recorded so the test can stop it.
 if [[ -f "$FAKE_DIR/slow" ]]; then echo "$$" >>"$FAKE_DIR/pids"; s=$(cat "$FAKE_DIR/slow"); exec sleep "${s:-6}"; fi
 case "$1" in
-    is-system-running) cat "$FAKE_DIR/system_state" 2>/dev/null || echo running ;;
+    is-system-running)
+        st=$(cat "$FAKE_DIR/system_state" 2>/dev/null || echo running)
+        # "killed": systemd killing new processes in a stopping unit (E5 reboots)
+        [[ "$st" == killed ]] && kill -KILL $$
+        printf '%s\n' "$st" ;;
     is-active)
         shift
         rc=0 any=0
@@ -164,6 +168,7 @@ REPORT_BOLT_CONFIG="$CHILD_DIR/etc/bolt/bolt-config.ini"
 REPORT_DMI_DIR="$CHILD_DIR/dmi"
 REPORT_OS_RELEASE="$CHILD_DIR/os-release"
 REPORT_MARKER="$CHILD_DIR/marker"
+REPORT_SHUTDOWN_MARKERS="$CHILD_DIR/run/shutdown-scheduled $CHILD_DIR/run/nologin"
 REPORT_UUID_FILE="$CHILD_DIR/no-such-uuid"
 REPORT_EUID=\${TEST_EUID:-0}
 $2
@@ -517,7 +522,7 @@ check "script stops there as before" bash -c '! grep -q NOT-REACHED "$1"' _ "$CH
 echo "# signals"
 # ---------------------------------------------------------------------------
 set -m
-sig_child() { # $1 name, $2 signal, $3 system state
+sig_child() { # $1 name, $2 signal, $3 system state, $4 shutdown marker to create before the signal
     new_child "$1" '
 report_init
 report_stage_begin packages
@@ -525,11 +530,12 @@ report_step_start agent_install
 INSTALL_MARKER_CREATED=1; touch "$REPORT_MARKER"
 sleep 20 & wait $!
 echo NOT-REACHED'
-    [[ -n "${3:-}" ]] && echo "$3" >"$CHILD_DIR/fake/system_state"
+    if [[ $# -ge 3 ]]; then printf '%s' "$3" >"$CHILD_DIR/fake/system_state"; fi
     (cd "$CHILD_DIR" && FAKE_DIR="$CHILD_DIR/fake" PATH="$FAKEPATH" exec "$BASH" child.sh >"$CHILD_DIR/out" 2>&1) &
     local pid=$!
     for _ in $(seq 1 50); do [[ -e "$CHILD_DIR/marker" ]] && break; sleep 0.1; done
     sleep 0.3
+    if [[ -n "${4:-}" ]]; then mkdir -p "$CHILD_DIR/run"; : >"$CHILD_DIR/run/$4"; fi
     kill -s "$2" "$pid"
     wait "$pid"
     CHILD_RC=$?
@@ -551,6 +557,23 @@ sig_child hup HUP
 eq "HUP: cancelled, exit 129" "cancelled HUP 129" "$(field "$(event install_finished)" .result) $(field "$(event install_finished)" .signal) $CHILD_RC"
 sig_child hup_shutdown HUP stopping
 eq "HUP during shutdown: no install_finished" "" "$(event install_finished)"
+# E5 B2: on a reboot, systemd killed the systemctl started from the TERM
+# trap before it answered, and the install showed as cancelled.
+sig_child term_killed TERM killed
+eq "TERM, state check killed (reboot): no install_finished" "" "$(event install_finished)"
+eq "TERM, state check killed: nothing like it sent" "" "$(sent_event install_finished)"
+eq "TERM, state check killed: exit 143 as before" 143 "$CHILD_RC"
+sig_child term_empty TERM ""
+eq "TERM, empty answer from systemd: no install_finished" "" "$(event install_finished)"
+sig_child hup_killed HUP killed
+eq "HUP, state check killed: no install_finished" "" "$(event install_finished)"
+for m in shutdown-scheduled nologin; do
+    sig_child "term_$m" TERM running "$m"
+    eq "TERM with shutdown marker $m: no install_finished" "" "$(event install_finished)"
+    check "TERM with shutdown marker $m: systemd not asked" bash -c '! grep -q is-system-running "$1"' _ "$CHILD_DIR/fake/systemctl.log"
+done
+sig_child term_degraded TERM degraded
+eq "TERM, system up (degraded): cancelled" "cancelled TERM 143" "$(field "$(event install_finished)" .result) $(field "$(event install_finished)" .signal) $CHILD_RC"
 set +m
 
 # ---------------------------------------------------------------------------

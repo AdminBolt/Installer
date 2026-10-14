@@ -93,6 +93,10 @@ REPORT_OS_RELEASE="/etc/os-release"
 REPORT_UUID_FILE="/proc/sys/kernel/random/uuid"
 REPORT_PANEL_URL="https://127.0.0.1:8443/"
 REPORT_MARKER="/var/lib/adminbolt/install-in-progress"
+# Present while the system is going down: a scheduled shutdown, and logins
+# closed (systemd-user-sessions creates it on its way down; it also exists
+# early in boot, before logins open).
+REPORT_SHUTDOWN_MARKERS="/run/systemd/shutdown/scheduled /run/nologin"
 REPORT_FINAL_WAIT=5
 # Upper bound, in milliseconds, on the time all reporting may add to a run;
 # every call to rpm or systemctl is cut off after REPORT_CALL_TIMEOUT seconds.
@@ -498,22 +502,37 @@ _report_step_result() {
     REPORT_STAGE_RESULT="failed"
 }
 
-_report_system_stopping() {
-    local state
+# TERM or HUP: succeeds only when it is known that the system is up and
+# not shutting down, i.e. someone stopped the install. Anything else - a
+# shutdown, or no answer - fails, and the install then reports nothing
+# (no_result) rather than a cancellation it cannot prove.
+# A shutdown is looked for first in files, without starting a process:
+# while the system stops, systemd may kill every new process in the
+# install's unit, and a systemctl started from here then dies before it
+# answers (seen on reboots in E5: an empty answer after a few ms).
+_report_operator_stop() {
+    local f state
+    for f in $REPORT_SHUTDOWN_MARKERS; do
+        [[ -e "$f" ]] && return 1
+    done
     command -v systemctl >/dev/null 2>&1 || return 1
     state=$(_report_bounded systemctl is-system-running 2>/dev/null </dev/null)
-    [[ "$state" == stopping ]]
+    case "$state" in
+        initializing|starting|running|degraded|maintenance) return 0 ;;
+    esac
+    return 1
 }
 
 # The signal is recorded and the script exits through the EXIT trap, which
 # reports it and then delivers the same signal again with its default action,
 # so the script still ends killed by that signal, as it would without these
-# traps. TERM or HUP while the system shuts down is not a cancellation:
-# nothing is reported, and the attempt shows as no_result.
+# traps. TERM or HUP is a cancellation only while the system is known to be
+# up; during a shutdown, or when that cannot be told, nothing is reported
+# and the attempt shows as no_result.
 _report_on_signal() {
     local sig="$1"
     REPORT_SIGNAL="$sig"
-    if [[ "$sig" != INT ]] && _report_timed _report_system_stopping; then REPORT_SUPPRESS=1; fi
+    if [[ "$sig" != INT ]] && ! _report_timed _report_operator_stop; then REPORT_SUPPRESS=1; fi
     case "$sig" in INT) exit 130 ;; TERM) exit 143 ;; *) exit 129 ;; esac
 }
 
