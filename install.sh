@@ -106,6 +106,8 @@ REPORT_EUID=$EUID
 REPORT_OWNER_UID=0
 REPORT_CHANNEL="direct"
 REPORT_CHANNEL_ARG=""
+# Set when --channel was given at all, so an empty value can be told apart.
+REPORT_CHANNEL_GIVEN=0
 REPORT_NO_TELEMETRY=0
 # off | spool (root) | memory (root, spool unusable) | deferred (not root)
 REPORT_MODE="off"
@@ -1319,6 +1321,11 @@ main() {
                 ;;
             --channel=*)
                 REPORT_CHANNEL_ARG="${arg#--channel=}"
+                REPORT_CHANNEL_GIVEN=1
+                ;;
+            --channel)
+                REPORT_CHANNEL_ARG=""
+                REPORT_CHANNEL_GIVEN=1
                 ;;
             --no-telemetry)
                 REPORT_NO_TELEMETRY=1
@@ -1330,11 +1337,15 @@ main() {
     report_init
     report_step_start parse_arguments
 
-    if [[ -n "$REPORT_CHANNEL_ARG" ]] && ! _report_in_list "$REPORT_CHANNEL_ARG" "$REPORT_CHANNELS"; then
-        print_error "Invalid --channel=${REPORT_CHANNEL_ARG} (allowed: ${REPORT_CHANNELS// /, })"
-        print_usage
-        report_fail parse_arguments invalid_argument
-        exit 1
+    # --channel only labels the report, so a value it does not know (a typo,
+    # an empty one) never stops the install: one warning, and the install is
+    # reported as direct. The value is shown cut to 40 characters, with
+    # anything unprintable as "?", and printed with %s, never interpreted.
+    if ((REPORT_CHANNEL_GIVEN)) && ! _report_in_list "$REPORT_CHANNEL_ARG" "$REPORT_CHANNELS"; then
+        local shown="${REPORT_CHANNEL_ARG:0:40}"
+        shown="${shown//[^[:print:]]/?}"
+        printf '%bWARNING:%b unknown --channel=%s, reporting this install as direct (known: %s)\n' \
+            "$YELLOW" "$NC" "$shown" "${REPORT_CHANNELS// /, }"
     fi
 
     if [[ -n "$MARIADB_SERIES" ]]; then

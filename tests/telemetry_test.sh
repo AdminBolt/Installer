@@ -580,17 +580,35 @@ fi
 # ---------------------------------------------------------------------------
 echo "# arguments (real main)"
 # ---------------------------------------------------------------------------
-child badchannel 'main --channel=bogus'
-eq "invalid --channel: exit 1" 1 "$CHILD_RC"
-fin=$(event install_finished)
-eq "invalid --channel: invalid_argument" "failed parse_arguments invalid_argument" "$(field "$fin" .result) $(field "$fin" .failed_step) $(field "$fin" .reason)"
-eq "invalid --channel reported as direct" direct "$(field "$(event install_started)" .channel)"
+# --channel only labels the report: an unknown, empty or missing value warns
+# once, is reported as direct, and the install goes on (here up to Stage 1,
+# replaced by a stub that ends the run).
+chan_child() { # $1 name, $2 the --channel argument(s) as shell words
+    child "$1" "stage_prerequisites() { echo REACHED-STAGE1; exit 0; }
+main $2"
+    CHAN_OUT="$CHILD_RC $(grep -q REACHED-STAGE1 "$CHILD_DIR/out" && echo continued || echo stopped) $(field "$(event install_started)" .channel) $(grep -c 'WARNING:.*unknown --channel=' "$CHILD_DIR/out")"
+}
+chan_child badchannel '--channel=bogus'
+eq "unknown --channel: one warning, reported as direct, install goes on" "0 continued direct 1" "$CHAN_OUT"
+check "unknown --channel: not an invalid_argument" bash -c '! grep -q invalid_argument <<<"$1"' _ "$(field "$(event install_finished)" .reason)"
+chan_child emptychannel '--channel='
+eq "empty --channel=: one warning, direct, install goes on" "0 continued direct 1" "$CHAN_OUT"
+chan_child barechannel '--channel'
+eq "--channel without a value: one warning, direct, install goes on" "0 continued direct 1" "$CHAN_OUT"
+chan_child twochannels "'--channel=direct get-script'"
+eq "--channel with two names: one warning, direct, install goes on" "0 continued direct 1" "$CHAN_OUT"
+chan_child spacechannel "'--channel= direct'"
+eq "--channel with a space: one warning, direct, install goes on" "0 continued direct 1" "$CHAN_OUT"
+chan_child goodchannel '--channel=web-installer'
+eq "known --channel: no warning, kept" "0 continued web-installer 0" "$CHAN_OUT"
+chan_child ctlchannel "\$'--channel=bo\\e[31mgus\\ttab\\\\n'"
+eq "--channel with control characters: one warning, direct, install goes on" "0 continued direct 1" "$CHAN_OUT"
+check "control characters shown as '?', backslash as typed" grep -qF 'unknown --channel=bo?[31mgus?tab\n,' "$CHILD_DIR/out"
+check "no raw escape from the value reaches the screen" bash -c '! grep -q $'"'"'bo\e\[31m'"'"' "$1"' _ "$CHILD_DIR/out"
+chan_child longchannel "--channel=$(printf 'x%.0s' {1..300})"
+check "long --channel cut to 40 characters in the warning" grep -qE 'unknown --channel=x{40},' "$CHILD_DIR/out"
 child badsource 'main --channel=web-installer --source=nope'
 eq "invalid --source: invalid_argument, channel kept" "invalid_argument web-installer" "$(field "$(event install_finished)" .reason) $(field "$(event install_started)" .channel)"
-child twochannels "main '--channel=direct get-script'"
-eq "--channel with two names: invalid_argument" "1 invalid_argument direct" "$CHILD_RC $(field "$(event install_finished)" .reason) $(field "$(event install_started)" .channel)"
-child spacechannel "main '--channel= direct'"
-eq "--channel with a space: invalid_argument" "1 invalid_argument" "$CHILD_RC $(field "$(event install_finished)" .reason)"
 child help 'main --help'
 check "--help: nothing reported" test ! -e "$CHILD_DIR/spool"
 child unknownflag 'main --whatever=1 --source=nope'
