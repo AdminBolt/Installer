@@ -357,6 +357,10 @@ stage_configuration() {
     # QA F2: a bare restart under set -e aborted the whole run (no trial
     # licence, no SSO URL, no banner) whenever rspamd was not installed.
     run_or_warn "systemctl restart rspamd" "Rspamd restart"
+    # AB-2069: the page the web server shows on port 80 for the server IP (and
+    # for domains with no site yet). Written by the panel through bolt-agent, so
+    # it carries the brand and the panel port; never fatal.
+    run_or_warn "bolt-cli publish-default-site-page" "Default site page"
     # Trial licence last: nothing in the install depends on it, and the licence server refuses repeats
     # per e-mail and per IP, which must never abort an otherwise complete installation.
     local TRIAL_LICENCE_OK=0
