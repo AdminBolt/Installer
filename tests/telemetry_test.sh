@@ -57,11 +57,12 @@ case " $* " in
         ((rc == 0)) && echo true
         exit "$rc" ;;
 esac
-data="" insecure=0
+data="" insecure=0 url=""
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --data-binary) data="$2"; shift ;;
         -k) insecure=1 ;;
+        http://*|https://*) url="$1" ;;
     esac
     shift
 done
@@ -82,6 +83,8 @@ case "$data" in
     @*) cat "${data#@}" >"$out" ;;
     *) printf '%s' "$data" >"$out" ;;
 esac
+# Which receiver each install's events went to.
+printf '%s %s\n' "$(grep -o '"install_id":"[0-9a-f-]*"' "$out" | cut -d'"' -f4)" "$url" >>"$FAKE_DIR/urls"
 code=$(cat "$FAKE_DIR/http_code" 2>/dev/null || echo 202)
 printf '%s' "$code"
 [[ "$code" == 000 ]] && exit 7
@@ -91,7 +94,7 @@ cat >"$T/bin/systemctl" <<'EOF'
 #!/usr/bin/env bash
 echo "$*" >>"$FAKE_DIR/systemctl.log"
 # A hanging systemd: recorded so the test can stop it.
-if [[ -f "$FAKE_DIR/slow" ]]; then echo "$$" >>"$FAKE_DIR/pids"; exec sleep 6; fi
+if [[ -f "$FAKE_DIR/slow" ]]; then echo "$$" >>"$FAKE_DIR/pids"; s=$(cat "$FAKE_DIR/slow"); exec sleep "${s:-6}"; fi
 case "$1" in
     is-system-running) cat "$FAKE_DIR/system_state" 2>/dev/null || echo running ;;
     is-active)
@@ -109,7 +112,7 @@ exit 0
 EOF
 cat >"$T/bin/rpm" <<'EOF'
 #!/usr/bin/env bash
-if [[ -f "$FAKE_DIR/slow" ]]; then echo "$$" >>"$FAKE_DIR/pids"; exec sleep 6; fi
+if [[ -f "$FAKE_DIR/slow" ]]; then echo "$$" >>"$FAKE_DIR/pids"; s=$(cat "$FAKE_DIR/slow"); exec sleep "${s:-6}"; fi
 fmt=""
 names=()
 while [[ $# -gt 0 ]]; do
@@ -1004,6 +1007,113 @@ start=$(date +%s.%N)
 (cd "$CHILD_DIR" && FAKE_DIR="$CHILD_DIR/fake" PATH="$FAKEPATH" timeout 90 "$BASH" child.sh >"$CHILD_DIR/out" 2>&1)
 ELAPSED=$(awk -v a="$start" -v b="$(date +%s.%N)" 'BEGIN { printf "%.1f", b - a }')
 check "same with the readiness check: under 10 s (took ${ELAPSED}s)" awk -v e="$ELAPSED" 'BEGIN { exit !(e < 10) }'
+
+# ---------------------------------------------------------------------------
+echo "# bolt-panel wrapper: a tee that stops at once, reading nothing"
+# ---------------------------------------------------------------------------
+# The package step writes only after tee is gone, so nothing sits in the pipe buffer.
+child tee_gone '
+report_init
+report_stage_begin packages
+install_packages() { sleep 0.5; echo "first package line"; echo "last package line"; }
+tee() { return 1; }
+install_bolt_panel_and_check_post bolt-panel
+echo CONTINUED'
+eq "tee gone at once: install goes on with exit code 0" "0 continued" "$CHILD_RC $(grep -q CONTINUED "$CHILD_DIR/out" && echo continued || echo stopped)"
+check "tee gone at once: package output still shown" grep -q 'last package line' "$CHILD_DIR/out"
+child tee_gone_dnf '
+report_init
+report_stage_begin packages
+install_packages() { sleep 0.5; echo "Error: transaction failed"; exit 5; }
+tee() { return 127; }
+install_bolt_panel_and_check_post bolt-panel
+echo NOT-REACHED'
+eq "tee gone at once and dnf fails: stops with dnf's own code" "5 package_install_failed" "$CHILD_RC $(field "$(event install_finished)" .reason)"
+
+# ---------------------------------------------------------------------------
+echo "# no timeout(1) on the machine, rpm and systemctl hang"
+# ---------------------------------------------------------------------------
+mkdir -p "$T/notimeout"
+ln -sf "$BASH" "$T/notimeout/bash"
+GUARD_TIMEOUT=$(command -v timeout)
+for c in env cat date stat mkdir mv chmod chown chgrp rm rmdir touch sleep od tr cut sha256sum grep sed awk id \
+    dirname basename uname mktemp ls head tail wc sort seq flock; do
+    p=$(command -v "$c" 2>/dev/null) && [[ "$p" == /* ]] && ln -sf "$p" "$T/notimeout/$c"
+done
+NOTIMEOUT_PATH="$T/bin:$T/notimeout"
+check "test PATH really has no timeout" bash -c '! PATH="$1" command -v timeout' _ "$NOTIMEOUT_PATH"
+new_child notimeout '
+report_init
+report_step_start parse_arguments
+report_fail parse_arguments invalid_argument
+exit 1'
+echo 30 >"$CHILD_DIR/fake/slow"
+start=$(date +%s.%N)
+(cd "$CHILD_DIR" && FAKE_DIR="$CHILD_DIR/fake" PATH="$NOTIMEOUT_PATH" "$GUARD_TIMEOUT" 60 "$BASH" child.sh >"$CHILD_DIR/out" 2>&1)
+CHILD_RC=$?
+ELAPSED=$(awk -v a="$start" -v b="$(date +%s.%N)" 'BEGIN { printf "%.1f", b - a }')
+check "no timeout(1), rpm hangs: exit within the budget (took ${ELAPSED}s)" awk -v e="$ELAPSED" 'BEGIN { exit !(e < 10) }'
+eq "no timeout(1), rpm hangs: exit code unchanged" 1 "$CHILD_RC"
+eq "no timeout(1), rpm hangs: versions left empty" "invalid_argument  " "$(field "$(event install_finished)" .reason) $(field "$(event install_finished)" .panel_version) $(field "$(event install_finished)" .agent_version)"
+# The timer is put in place in the background and may still be inside its own bounded call.
+sleep 3.5
+alive=0
+while read -r pid; do kill -0 "$pid" 2>/dev/null && alive=$((alive + 1)); done <"$CHILD_DIR/fake/pids"
+eq "no timeout(1): every hanging rpm/systemctl was stopped" 0 "$alive"
+new_child notimeout_fast '
+report_init
+REPORT_PANEL_VERSION=""
+_report_pkg_versions
+echo "versions=$REPORT_PANEL_VERSION/$REPORT_AGENT_VERSION"
+exit 0'
+(cd "$CHILD_DIR" && FAKE_DIR="$CHILD_DIR/fake" PATH="$NOTIMEOUT_PATH" "$GUARD_TIMEOUT" 60 "$BASH" child.sh >"$CHILD_DIR/out" 2>&1)
+check "no timeout(1), rpm answers: versions still read" grep -qx 'versions=1.9.3-1.el9/2.4.0-1.el9' "$CHILD_DIR/out"
+
+# ---------------------------------------------------------------------------
+echo "# each install keeps its own receiver"
+# ---------------------------------------------------------------------------
+new_child two_receivers 'ADMINBOLT_INSTALL_REPORT_URL=http://one.test/install-events
+report_init
+report_step_start repo_setup
+report_fail repo_setup repo_download_failed
+exit 1'
+echo 503 >"$CHILD_DIR/fake/http_code"
+run_child
+ida=$(basename "$(echo "$CHILD_DIR"/spool/adminbolt-install-report/*/)")
+sed 's#one\.test#two.test#' "$CHILD_DIR/child.sh" >"$CHILD_DIR/child2.sh"
+(cd "$CHILD_DIR" && FAKE_DIR="$CHILD_DIR/fake" PATH="$FAKEPATH" "$BASH" child2.sh >"$CHILD_DIR/out2" 2>&1)
+idb=""
+for d in "$CHILD_DIR"/spool/adminbolt-install-report/*/; do
+    d=$(basename "$d")
+    [[ "$d" == "$ida" ]] || idb=$d
+done
+check "two installs queued" test -n "$ida" -a -n "$idb" -a "$ida" != "$idb"
+rm -f "$CHILD_DIR/fake/urls"
+echo 202 >"$CHILD_DIR/fake/http_code"
+(cd / && FAKE_DIR="$CHILD_DIR/fake" PATH="$FAKEPATH" "$CHILD_DIR/libexec/adminbolt/install-report-send")
+eq "resend: first install's events go to its own receiver" "http://one.test/install-events" "$(awk -v i="$ida" '$1 == i { print $2 }' "$CHILD_DIR/fake/urls" | sort -u | tr '\n' ' ' | sed 's/ $//')"
+eq "resend: second install's events go to its receiver" "http://two.test/install-events" "$(awk -v i="$idb" '$1 == i { print $2 }' "$CHILD_DIR/fake/urls" | sort -u | tr '\n' ' ' | sed 's/ $//')"
+eq "resend: every queued event of both was sent" 6 "$(wc -l <"$CHILD_DIR/fake/urls" | tr -d ' ')"
+rm -f "$CHILD_DIR"/spool/adminbolt-install-report/*/sent/* "$CHILD_DIR/fake/urls"
+printf 'not a url; rm -rf /\n' >"$CHILD_DIR/spool/adminbolt-install-report/$ida/url"
+echo 503 >"$CHILD_DIR/fake/http_code"
+(cd "$CHILD_DIR" && FAKE_DIR="$CHILD_DIR/fake" PATH="$FAKEPATH" "$BASH" child2.sh >"$CHILD_DIR/out3" 2>&1)
+rm -f "$CHILD_DIR/fake/urls"
+echo 202 >"$CHILD_DIR/fake/http_code"
+(cd / && FAKE_DIR="$CHILD_DIR/fake" PATH="$FAKEPATH" "$CHILD_DIR/libexec/adminbolt/install-report-send")
+eq "resend: an unusable stored address falls back to the built-in receiver, not the latest install's" https://ai-hub.adminbolt.com/install-events "$(awk -v i="$ida" '$1 == i { print $2 }' "$CHILD_DIR/fake/urls" | sort -u)"
+
+# ---------------------------------------------------------------------------
+echo "# --email is a plain address, never shell code"
+# ---------------------------------------------------------------------------
+# --source=nope stops main right after the e-mail check either way.
+for bad in 'a@b.com;touch${IFS}pwned' '$(touch${IFS}pwned)@example.com' 'a@b.com`id`' 'a@b.com|id'; do
+    child email_bad "main '--email=$bad' --source=nope"
+    eq "--email=$bad refused as invalid" "1 yes" "$CHILD_RC $(grep -q 'Invalid --email' "$CHILD_DIR/out" && echo yes || echo no)"
+    check "--email=$bad: nothing executed" test ! -e "$CHILD_DIR/pwned"
+done
+child email_ok "main --email=first.last+tag@mail-1.example.co.uk --source=nope"
+eq "valid --email passes the check (stops later, at --source)" "1 no" "$CHILD_RC $(grep -q 'Invalid --email' "$CHILD_DIR/out" && echo yes || echo no)"
 
 # ---------------------------------------------------------------------------
 echo "# every event of every run above against the KONTRAKT field rules"

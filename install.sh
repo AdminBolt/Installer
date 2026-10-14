@@ -77,6 +77,10 @@ time_total_end() {
 # never from the message printed for it.
 # ---------------------------------------------------------------------------
 REPORT_URL="https://ai-hub.adminbolt.com/install-events"
+# The built-in address, before ADMINBOLT_INSTALL_REPORT_URL may replace REPORT_URL.
+REPORT_DEFAULT_URL="$REPORT_URL"
+# Accepted form of a receiver address (installer override and per-install file).
+REPORT_URL_RE='^https?://[A-Za-z0-9.-]+(:[0-9]{1,5})?(/[A-Za-z0-9._~/-]*)?$'
 # Not under /var/lib/adminbolt: the panel's database install hands that
 # directory, recursively, to its web user.
 REPORT_DIR="/var/lib/adminbolt-install-report"
@@ -176,9 +180,29 @@ _report_in_list() {
 _report_bounded() {
     if command -v timeout >/dev/null 2>&1; then
         timeout -k 1 "$REPORT_CALL_TIMEOUT" "$@"
-    else
-        "$@"
+        return
     fi
+    # No timeout(1): the same bound in bash. The command runs in the
+    # background and is stopped (TERM, then KILL a second later) once it
+    # overstays; 124 then, as timeout(1) would answer.
+    local pid end i
+    "$@" &
+    pid=$!
+    end=$(($(_report_now_ms) + REPORT_CALL_TIMEOUT * 1000))
+    while kill -0 "$pid" 2>/dev/null; do
+        if (($(_report_now_ms) >= end)); then
+            kill -TERM "$pid" 2>/dev/null
+            for ((i = 0; i < 10; i++)); do
+                kill -0 "$pid" 2>/dev/null || break
+                sleep 0.1 2>/dev/null || sleep 1 2>/dev/null || break
+            done
+            kill -KILL "$pid" 2>/dev/null
+            wait "$pid" 2>/dev/null
+            return 124
+        fi
+        sleep 0.1 2>/dev/null || sleep 1 2>/dev/null || :
+    done
+    wait "$pid"
 }
 
 _report_now_ms() {
@@ -338,7 +362,10 @@ _report_spool_init() {
         umask 077
         cd -P "$REPORT_DIR" 2>/dev/null && _report_dir_private . || exit 1
         mkdir -m 0700 "./$INSTALL_ID" && cd -P "./$INSTALL_ID" || exit 1
-        mkdir -m 0700 events sent && printf '%s\n' "$REPORT_START" >started
+        # Each install keeps its own receiver address: the resend script is
+        # shared, and a later install aimed elsewhere must not redirect this one.
+        mkdir -m 0700 events sent && printf '%s\n' "$REPORT_START" >started \
+            && printf '%s\n' "$REPORT_URL" >url
     ) </dev/null >/dev/null 2>&1
 }
 
@@ -592,8 +619,10 @@ _report_write_sender() {
         printf '# AdminBolt install report: resends undelivered install events (AB-2067).\n'
         printf '# Written by install.sh; removes itself, its timer and its service after 24 hours\n'
         printf '# or once nothing is left to send. The spool directory is kept.\n'
-        printf 'SPOOL=%q\nURL=%q\nUNIT_DIR=%q\nUNIT_NAME=%q\nSELF=%q\nOWNER_UID=%q\n' \
-            "$REPORT_DIR" "$REPORT_URL" "$REPORT_UNIT_DIR" "$REPORT_UNIT_NAME" "$dest" "$REPORT_OWNER_UID"
+        printf 'SPOOL=%q\nDEFAULT_URL=%q\nUNIT_DIR=%q\nUNIT_NAME=%q\nSELF=%q\nOWNER_UID=%q\n' \
+            "$REPORT_DIR" "$REPORT_DEFAULT_URL" "$REPORT_UNIT_DIR" "$REPORT_UNIT_NAME" "$dest" "$REPORT_OWNER_UID"
+        # The pattern has no single quote, so it is written as it is.
+        printf "URL_RE='%s'\n" "$REPORT_URL_RE"
         cat <<'SENDER'
 umask 077
 MAX_AGE=86400
@@ -606,10 +635,14 @@ bounded() { if command -v timeout >/dev/null 2>&1; then timeout -k 1 2 "$@"; els
 # Run from the spool directory, in a subshell: tries every undelivered event
 # of one install younger than 24 hours.
 send_install() {
-    local started f n code
+    local started f n code to
     cd -P "./$1" 2>/dev/null && private_dir . || return 0
     started=$(cat started 2>/dev/null)
     [[ "$started" =~ ^[0-9]+$ ]] && ((now - started <= MAX_AGE)) || return 0
+    # This install's own receiver, written once when it started.
+    to=""
+    { read -r to <url; } 2>/dev/null
+    [[ "$to" =~ $URL_RE ]] || to=$DEFAULT_URL
     for f in events/*.json; do
         [ -f "$f" ] && [ ! -L "$f" ] || continue
         n=${f#events/}
@@ -617,7 +650,7 @@ send_install() {
         [[ "$n" =~ ^[0-9]{1,2}$ ]] || continue
         [ -e "sent/$n" ] && continue
         code=$(curl -s -o /dev/null -w '%{http_code}' --connect-timeout 2 --max-time 5 \
-            -H 'Content-Type: application/json' --data-binary "@$f" "$URL" </dev/null 2>/dev/null) || true
+            -H 'Content-Type: application/json' --data-binary "@$f" "$to" </dev/null 2>/dev/null) || true
         # 2xx and 400/409/413 are final; 429, 507, 5xx and no answer are retried.
         if [[ "$code" =~ ^(2[0-9][0-9]|400|409|413)$ ]]; then : >"sent/$n"; fi
     done
@@ -709,7 +742,7 @@ _report_init() {
         return 0
     fi
     if [[ -n "${ADMINBOLT_INSTALL_REPORT_URL:-}" ]]; then
-        REPORT_URL=$(_report_clean "$ADMINBOLT_INSTALL_REPORT_URL" '^https?://[A-Za-z0-9.-]+(:[0-9]{1,5})?(/[A-Za-z0-9._~/-]*)?$' "$REPORT_URL")
+        REPORT_URL=$(_report_clean "$ADMINBOLT_INSTALL_REPORT_URL" "$REPORT_URL_RE" "$REPORT_URL")
     fi
     INSTALL_ID=$(_report_new_uuid) || { INSTALL_ID=""; return 0; }
     REPORT_REV=$(_report_installer_rev)
@@ -1087,12 +1120,15 @@ install_bolt_panel_and_check_post() {
     fi
     [[ $- == *e* ]] && errexit=1
     set +e
-    # tee ignores Ctrl+C: dnf may handle it and go on writing, and a tee killed
-    # by it would turn that into a broken pipe the install never had before.
+    # The reader can never leave the package step without a pipe to write to:
+    # tee ignores Ctrl+C (dnf may handle it and go on writing), and if tee
+    # cannot start or stops early, cat passes the rest through to the screen,
+    # as without the copy. The pipe stays open in between, so dnf never gets
+    # SIGPIPE from the copy.
     (
         ((errexit)) && set -e
         install_packages --enablerepo=bolt bolt-nginx bolt-php "$1"
-    ) 2>&1 | { trap '' INT; tee "$log"; }
+    ) 2>&1 | { trap '' INT; tee "$log" || cat; }
     status=${PIPESTATUS[0]}
     ((errexit)) && set -e
     if [[ "$status" -ne 0 ]]; then
@@ -1221,7 +1257,8 @@ stage_configuration() {
     local TRIAL_LICENCE_OK=0
     if [[ -n "$ADMIN_EMAIL" ]]; then
         # run_or_warn evaluates the command in this shell, so the assignment records the outcome.
-        run_or_warn "bolt-cli request-trial-license --email=${ADMIN_EMAIL} && TRIAL_LICENCE_OK=1" "Request trial licence"
+        # The address is quoted for eval: it is checked in main, but never parsed as shell code.
+        run_or_warn "bolt-cli request-trial-license --email=$(printf '%q' "$ADMIN_EMAIL") && TRIAL_LICENCE_OK=1" "Request trial licence"
         # Its own report field; never part of the install result.
         if [[ "${TRIAL_LICENCE_OK}" -eq 1 ]]; then report_trial_licence ok; else report_trial_licence failed; fi
     else
@@ -1304,7 +1341,10 @@ main() {
         esac
     fi
 
-    if [[ -n "$ADMIN_EMAIL" && ! "$ADMIN_EMAIL" =~ ^[^[:space:]@]+@[^[:space:]@]+\.[^[:space:]@]+$ ]]; then
+    # Letters, digits and . _ % + - before the @; a domain of letters, digits,
+    # hyphens and dots. Nothing a shell would treat specially.
+    local email_re='^[A-Za-z0-9._%+-]+@[A-Za-z0-9-]+(\.[A-Za-z0-9-]+)+$'
+    if [[ -n "$ADMIN_EMAIL" && ! "$ADMIN_EMAIL" =~ $email_re ]]; then
         print_error "Invalid --email=${ADMIN_EMAIL}"
         print_usage
         report_fail parse_arguments invalid_argument
