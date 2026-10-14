@@ -1107,13 +1107,30 @@ eq "resend: an unusable stored address falls back to the built-in receiver, not 
 echo "# --email is a plain address, never shell code"
 # ---------------------------------------------------------------------------
 # --source=nope stops main right after the e-mail check either way.
-for bad in 'a@b.com;touch${IFS}pwned' '$(touch${IFS}pwned)@example.com' 'a@b.com`id`' 'a@b.com|id'; do
+for bad in 'a@b.com;touch${IFS}pwned' '$(touch${IFS}pwned)@example.com' 'a@b.com`id`' 'a@b.com|id' 'a b@example.com' 'a@b@example.com'; do
     child email_bad "main '--email=$bad' --source=nope"
     eq "--email=$bad refused as invalid" "1 yes" "$CHILD_RC $(grep -q 'Invalid --email' "$CHILD_DIR/out" && echo yes || echo no)"
     check "--email=$bad: nothing executed" test ! -e "$CHILD_DIR/pwned"
 done
-child email_ok "main --email=first.last+tag@mail-1.example.co.uk --source=nope"
-eq "valid --email passes the check (stops later, at --source)" "1 no" "$CHILD_RC $(grep -q 'Invalid --email' "$CHILD_DIR/out" && echo yes || echo no)"
+for good in 'first.last+tag@mail-1.example.co.uk' "o'brien@example.ie" 'jan&co@example.com' 'a!#$%*/=?^_`{|}~-z@example.com'; do
+    printf '%s\n' "$good" >"$T/email.arg"
+    child email_ok 'main "--email=$(cat "'"$T"'/email.arg")" --source=nope'
+    eq "valid --email=$good passes the check (stops later, at --source)" "1 no" "$CHILD_RC $(grep -q 'Invalid --email' "$CHILD_DIR/out" && echo yes || echo no)"
+done
+# The trial licence request gets the address as one argument, whatever it holds.
+for addr in "o'brien@example.ie" 'jan&co@example.com' 'a`touch${IFS}pwned`b@example.com' 'a$(touch${IFS}pwned)b@example.com' 'a|touch${IFS}pwned@example.com' "x'\$(touch\${IFS}pwned)'@example.com"; do
+    printf '%s\n' "$addr" >"$T/email.arg"
+    new_child trial_quoted '
+bolt-cli() { printf "%s\n" "$@" >"$FAKE_DIR/trial.args"; }
+ADMIN_EMAIL=$(cat "'"$T"'/email.arg")
+TRIAL_LICENCE_OK=0
+request_trial_licence
+echo "ok=$TRIAL_LICENCE_OK"
+exit 0'
+    run_child
+    eq "trial request, $addr: one argument, the address as given" "request-trial-license|--email=$addr|ok=1" "$(paste -sd'|' "$CHILD_DIR/fake/trial.args")|$(grep -o 'ok=[01]' "$CHILD_DIR/out")"
+    check "trial request, $addr: nothing executed" test ! -e "$CHILD_DIR/pwned"
+done
 
 # ---------------------------------------------------------------------------
 echo "# every event of every run above against the KONTRAKT field rules"

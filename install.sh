@@ -1021,6 +1021,15 @@ selinux_not_enforcing() {
     return 1
 }
 
+# Sets the caller's TRIAL_LICENCE_OK to 1 when a trial licence was issued.
+# run_or_warn evaluates the command in this shell, so the assignment records
+# the outcome. The address is quoted with %q for that eval: whatever
+# characters it holds (' $ ` | & and the like are valid in an address), none
+# is ever parsed as shell code.
+request_trial_licence() {
+    run_or_warn "bolt-cli request-trial-license --email=$(printf '%q' "$ADMIN_EMAIL") && TRIAL_LICENCE_OK=1" "Request trial licence"
+}
+
 # ---------- Stage 2: Prepare → Prerequisite packages → Bolt packages ----------
 # Step 2.1: Prepare all settings (no package installs)
 stage2_prepare_settings() {
@@ -1120,11 +1129,12 @@ install_bolt_panel_and_check_post() {
     fi
     [[ $- == *e* ]] && errexit=1
     set +e
-    # The reader can never leave the package step without a pipe to write to:
-    # tee ignores Ctrl+C (dnf may handle it and go on writing), and if tee
-    # cannot start or stops early, cat passes the rest through to the screen,
-    # as without the copy. The pipe stays open in between, so dnf never gets
-    # SIGPIPE from the copy.
+    # The copy does not take the pipe away from the package step: tee ignores
+    # Ctrl+C (dnf may handle it and go on writing), and if tee cannot start or
+    # stops early, cat passes the rest through to the screen, as without the
+    # copy; the pipe stays open in between. (If the installer's own output is
+    # gone - a closed terminal, a reader of a pipe stopped by Ctrl+C - dnf
+    # loses its output as it would without the copy.)
     (
         ((errexit)) && set -e
         install_packages --enablerepo=bolt bolt-nginx bolt-php "$1"
@@ -1256,9 +1266,7 @@ stage_configuration() {
     # per e-mail and per IP, which must never abort an otherwise complete installation.
     local TRIAL_LICENCE_OK=0
     if [[ -n "$ADMIN_EMAIL" ]]; then
-        # run_or_warn evaluates the command in this shell, so the assignment records the outcome.
-        # The address is quoted for eval: it is checked in main, but never parsed as shell code.
-        run_or_warn "bolt-cli request-trial-license --email=$(printf '%q' "$ADMIN_EMAIL") && TRIAL_LICENCE_OK=1" "Request trial licence"
+        request_trial_licence
         # Its own report field; never part of the install result.
         if [[ "${TRIAL_LICENCE_OK}" -eq 1 ]]; then report_trial_licence ok; else report_trial_licence failed; fi
     else
@@ -1341,9 +1349,12 @@ main() {
         esac
     fi
 
-    # Letters, digits and . _ % + - before the @; a domain of letters, digits,
-    # hyphens and dots. Nothing a shell would treat specially.
-    local email_re='^[A-Za-z0-9._%+-]+@[A-Za-z0-9-]+(\.[A-Za-z0-9-]+)+$'
+    # Before the @: letters, digits and the other characters RFC 5322 allows
+    # in an address (! # $ % & ' * + / = ? ^ _ ` { | } ~ . -); after it: a
+    # domain of letters, digits, hyphens and dots. No spaces, no control
+    # characters. Some of these mean something to a shell, so the address is
+    # only ever passed on quoted (request_trial_licence).
+    local email_re="^[A-Za-z0-9!#\$%&'*+/=?^_\`{|}~.-]+@[A-Za-z0-9-]+(\.[A-Za-z0-9-]+)+\$"
     if [[ -n "$ADMIN_EMAIL" && ! "$ADMIN_EMAIL" =~ $email_re ]]; then
         print_error "Invalid --email=${ADMIN_EMAIL}"
         print_usage
