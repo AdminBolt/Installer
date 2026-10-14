@@ -94,6 +94,10 @@ REPORT_UUID_FILE="/proc/sys/kernel/random/uuid"
 # Its fingerprint is written next to the install ID, so the panel can tell a
 # copy of this server (booted from an image of it) from the server itself.
 REPORT_MACHINE_ID_FILE="/etc/machine-id"
+# Repository file written for --source; the install report probes its baseurls.
+BOLT_REPO_FILE="/etc/yum.repos.d/bolt.repo"
+# Upper bound, in seconds, on the whole --source repository probe.
+REPORT_PROBE_CAP=10
 REPORT_PANEL_URL="https://127.0.0.1:8443/"
 REPORT_MARKER="/var/lib/adminbolt/install-in-progress"
 # Present while the system is going down: a scheduled shutdown, and logins
@@ -516,6 +520,8 @@ _report_step_result() {
     fi
     # A step other than the one that absorbed a Ctrl+C failed after it: a
     # real failure, which the interruption must not hide (see _report_finish).
+    # Optional steps never get here (they return above), so only steps that
+    # decide the result count.
     if ((REPORT_INT_SEEN)) && [[ "$own" != "$REPORT_INT_STEP" ]] && ((!REPORT_FAILED_AFTER_INT)); then
         REPORT_FAILED_AFTER_INT=1
         REPORT_AFTER_INT_STEP="$step"
@@ -593,10 +599,14 @@ _report_finish() {
     local sig="$REPORT_SIGNAL" absorbed=0
     if [[ -z "$sig" ]] && ((REPORT_INT_SEEN && rc != 0)); then
         # An absorbed Ctrl+C ended the install as cancelled, unless another
-        # step failed after it: reported (FAILED_AFTER_INT), or the step the
-        # script stopped in (set -e) is not the one that took the Ctrl+C.
+        # step that is not optional failed after it: reported
+        # (FAILED_AFTER_INT), or the step the script stopped in (set -e) is
+        # not the one that took the Ctrl+C.
         absorbed=1
-        if ((REPORT_FAILED_AFTER_INT)) || [[ -n "$REPORT_STEP" && "$REPORT_STEP" != "$REPORT_INT_STEP" ]]; then
+        if ((REPORT_FAILED_AFTER_INT)); then
+            absorbed=0
+        elif [[ -n "$REPORT_STEP" && "$REPORT_STEP" != "$REPORT_INT_STEP" ]] \
+            && [[ "$(report_step_class "$REPORT_STEP")" != optional ]]; then
             absorbed=0
         fi
     fi
@@ -696,6 +706,9 @@ _report_write_sender() {
 umask 077
 MAX_AGE=86400
 now=${ADMINBOLT_REPORT_NOW:-$(date +%s)}
+# Sending stops after this many seconds (the unit's TimeoutStartSec=300 is the
+# hard stop); what is left waits for the next run.
+deadline=$(($(date +%s) + ${ADMINBOLT_REPORT_RUN_BUDGET:-240}))
 
 private_dir() { [ "$(stat -c '%u %a' "$1" 2>/dev/null)" = "$OWNER_UID 700" ]; }
 valid_id() { [[ "$1" =~ ^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$ ]]; }
@@ -718,6 +731,7 @@ send_install() {
         n=${n%.json}
         [[ "$n" =~ ^[0-9]{1,2}$ ]] || continue
         [ -e "sent/$n" ] && continue
+        (($(date +%s) < deadline)) || return 0
         code=$(curl -s -o /dev/null -w '%{http_code}' --connect-timeout 2 --max-time 5 \
             -H 'Content-Type: application/json' --data-binary "@$f" "$to" </dev/null 2>/dev/null) || true
         # 2xx and 400/409/413 are final; 429, 507, 5xx and no answer are retried.
@@ -792,7 +806,7 @@ _report_install_timer() {
 _report_put_timer() {
     _report_write_sender "$REPORT_SENDER" || return 1
     local svc="$REPORT_UNIT_DIR/$REPORT_UNIT_NAME.service" tim="$REPORT_UNIT_DIR/$REPORT_UNIT_NAME.timer"
-    printf '[Unit]\nDescription=AdminBolt install report: resend undelivered events\nWants=network-online.target\nAfter=network-online.target\n\n[Service]\nType=oneshot\nExecStart=%s\n' \
+    printf '[Unit]\nDescription=AdminBolt install report: resend undelivered events\nWants=network-online.target\nAfter=network-online.target\n\n[Service]\nType=oneshot\nExecStart=%s\nTimeoutStartSec=300\nMemoryMax=64M\nCPUQuota=20%%\n' \
         "$REPORT_SENDER" >"$svc.tmp" && chmod 0644 "$svc.tmp" && mv -f "$svc.tmp" "$svc" || return 1
     # OnActiveSec covers this boot, OnBootSec the boots after a restart.
     printf '[Unit]\nDescription=AdminBolt install report: resend undelivered events every 15 minutes for 24 hours\n\n[Timer]\nOnBootSec=5min\nOnActiveSec=15min\nOnUnitActiveSec=15min\n\n[Install]\nWantedBy=timers.target\n' \
@@ -889,11 +903,14 @@ _report_ini_set() {
     return 1
 }
 
-# sha256 of /etc/machine-id, or nothing when it cannot be read.
+# sha256 of the machine ID in /etc/machine-id without white space (the file
+# holds 32 hex characters and a newline), or nothing when it cannot be read
+# or is empty. The panel computes the same value.
 _report_machine_fingerprint() {
-    local h
-    [[ -s "$REPORT_MACHINE_ID_FILE" ]] || return 1
-    h=$(sha256sum <"$REPORT_MACHINE_ID_FILE" 2>/dev/null | cut -c1-64) || return 1
+    local id h
+    id=$(tr -d '[:space:]' <"$REPORT_MACHINE_ID_FILE" 2>/dev/null) || return 1
+    [[ -n "$id" ]] || return 1
+    h=$(printf '%s' "$id" | sha256sum 2>/dev/null | cut -c1-64) || return 1
     [[ "$h" =~ ^[0-9a-f]{64}$ ]] || return 1
     printf '%s' "$h"
 }
@@ -1037,7 +1054,7 @@ detect_distribution() {
 # Write bolt / bolt-noarch repos for a pulp content tier (stable, staging, testing).
 install_bolt_repos_from_source() {
     local tier="$1"
-    local repofile="/etc/yum.repos.d/bolt.repo"
+    local repofile="$BOLT_REPO_FILE"
     print_info "Configuring Bolt repositories (source=${tier})..."
     cat >"$repofile" <<EOF
 [bolt]
@@ -1059,28 +1076,37 @@ EOF
     print_success "Repository file written: ${repofile}"
 }
 
-# Install report only: fetches the metadata index of both --source
-# repositories (a few seconds at most). Nothing is printed and the install
-# goes on either way; a package step that fails afterwards is then reported
-# as repo_download_failed instead of a package failure.
+# Install report only: fetches the metadata index (repodata/repomd.xml) of
+# every baseurl in the repository file just written, with dnf's $releasever
+# and $basearch filled in; REPORT_PROBE_CAP seconds at most in total. Nothing
+# is printed and the install goes on either way; a package step that fails
+# afterwards is then reported as repo_download_failed instead of a package
+# failure.
 report_probe_source_repos() {
-    local el_version="$1" tier="$2" arch url
+    local el_version="$1" arch url start left connect
     [[ "$REPORT_MODE" != off ]] || return 0
     arch=$(uname -m 2>/dev/null)
-    for url in "https://mirror.adminbolt.com/pulp/content/${tier}/rhel/${el_version}/${arch}/repodata/repomd.xml" \
-        "https://mirror.adminbolt.com/pulp/content/${tier}/rhel/${el_version}/noarch/repodata/repomd.xml"; do
-        if ! curl -f -s -k -o /dev/null --connect-timeout 3 --max-time 10 "$url" </dev/null >/dev/null 2>&1; then
+    start=$(date +%s)
+    while read -r url; do
+        [[ -n "$url" ]] || continue
+        url="${url//\$releasever/$el_version}"
+        url="${url//\$basearch/$arch}"
+        left=$((REPORT_PROBE_CAP - ($(date +%s) - start)))
+        connect=3
+        ((left < connect)) && connect=$left
+        if ((left < 1)) || ! curl -f -s -k -o /dev/null --connect-timeout "$connect" --max-time "$left" \
+            "${url%/}/repodata/repomd.xml" </dev/null >/dev/null 2>&1; then
             REPORT_REPO_UNREACHABLE=1
             return 0
         fi
-    done
+    done < <(sed -n 's/^[[:space:]]*baseurl[[:space:]]*=[[:space:]]*//p' "$BOLT_REPO_FILE" 2>/dev/null)
 }
 
 install_repo_rhel() {
     local el_version=$1 rc
     if [[ -n "$BOLT_SOURCE" ]]; then
         install_bolt_repos_from_source "$BOLT_SOURCE"
-        report_probe_source_repos "$el_version" "$BOLT_SOURCE" || true
+        report_probe_source_repos "$el_version" || true
         return 0
     fi
     local rpm_url="${REPO_BASE_URL}/rhel/${el_version}/noarch/Packages/b/${REPO_PACKAGE}.el${el_version}.noarch.rpm"

@@ -52,8 +52,19 @@ cat >"$T/bin/curl" <<'EOF'
 [[ -f "$FAKE_DIR/real_curl" ]] && exec "$(cat "$FAKE_DIR/real_curl")" "$@"
 case " $* " in
     *repodata/repomd.xml*)
-        # metadata probe of a written repository: repomd_rc != 0 = unreachable
-        for a in "$@"; do [[ "$a" == http* ]] && echo "$a" >>"$FAKE_DIR/repomd.log"; done
+        # metadata probe of a written repository: repomd_rc != 0 = unreachable;
+        # repomd_sleep = a hanging mirror, cut off at --max-time like curl does
+        mt="" prev=""
+        for a in "$@"; do
+            [[ "$a" == http* ]] && echo "$a" >>"$FAKE_DIR/repomd.log"
+            [[ "$prev" == --max-time ]] && mt="$a"
+            prev="$a"
+        done
+        if [[ -f "$FAKE_DIR/repomd_sleep" ]]; then
+            sl=$(cat "$FAKE_DIR/repomd_sleep")
+            if [[ -n "$mt" ]] && ((mt < sl)); then sleep "$mt"; exit 28; fi
+            sleep "$sl"
+        fi
         exit "$(cat "$FAKE_DIR/repomd_rc" 2>/dev/null || echo 0)" ;;
     *get.acme.sh*)
         # acme.sh download: acme_rc != 0 = the download fails with no output
@@ -162,7 +173,8 @@ new_child() {
     printf 'ID="almalinux"\nVERSION_ID="9.4"\nPRETTY_NAME="host.example.com"\n' >"$CHILD_DIR/os-release"
     printf 'Hetzner\n' >"$CHILD_DIR/dmi/sys_vendor"
     printf 'vServer\n' >"$CHILD_DIR/dmi/product_name"
-    printf '0123456789abcdef0123456789abcdef\n' >"$CHILD_DIR/machine-id"
+    printf '4c4c4544004e3510804ab4c04f4e3332\n' >"$CHILD_DIR/machine-id"
+    mkdir -p "$CHILD_DIR/etc/yum.repos.d"
     cat >"$CHILD_DIR/child.sh" <<EOF
 ADMINBOLT_INSTALL_SOURCE_ONLY=1
 . "$INSTALL_SH"
@@ -176,6 +188,7 @@ REPORT_MARKER="$CHILD_DIR/marker"
 REPORT_SHUTDOWN_MARKERS="$CHILD_DIR/run/shutdown-scheduled $CHILD_DIR/run/nologin"
 REPORT_UUID_FILE="$CHILD_DIR/no-such-uuid"
 REPORT_MACHINE_ID_FILE="$CHILD_DIR/machine-id"
+BOLT_REPO_FILE="$CHILD_DIR/etc/yum.repos.d/bolt.repo"
 REPORT_EUID=\${TEST_EUID:-0}
 $2
 EOF
@@ -384,6 +397,9 @@ check "timer enabled at start" grep -q 'enable --now adminbolt-install-report.ti
 check "timer OnBootSec=5min" grep -qx 'OnBootSec=5min' "$CHILD_DIR/units/adminbolt-install-report.timer"
 check "timer every 15 min" grep -qx 'OnUnitActiveSec=15min' "$CHILD_DIR/units/adminbolt-install-report.timer"
 check "service runs the sender" grep -qx "ExecStart=$CHILD_DIR/libexec/adminbolt/install-report-send" "$CHILD_DIR/units/adminbolt-install-report.service"
+for lim in TimeoutStartSec=300 MemoryMax=64M CPUQuota=20%; do
+    check "service limited: $lim" grep -qx "$lim" "$CHILD_DIR/units/adminbolt-install-report.service"
+done
 check "sender is executable" test -x "$CHILD_DIR/libexec/adminbolt/install-report-send"
 check "sender passes bash -n" bash -n "$CHILD_DIR/libexec/adminbolt/install-report-send"
 if command -v shellcheck >/dev/null 2>&1; then
@@ -461,9 +477,9 @@ eq "mirror unreachable: repo_download_failed" "repo_setup repo_download_failed" 
 src_child() { # $1 name, $2 repomd_rc, $3 what happens after the repository step
     new_child "$1" "
 BOLT_SOURCE=stable
+${4:-}
 report_init
 report_stage_begin packages
-install_bolt_repos_from_source() { :; }
 report_step_start repo_setup
 install_repo_rhel 9
 echo AFTER-REPO
@@ -483,7 +499,24 @@ report_fail agent_install agent_install_failed
 exit 1'
 fin=$(event install_finished)
 eq "--source, mirror reachable, bolt-agent install fails: agent_install agent_install_failed" "agent_install agent_install_failed" "$(field "$fin" .failed_step) $(field "$fin" .reason)"
-eq "--source, mirror reachable: both repositories probed" "2" "$(grep -c 'mirror.adminbolt.com/pulp/content/stable/rhel/9/.*/repodata/repomd.xml' "$CHILD_DIR/fake/repomd.log")"
+# The probe reads the addresses from the repository file it just wrote.
+expected=$(sed -n 's/^baseurl = //p' "$CHILD_DIR/etc/yum.repos.d/bolt.repo" | sed -e 's/\$releasever/9/' -e "s/\\\$basearch/$(uname -m)/" -e 's#$#/repodata/repomd.xml#')
+eq "--source, mirror reachable: probes exactly the baseurls of the written bolt.repo" "$expected" "$(cat "$CHILD_DIR/fake/repomd.log")"
+eq "--source: two repositories in the file" 2 "$(printf '%s\n' "$expected" | grep -c 'pulp/content/stable/rhel/9/.*/repodata/repomd.xml')"
+src_child src_notel 7 'report_step_start agent_install
+report_fail agent_install agent_install_failed
+exit 1' 'REPORT_NO_TELEMETRY=1'
+check "--no-telemetry: no repository probe" test ! -e "$CHILD_DIR/fake/repomd.log"
+check "--no-telemetry: repository file still written" grep -q '^\[bolt\]' "$CHILD_DIR/etc/yum.repos.d/bolt.repo"
+src_child src_hang 0 'report_step_start agent_install
+report_fail agent_install agent_install_failed
+exit 1' 'REPORT_PROBE_CAP=2'
+echo 30 >"$CHILD_DIR/fake/repomd_sleep"
+start=$(date +%s.%N)
+run_child
+ELAPSED=$(awk -v a="$start" -v b="$(date +%s.%N)" 'BEGIN { printf "%.1f", b - a }')
+check "--source, hanging mirror: the probe keeps to its total cap (2 s, took ${ELAPSED}s)" awk -v e="$ELAPSED" 'BEGIN { exit !(e < 4.5) }'
+eq "--source, hanging mirror: reported as repo_download_failed" "repo_setup repo_download_failed" "$(field "$(event install_finished)" .failed_step) $(field "$(event install_finished)" .reason)"
 src_child src_flaky 7 'report_step_start agent_install
 report_step_result agent_install ok
 report_stage_begin configuration; report_stage_end
@@ -723,7 +756,9 @@ grep -q "^BOLT_INSTALL_ID=$INSTALL_ID\$" "$REPORT_BOLT_CONFIG" && echo ID-MATCHE
 exit 0'
 check "BOLT_INSTALL_ID written, same ID as the events" grep -q ID-MATCHES "$CHILD_DIR/out"
 eq "created config file is 0640" 640 "$(stat -c %a "$CHILD_DIR/etc/bolt/bolt-config.ini")"
-eq "machine fingerprint written next to the ID (sha256 of machine-id)" "$(sha256sum "$CHILD_DIR/machine-id" | cut -c1-64)" "$(sed -n 's/^BOLT_INSTALL_MACHINE=//p' "$CHILD_DIR/etc/bolt/bolt-config.ini")"
+# sha256 of the machine ID without its trailing newline; the panel computes
+# the same value (AB2067InstallReportServiceTest uses the same vector).
+eq "machine fingerprint written next to the ID (sha256 of the trimmed machine-id)" "06962624eca6f46cd820de44ed3b4241ff66c5cde655891fb4ef86e306e187ad" "$(sed -n 's/^BOLT_INSTALL_MACHINE=//p' "$CHILD_DIR/etc/bolt/bolt-config.ini")"
 child id_ini_nomachine '
 rm -f "$REPORT_MACHINE_ID_FILE"
 report_init
@@ -837,6 +872,23 @@ check "after 24 h: nothing sent any more" test ! -e "$CHILD_DIR/fake/req"
 check "after 24 h: sender removed itself" test ! -e "$SENDER"
 check "after 24 h: timer removed" test ! -e "$CHILD_DIR/units/adminbolt-install-report.timer"
 check "after 24 h: spool kept" test -n "$(ls "$CHILD_DIR"/spool/adminbolt-install-report/*/events/*.json)"
+
+# One run sends for at most its run budget (the unit's TimeoutStartSec is the
+# hard stop); what is left waits for the next run.
+child sender_budget '
+report_init
+exit 1'
+rm -rf "$CHILD_DIR/fake/req" "$CHILD_DIR"/spool/adminbolt-install-report/*/sent/*
+echo 1 >"$CHILD_DIR/fake/curl_delay"
+SENDER="$CHILD_DIR/libexec/adminbolt/install-report-send"
+run_sender env ADMINBOLT_REPORT_RUN_BUDGET=1
+rm -f "$CHILD_DIR/fake/curl_delay"
+sent_n=$(ls "$CHILD_DIR"/spool/adminbolt-install-report/*/sent | wc -l | tr -d ' ')
+all_n=$(ls "$CHILD_DIR"/spool/adminbolt-install-report/*/events | wc -l | tr -d ' ')
+check "run budget spent: not every event sent in one run ($sent_n of $all_n)" test "$sent_n" -lt "$all_n"
+check "run budget spent: timer kept for the rest" test -e "$CHILD_DIR/units/adminbolt-install-report.timer"
+run_sender env
+eq "next run sends the rest" "$all_n" "$(ls "$CHILD_DIR"/spool/adminbolt-install-report/*/sent | wc -l | tr -d ' ')"
 
 child sender_running '
 report_init
@@ -1102,6 +1154,29 @@ exit 1'
 run_child
 fin=$(event install_finished)
 eq "Ctrl+C absorbed by a required step, another fails later: the later step is the reason" "failed postfix required_step_failed mariadb,postfix" "$(field "$fin" .result) $(field "$fin" .failed_step) $(field "$fin" .reason) $(field "$fin" .failed_required_steps)"
+new_child int_claimed_then_optional '
+report_init
+report_stage_begin configuration
+report_step_start mariadb
+_report_on_int 1
+report_step_result mariadb failed
+report_step_start greeting
+report_step_result greeting failed
+exit 1'
+run_child
+fin=$(event install_finished)
+eq "Ctrl+C absorbed by a required step, an optional one fails later: still cancelled" "cancelled INT mariadb 1" "$(field "$fin" .result) $(field "$fin" .signal) $(field "$fin" .failed_step) $(field "$fin" .exit_code)"
+new_child int_then_optional_sete '
+report_init
+report_stage_begin configuration
+report_step_start mariadb
+_report_on_int 1
+report_step_result mariadb failed
+report_step_start greeting
+false'
+run_child
+fin=$(event install_finished)
+eq "Ctrl+C absorbed, script then stops in an optional step (set -e): still cancelled" "cancelled INT mariadb 1" "$(field "$fin" .result) $(field "$fin" .signal) $(field "$fin" .failed_step) $(field "$fin" .exit_code)"
 # The same with a real Ctrl+C: an optional step absorbs it, the bolt-panel
 # scriptlet then fails and the script ends with 1.
 int_child int_optional_then_fail report "$handles1" 'run_or_warn "$BASH step.sh" "Step" greeting
