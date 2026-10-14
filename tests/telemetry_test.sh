@@ -51,6 +51,10 @@ cat >"$T/bin/curl" <<'EOF'
 # status in $FAKE_DIR/http_code. -k (the readiness check) answers panel_code.
 [[ -f "$FAKE_DIR/real_curl" ]] && exec "$(cat "$FAKE_DIR/real_curl")" "$@"
 case " $* " in
+    *repodata/repomd.xml*)
+        # metadata probe of a written repository: repomd_rc != 0 = unreachable
+        for a in "$@"; do [[ "$a" == http* ]] && echo "$a" >>"$FAKE_DIR/repomd.log"; done
+        exit "$(cat "$FAKE_DIR/repomd_rc" 2>/dev/null || echo 0)" ;;
     *get.acme.sh*)
         # acme.sh download: acme_rc != 0 = the download fails with no output
         rc=$(cat "$FAKE_DIR/acme_rc" 2>/dev/null || echo 0)
@@ -158,6 +162,7 @@ new_child() {
     printf 'ID="almalinux"\nVERSION_ID="9.4"\nPRETTY_NAME="host.example.com"\n' >"$CHILD_DIR/os-release"
     printf 'Hetzner\n' >"$CHILD_DIR/dmi/sys_vendor"
     printf 'vServer\n' >"$CHILD_DIR/dmi/product_name"
+    printf '0123456789abcdef0123456789abcdef\n' >"$CHILD_DIR/machine-id"
     cat >"$CHILD_DIR/child.sh" <<EOF
 ADMINBOLT_INSTALL_SOURCE_ONLY=1
 . "$INSTALL_SH"
@@ -170,6 +175,7 @@ REPORT_OS_RELEASE="$CHILD_DIR/os-release"
 REPORT_MARKER="$CHILD_DIR/marker"
 REPORT_SHUTDOWN_MARKERS="$CHILD_DIR/run/shutdown-scheduled $CHILD_DIR/run/nologin"
 REPORT_UUID_FILE="$CHILD_DIR/no-such-uuid"
+REPORT_MACHINE_ID_FILE="$CHILD_DIR/machine-id"
 REPORT_EUID=\${TEST_EUID:-0}
 $2
 EOF
@@ -449,6 +455,55 @@ curl() { return 7; }
 install_repo_rhel 9'
 eq "mirror unreachable: repo_download_failed" "repo_setup repo_download_failed" "$(field "$(event install_finished)" .failed_step) $(field "$(event install_finished)" .reason)"
 
+# --source writes the repository file without downloading anything; its
+# metadata is probed so an unreachable mirror is reported as one when a
+# package step then fails. The probe never stops the install by itself.
+src_child() { # $1 name, $2 repomd_rc, $3 what happens after the repository step
+    new_child "$1" "
+BOLT_SOURCE=stable
+report_init
+report_stage_begin packages
+install_bolt_repos_from_source() { :; }
+report_step_start repo_setup
+install_repo_rhel 9
+echo AFTER-REPO
+$3"
+    echo "$2" >"$CHILD_DIR/fake/repomd_rc"
+    run_child
+}
+src_child src_down 7 'report_step_start agent_install
+report_fail agent_install agent_install_failed
+exit 1'
+fin=$(event install_finished)
+eq "--source, mirror unreachable, bolt-agent install fails: repo_setup repo_download_failed, exit 1" "failed repo_setup repo_download_failed 1" "$(field "$fin" .result) $(field "$fin" .failed_step) $(field "$fin" .reason) $CHILD_RC"
+eq "--source, mirror unreachable: both steps listed as failed" "repo_setup,agent_install" "$(field "$fin" .failed_required_steps)"
+check "--source, mirror unreachable: the probe does not stop the install" grep -q AFTER-REPO "$CHILD_DIR/out"
+src_child src_up 0 'report_step_start agent_install
+report_fail agent_install agent_install_failed
+exit 1'
+fin=$(event install_finished)
+eq "--source, mirror reachable, bolt-agent install fails: agent_install agent_install_failed" "agent_install agent_install_failed" "$(field "$fin" .failed_step) $(field "$fin" .reason)"
+eq "--source, mirror reachable: both repositories probed" "2" "$(grep -c 'mirror.adminbolt.com/pulp/content/stable/rhel/9/.*/repodata/repomd.xml' "$CHILD_DIR/fake/repomd.log")"
+src_child src_flaky 7 'report_step_start agent_install
+report_step_result agent_install ok
+report_stage_begin configuration; report_stage_end
+report_readiness_check
+exit 0'
+eq "--source, probe failed but the install succeeds: succeeded" "succeeded 0" "$(field "$(event install_finished)" .result) $CHILD_RC"
+
+child repo_rpm '
+report_init
+report_stage_begin packages
+report_step_start repo_setup
+dnf() { return 1; }
+yum() { return 1; }
+rpm() { [[ "$1" == -ivh ]] && return 3; command rpm "$@"; }
+install_repo_rhel 9
+echo NOT-REACHED'
+fin=$(event install_finished)
+eq "bolt-repo package install fails: repo_setup package_install_failed, rpm exit code kept" "failed repo_setup package_install_failed 3 3" "$(field "$fin" .result) $(field "$fin" .failed_step) $(field "$fin" .reason) $(field "$fin" .exit_code) $CHILD_RC"
+check "bolt-repo package install fails: script stops there as before" bash -c '! grep -q NOT-REACHED "$1"' _ "$CHILD_DIR/out"
+
 child sete '
 report_init
 report_stage_begin packages
@@ -668,6 +723,27 @@ grep -q "^BOLT_INSTALL_ID=$INSTALL_ID\$" "$REPORT_BOLT_CONFIG" && echo ID-MATCHE
 exit 0'
 check "BOLT_INSTALL_ID written, same ID as the events" grep -q ID-MATCHES "$CHILD_DIR/out"
 eq "created config file is 0640" 640 "$(stat -c %a "$CHILD_DIR/etc/bolt/bolt-config.ini")"
+eq "machine fingerprint written next to the ID (sha256 of machine-id)" "$(sha256sum "$CHILD_DIR/machine-id" | cut -c1-64)" "$(sed -n 's/^BOLT_INSTALL_MACHINE=//p' "$CHILD_DIR/etc/bolt/bolt-config.ini")"
+child id_ini_nomachine '
+rm -f "$REPORT_MACHINE_ID_FILE"
+report_init
+report_write_panel_settings
+exit 0'
+eq "no machine-id: ID written, no fingerprint" "1 0" "$(grep -c '^BOLT_INSTALL_ID=' "$CHILD_DIR/etc/bolt/bolt-config.ini") $(grep -c '^BOLT_INSTALL_MACHINE' "$CHILD_DIR/etc/bolt/bolt-config.ini")"
+# An image build: every server booted from the image would inherit what the
+# build leaves on disk, so it leaves no install ID, spool or timer; its own
+# events are only sent directly.
+child imgbuild '
+REPORT_CHANNEL_ARG=image-build
+report_init
+report_stage_begin configuration; report_stage_end
+report_write_panel_settings
+report_readiness_check
+exit 0'
+check "image build: no install ID in bolt-config.ini" bash -c '! grep -qs BOLT_INSTALL "$1"' _ "$CHILD_DIR/etc/bolt/bolt-config.ini"
+check "image build: no spool" test ! -e "$CHILD_DIR/spool"
+check "image build: no timer, no sender" test ! -e "$CHILD_DIR/units/adminbolt-install-report.timer" -a ! -e "$CHILD_DIR/libexec"
+eq "image build: its events still sent, channel image-build" "image-build succeeded" "$(field "$(sent_event install_started)" .channel) $(field "$(sent_event install_finished)" .result)"
 
 # ---------------------------------------------------------------------------
 echo "# INI writer"
@@ -967,16 +1043,73 @@ $pkg_step
 install_bolt_panel_and_check_post bolt-panel"
 eq "bolt-panel step handles Ctrl+C and keeps writing: same as without the report ($base_panel)" "$base_panel" "$INT_OUTCOME"
 check "bolt-panel step: its output after Ctrl+C still shown" grep -q 'more output' "$CHILD_DIR/out"
+# _report_on_int is what the INT trap runs once the command that absorbed
+# Ctrl+C has returned (here with 1, like dnf).
 new_child int_then_fail '
 report_init
 report_stage_begin packages
-REPORT_INT_SEEN=1
 report_step_start prerequisite_packages
+_report_on_int 1
 report_fail
 exit 1'
 run_child
 fin=$(event install_finished)
-eq "Ctrl+C absorbed, install then fails: cancelled, exit code kept" "cancelled INT interrupted 1 1" "$(field "$fin" .result) $(field "$fin" .signal) $(field "$fin" .reason) $(field "$fin" .exit_code) $CHILD_RC"
+eq "Ctrl+C absorbed, that step then fails: cancelled, exit code kept" "cancelled INT interrupted prerequisite_packages 1 1" "$(field "$fin" .result) $(field "$fin" .signal) $(field "$fin" .reason) $(field "$fin" .failed_step) $(field "$fin" .exit_code) $CHILD_RC"
+new_child int_then_other_fail '
+report_init
+report_stage_begin packages
+report_step_start greeting
+_report_on_int 1
+report_step_result greeting failed
+report_fail panel_scriptlet panel_scriptlet_failed
+report_stage_begin configuration
+report_step_start agent_panel_connect
+report_fail
+exit 1'
+run_child
+fin=$(event install_finished)
+eq "Ctrl+C absorbed by an optional step, required steps fail later: failed with the first real reason, exit code kept" "failed - panel_scriptlet_failed panel_scriptlet 1 1" "$(field "$fin" .result) -$(field "$fin" .signal) $(field "$fin" .reason) $(field "$fin" .failed_step) $(field "$fin" .exit_code) $CHILD_RC"
+eq "same: failed steps listed" "greeting panel_scriptlet,agent_panel_connect" "$(field "$fin" .failed_optional_steps) $(field "$fin" .failed_required_steps)"
+new_child int_then_sete '
+report_init
+report_stage_begin packages
+report_step_start greeting
+_report_on_int 1
+report_step_result greeting failed
+report_step_start web_services_enable
+false'
+run_child
+fin=$(event install_finished)
+eq "Ctrl+C absorbed, later step stops the script (set -e): failed with that step" "failed web_services_enable required_step_failed 1" "$(field "$fin" .result) $(field "$fin" .failed_step) $(field "$fin" .reason) $(field "$fin" .exit_code)"
+new_child int_same_sete '
+report_init
+report_stage_begin packages
+report_step_start prerequisite_packages
+_report_on_int 1
+false'
+run_child
+fin=$(event install_finished)
+eq "Ctrl+C absorbed, the same step stops the script (set -e): cancelled" "cancelled INT prerequisite_packages 1" "$(field "$fin" .result) $(field "$fin" .signal) $(field "$fin" .failed_step) $(field "$fin" .exit_code)"
+new_child int_required_then_other '
+report_init
+report_stage_begin configuration
+report_step_start mariadb
+_report_on_int 1
+report_step_result mariadb failed
+report_step_start postfix
+report_step_result postfix failed
+exit 1'
+run_child
+fin=$(event install_finished)
+eq "Ctrl+C absorbed by a required step, another fails later: the later step is the reason" "failed postfix required_step_failed mariadb,postfix" "$(field "$fin" .result) $(field "$fin" .failed_step) $(field "$fin" .reason) $(field "$fin" .failed_required_steps)"
+# The same with a real Ctrl+C: an optional step absorbs it, the bolt-panel
+# scriptlet then fails and the script ends with 1.
+int_child int_optional_then_fail report "$handles1" 'run_or_warn "$BASH step.sh" "Step" greeting
+report_stage_begin packages
+report_fail panel_scriptlet panel_scriptlet_failed
+exit 1'
+fin=$(event install_finished)
+eq "real Ctrl+C absorbed by an optional step, scriptlet fails later: failed panel_scriptlet_failed, exit 1" "failed panel_scriptlet_failed - 1 1" "$(field "$fin" .result) $(field "$fin" .reason) -$(field "$fin" .signal) $(field "$fin" .exit_code) $CHILD_RC"
 set +m
 
 # ---------------------------------------------------------------------------

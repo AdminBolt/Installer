@@ -91,6 +91,9 @@ REPORT_BOLT_CONFIG="/etc/bolt/bolt-config.ini"
 REPORT_DMI_DIR="/sys/class/dmi/id"
 REPORT_OS_RELEASE="/etc/os-release"
 REPORT_UUID_FILE="/proc/sys/kernel/random/uuid"
+# Its fingerprint is written next to the install ID, so the panel can tell a
+# copy of this server (booted from an image of it) from the server itself.
+REPORT_MACHINE_ID_FILE="/etc/machine-id"
 REPORT_PANEL_URL="https://127.0.0.1:8443/"
 REPORT_MARKER="/var/lib/adminbolt/install-in-progress"
 # Present while the system is going down: a scheduled shutdown, and logins
@@ -134,6 +137,8 @@ REPORT_SIGNAL=""
 REPORT_SUPPRESS=0
 REPORT_TRIAL=""
 REPORT_READINESS=""
+# Set when the --source repository's metadata could not be fetched.
+REPORT_REPO_UNREACHABLE=0
 INSTALL_MARKER_CREATED=0
 
 REPORT_CHANNELS="direct get-script web-installer vultr akamai node image-build test hostinger digitalocean aws azure"
@@ -490,6 +495,15 @@ _report_step_result() {
     fi
     [[ -n "$reason" ]] || reason=$(report_reason_for_step "$step")
     _report_in_list "$reason" "$REPORT_REASONS" || reason="unclassified"
+    local own="$step"
+    # A package step that fails after the --source repository's metadata
+    # could not be fetched failed on the mirror: reported as the repository
+    # step (the package step is listed too). Only the report changes.
+    if [[ -z "$REPORT_REASON" && ( "$step" == agent_install || "$step" == panel_install ) ]] && ((REPORT_REPO_UNREACHABLE)); then
+        _report_in_list repo_setup "$REPORT_FAILED_REQUIRED" || REPORT_FAILED_REQUIRED+="${REPORT_FAILED_REQUIRED:+ }repo_setup"
+        REPORT_FAILED_STEP="repo_setup"
+        REPORT_REASON="repo_download_failed"
+    fi
     if [[ "$class" == required ]]; then
         _report_in_list "$step" "$REPORT_FAILED_REQUIRED" || REPORT_FAILED_REQUIRED+="${REPORT_FAILED_REQUIRED:+ }$step"
     else
@@ -498,6 +512,14 @@ _report_step_result() {
     if [[ -z "$REPORT_REASON" ]]; then
         REPORT_FAILED_STEP="$step"
         REPORT_REASON="$reason"
+        if ((REPORT_INT_SEEN)) && [[ "$own" == "$REPORT_INT_STEP" ]]; then REPORT_INT_CLAIMED=1; fi
+    fi
+    # A step other than the one that absorbed a Ctrl+C failed after it: a
+    # real failure, which the interruption must not hide (see _report_finish).
+    if ((REPORT_INT_SEEN)) && [[ "$own" != "$REPORT_INT_STEP" ]] && ((!REPORT_FAILED_AFTER_INT)); then
+        REPORT_FAILED_AFTER_INT=1
+        REPORT_AFTER_INT_STEP="$step"
+        REPORT_AFTER_INT_REASON="$reason"
     fi
     REPORT_STAGE_RESULT="failed"
 }
@@ -540,13 +562,22 @@ _report_on_signal() {
 # foreground and stops only when that command was itself ended by SIGINT
 # (status 130). A command that handles the interruption and returns normally
 # lets the install carry on, as it did before. dnf is one: it catches Ctrl+C
-# and exits 1. So the interruption is only remembered: if the install then
-# ends with an error it is reported as cancelled (with the real exit code);
-# if it still succeeds, it is reported as it ended.
+# and exits 1. So the interruption is only remembered, with the step that
+# took it: if the install then ends with an error caused there it is reported
+# as cancelled (with the real exit code); if another step failed after it,
+# that real failure is reported (failed); if it still succeeds, it is
+# reported as it ended. The trap runs once the interrupted command has
+# returned, before its step records the outcome, so REPORT_STEP is that step.
 REPORT_INT_SEEN=0
+REPORT_INT_STEP=""
+REPORT_INT_CLAIMED=0
+REPORT_FAILED_AFTER_INT=0
+REPORT_AFTER_INT_STEP=""
+REPORT_AFTER_INT_REASON=""
 _report_on_int() {
     local rc="$1"
     REPORT_INT_SEEN=1
+    REPORT_INT_STEP="$REPORT_STEP"
     ((rc == 130)) || return 0
     _report_on_signal INT
 }
@@ -559,12 +590,22 @@ _report_finish() {
         _report_spool_mark_finished
         return 0
     fi
-    local sig="$REPORT_SIGNAL"
-    if [[ -n "$sig" ]] || ((REPORT_INT_SEEN && rc != 0)); then
+    local sig="$REPORT_SIGNAL" absorbed=0
+    if [[ -z "$sig" ]] && ((REPORT_INT_SEEN && rc != 0)); then
+        # An absorbed Ctrl+C ended the install as cancelled, unless another
+        # step failed after it: reported (FAILED_AFTER_INT), or the step the
+        # script stopped in (set -e) is not the one that took the Ctrl+C.
+        absorbed=1
+        if ((REPORT_FAILED_AFTER_INT)) || [[ -n "$REPORT_STEP" && "$REPORT_STEP" != "$REPORT_INT_STEP" ]]; then
+            absorbed=0
+        fi
+    fi
+    if [[ -n "$sig" ]] || ((absorbed)); then
         # An absorbed Ctrl+C is only reported; the exit code stays the script's.
+        failed_step="$REPORT_STEP"
+        if [[ -z "$sig" ]]; then failed_step="$REPORT_INT_STEP"; fi
         sig="${sig:-INT}"
         result="cancelled"
-        failed_step="$REPORT_STEP"
         reason="interrupted"
     else
         if ((rc != 0)); then
@@ -591,6 +632,13 @@ _report_finish() {
             result="succeeded_with_warnings"
         else
             result="succeeded"
+        fi
+        # The first failure was the step that absorbed a Ctrl+C (it failed
+        # because of it) and another step failed for real afterwards: that
+        # one is the reason.
+        if ((REPORT_INT_CLAIMED && REPORT_FAILED_AFTER_INT)); then
+            REPORT_FAILED_STEP="$REPORT_AFTER_INT_STEP"
+            REPORT_REASON="$REPORT_AFTER_INT_REASON"
         fi
         failed_step="$REPORT_FAILED_STEP"
         reason="$REPORT_REASON"
@@ -769,6 +817,11 @@ _report_init() {
     REPORT_REV=$(_report_installer_rev)
     if [[ "$REPORT_EUID" -ne 0 ]]; then
         REPORT_MODE="deferred"
+    elif [[ "$REPORT_CHANNEL" == image-build ]]; then
+        # Building an image: what this run leaves on disk ends up on every
+        # server booted from it. No spool and no timer (they would resend
+        # the build's events from each of them); events are sent directly.
+        REPORT_MODE="memory"
     else
         REPORT_OWNER_UID=$(id -u)
         if _report_spool_init; then
@@ -836,11 +889,29 @@ _report_ini_set() {
     return 1
 }
 
+# sha256 of /etc/machine-id, or nothing when it cannot be read.
+_report_machine_fingerprint() {
+    local h
+    [[ -s "$REPORT_MACHINE_ID_FILE" ]] || return 1
+    h=$(sha256sum <"$REPORT_MACHINE_ID_FILE" 2>/dev/null | cut -c1-64) || return 1
+    [[ "$h" =~ ^[0-9a-f]{64}$ ]] || return 1
+    printf '%s' "$h"
+}
+
+# The install ID goes into bolt-config.ini for the panel, with the machine's
+# fingerprint: a server booted from an image of this one has another
+# machine-id, and the panel then does not report under this install's ID.
+# An image build writes no ID at all (every server from the image would
+# share it; a server from such an image gets its own at first boot, AB-2068).
 _report_write_panel_settings() {
+    local machine
     if ((REPORT_NO_TELEMETRY)); then
         _report_ini_set "$REPORT_BOLT_CONFIG" BOLT_INSTALL_TELEMETRY 0 \
             || echo -e "${YELLOW}WARNING:${NC} could not write BOLT_INSTALL_TELEMETRY=0 to ${REPORT_BOLT_CONFIG}; set it with: bolt-cli set-ini-settings BOLT_INSTALL_TELEMETRY 0"
-    elif [[ -n "$INSTALL_ID" ]]; then
+    elif [[ -n "$INSTALL_ID" && "$REPORT_CHANNEL" != image-build ]]; then
+        if machine=$(_report_machine_fingerprint); then
+            _report_ini_set "$REPORT_BOLT_CONFIG" BOLT_INSTALL_MACHINE "$machine" || true
+        fi
         _report_ini_set "$REPORT_BOLT_CONFIG" BOLT_INSTALL_ID "$INSTALL_ID" || true
     fi
 }
@@ -988,17 +1059,38 @@ EOF
     print_success "Repository file written: ${repofile}"
 }
 
+# Install report only: fetches the metadata index of both --source
+# repositories (a few seconds at most). Nothing is printed and the install
+# goes on either way; a package step that fails afterwards is then reported
+# as repo_download_failed instead of a package failure.
+report_probe_source_repos() {
+    local el_version="$1" tier="$2" arch url
+    [[ "$REPORT_MODE" != off ]] || return 0
+    arch=$(uname -m 2>/dev/null)
+    for url in "https://mirror.adminbolt.com/pulp/content/${tier}/rhel/${el_version}/${arch}/repodata/repomd.xml" \
+        "https://mirror.adminbolt.com/pulp/content/${tier}/rhel/${el_version}/noarch/repodata/repomd.xml"; do
+        if ! curl -f -s -k -o /dev/null --connect-timeout 3 --max-time 10 "$url" </dev/null >/dev/null 2>&1; then
+            REPORT_REPO_UNREACHABLE=1
+            return 0
+        fi
+    done
+}
+
 install_repo_rhel() {
-    local el_version=$1
+    local el_version=$1 rc
     if [[ -n "$BOLT_SOURCE" ]]; then
         install_bolt_repos_from_source "$BOLT_SOURCE"
+        report_probe_source_repos "$el_version" "$BOLT_SOURCE" || true
         return 0
     fi
     local rpm_url="${REPO_BASE_URL}/rhel/${el_version}/noarch/Packages/b/${REPO_PACKAGE}.el${el_version}.noarch.rpm"
     local temp_rpm="/tmp/bolt-repo-${el_version}.rpm"
     print_info "Downloading repository package..."
     curl -f -L -k -o "$temp_rpm" "$rpm_url" || { print_error "Failed to download repo"; report_fail repo_setup repo_download_failed; exit 1; }
-    (command -v dnf >/dev/null 2>&1 && dnf install -y "$temp_rpm") || (command -v yum >/dev/null 2>&1 && yum install -y "$temp_rpm") || rpm -ivh "$temp_rpm"
+    # A failed install of the downloaded package stops the script as before
+    # (with rpm's exit code), reported as a package failure.
+    (command -v dnf >/dev/null 2>&1 && dnf install -y "$temp_rpm") || (command -v yum >/dev/null 2>&1 && yum install -y "$temp_rpm") || rpm -ivh "$temp_rpm" \
+        || { rc=$?; report_fail repo_setup package_install_failed; exit "$rc"; }
     rm -f "$temp_rpm"
     print_success "Repository installed"
 }
