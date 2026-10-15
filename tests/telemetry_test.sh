@@ -1142,6 +1142,36 @@ false'
 run_child
 fin=$(event install_finished)
 eq "Ctrl+C absorbed, the same step stops the script (set -e): cancelled" "cancelled INT prerequisite_packages 1" "$(field "$fin" .result) $(field "$fin" .signal) $(field "$fin" .failed_step) $(field "$fin" .exit_code)"
+# The Ctrl+C belongs to one run of a step, not to its name: stage 2.2 starts
+# prerequisite_packages twice. dnf absorbs Ctrl+C while installing
+# epel-release and the yum fallback succeeds; the second run then fails for
+# real (mirror outage): failed, not cancelled.
+new_child int_step_rerun_fails '
+report_init
+report_stage_begin packages
+rpm() { return 1; }
+dnf() { return 1; }
+yum() { return 0; }
+report_step_start prerequisite_packages
+install_packages epel-release dnf-plugins-core
+_report_on_int 1
+report_step_start prerequisite_packages
+yum() { return 1; }
+install_packages restic rclone
+echo NOT-REACHED'
+run_child
+fin=$(event install_finished)
+eq "Ctrl+C absorbed in the first run of a step, its second run fails: failed with the step's reason" "failed - prerequisite_packages package_install_failed 1 1" "$(field "$fin" .result) -$(field "$fin" .signal) $(field "$fin" .failed_step) $(field "$fin" .reason) $(field "$fin" .exit_code) $CHILD_RC"
+new_child int_step_rerun_sete '
+report_init
+report_stage_begin packages
+report_step_start prerequisite_packages
+_report_on_int 1
+report_step_start prerequisite_packages
+false'
+run_child
+fin=$(event install_finished)
+eq "Ctrl+C absorbed in the first run of a step, its second run stops the script (set -e): failed" "failed - prerequisite_packages package_install_failed 1" "$(field "$fin" .result) -$(field "$fin" .signal) $(field "$fin" .failed_step) $(field "$fin" .reason) $(field "$fin" .exit_code)"
 new_child int_required_then_other '
 report_init
 report_stage_begin configuration

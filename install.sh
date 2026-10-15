@@ -133,6 +133,7 @@ REPORT_STAGE=""
 REPORT_STAGE_START=0
 REPORT_STAGE_RESULT="ok"
 REPORT_STEP=""
+REPORT_STEP_RUN=0
 REPORT_FAILED_STEP=""
 REPORT_REASON=""
 REPORT_FAILED_REQUIRED=""
@@ -488,7 +489,10 @@ _report_stage_end() {
 }
 
 _report_step_result() {
-    local step="$1" outcome="$2" reason="${3:-}" class
+    local step="$1" outcome="$2" reason="${3:-}" class int_run=0
+    # Whether this is the run of the step that absorbed a Ctrl+C; checked
+    # before the current step is cleared.
+    ((REPORT_INT_SEEN)) && _report_is_int_run "$step" && int_run=1
     [[ "$REPORT_STEP" == "$step" ]] && REPORT_STEP=""
     [[ -n "$step" && "$outcome" == failed ]] || return 0
     class=$(report_step_class "$step")
@@ -499,7 +503,6 @@ _report_step_result() {
     fi
     [[ -n "$reason" ]] || reason=$(report_reason_for_step "$step")
     _report_in_list "$reason" "$REPORT_REASONS" || reason="unclassified"
-    local own="$step"
     # A package step that fails after the --source repository's metadata
     # could not be fetched failed on the mirror: reported as the repository
     # step (the package step is listed too). Only the report changes.
@@ -516,13 +519,13 @@ _report_step_result() {
     if [[ -z "$REPORT_REASON" ]]; then
         REPORT_FAILED_STEP="$step"
         REPORT_REASON="$reason"
-        if ((REPORT_INT_SEEN)) && [[ "$own" == "$REPORT_INT_STEP" ]]; then REPORT_INT_CLAIMED=1; fi
+        if ((int_run)); then REPORT_INT_CLAIMED=1; fi
     fi
-    # A step other than the one that absorbed a Ctrl+C failed after it: a
-    # real failure, which the interruption must not hide (see _report_finish).
-    # Optional steps never get here (they return above), so only steps that
-    # decide the result count.
-    if ((REPORT_INT_SEEN)) && [[ "$own" != "$REPORT_INT_STEP" ]] && ((!REPORT_FAILED_AFTER_INT)); then
+    # A step other than the run that absorbed a Ctrl+C failed after it (also
+    # a later run of the same step): a real failure, which the interruption
+    # must not hide (see _report_finish). Optional steps never get here (they
+    # return above), so only steps that decide the result count.
+    if ((REPORT_INT_SEEN && !int_run && !REPORT_FAILED_AFTER_INT)); then
         REPORT_FAILED_AFTER_INT=1
         REPORT_AFTER_INT_STEP="$step"
         REPORT_AFTER_INT_REASON="$reason"
@@ -574,8 +577,12 @@ _report_on_signal() {
 # that real failure is reported (failed); if it still succeeds, it is
 # reported as it ended. The trap runs once the interrupted command has
 # returned, before its step records the outcome, so REPORT_STEP is that step.
+# The interruption belongs to that one run of the step (REPORT_STEP_RUN,
+# counted up each time a step starts): a step can be started twice, as
+# prerequisite_packages is, and a failure of its later run is a real one.
 REPORT_INT_SEEN=0
 REPORT_INT_STEP=""
+REPORT_INT_RUN=-1
 REPORT_INT_CLAIMED=0
 REPORT_FAILED_AFTER_INT=0
 REPORT_AFTER_INT_STEP=""
@@ -584,8 +591,15 @@ _report_on_int() {
     local rc="$1"
     REPORT_INT_SEEN=1
     REPORT_INT_STEP="$REPORT_STEP"
+    REPORT_INT_RUN="$REPORT_STEP_RUN"
     ((rc == 130)) || return 0
     _report_on_signal INT
+}
+
+# _report_is_int_run step: step is the one running now and this run of it
+# absorbed the Ctrl+C.
+_report_is_int_run() {
+    [[ -n "$1" && "$1" == "$REPORT_INT_STEP" && "$1" == "$REPORT_STEP" && "$REPORT_STEP_RUN" == "$REPORT_INT_RUN" ]]
 }
 
 _report_finish() {
@@ -601,11 +615,11 @@ _report_finish() {
         # An absorbed Ctrl+C ended the install as cancelled, unless another
         # step that is not optional failed after it: reported
         # (FAILED_AFTER_INT), or the step the script stopped in (set -e) is
-        # not the one that took the Ctrl+C.
+        # not the run that took the Ctrl+C.
         absorbed=1
         if ((REPORT_FAILED_AFTER_INT)); then
             absorbed=0
-        elif [[ -n "$REPORT_STEP" && "$REPORT_STEP" != "$REPORT_INT_STEP" ]] \
+        elif [[ -n "$REPORT_STEP" ]] && ! _report_is_int_run "$REPORT_STEP" \
             && [[ "$(report_step_class "$REPORT_STEP")" != optional ]]; then
             absorbed=0
         fi
@@ -945,7 +959,7 @@ _report_ready() {
 _report_readiness_check() {
     [[ "$REPORT_MODE" != off ]] || return 0
     _report_stage_begin readiness
-    REPORT_STEP="readiness"
+    report_step_start readiness
     if _report_ready; then
         REPORT_READINESS="ok"
         _report_step_result readiness ok
@@ -964,7 +978,7 @@ report_init() {
 }
 report_stage_begin() { [[ "$REPORT_MODE" == off ]] || { _report_stage_end 2>/dev/null; _report_stage_begin "$1"; } || true; }
 report_stage_end() { _report_stage_end 2>/dev/null || true; }
-report_step_start() { REPORT_STEP="${1:-}"; }
+report_step_start() { REPORT_STEP="${1:-}"; REPORT_STEP_RUN=$((REPORT_STEP_RUN + 1)); }
 report_step_result() { _report_step_result "$@" 2>/dev/null || true; }
 # report_fail [step] [reason]: the step failed (default: the current one).
 report_fail() { _report_step_result "${1:-$REPORT_STEP}" failed "${2:-}" 2>/dev/null || true; }
