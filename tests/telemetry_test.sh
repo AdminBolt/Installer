@@ -474,7 +474,7 @@ eq "mirror unreachable: repo_download_failed" "repo_setup repo_download_failed" 
 # --source writes the repository file without downloading anything; its
 # metadata is probed so an unreachable mirror is reported as one when a
 # package step then fails. The probe never stops the install by itself.
-src_child() { # $1 name, $2 repomd_rc, $3 what happens after the repository step
+src_child() { # $1 name, $2 repomd_rc, $3 what happens after the repository step, $4 extra setup, $5 mirror hang in seconds
     new_child "$1" "
 BOLT_SOURCE=stable
 ${4:-}
@@ -485,6 +485,7 @@ install_repo_rhel 9
 echo AFTER-REPO
 $3"
     echo "$2" >"$CHILD_DIR/fake/repomd_rc"
+    [[ -z "${5:-}" ]] || echo "$5" >"$CHILD_DIR/fake/repomd_sleep"
     run_child
 }
 src_child src_down 7 'report_step_start agent_install
@@ -508,12 +509,12 @@ report_fail agent_install agent_install_failed
 exit 1' 'REPORT_NO_TELEMETRY=1'
 check "--no-telemetry: no repository probe" test ! -e "$CHILD_DIR/fake/repomd.log"
 check "--no-telemetry: repository file still written" grep -q '^\[bolt\]' "$CHILD_DIR/etc/yum.repos.d/bolt.repo"
+# One run only, with the mirror hanging from the start: a second run in the
+# same directory would leave two installs in the spool.
+start=$(date +%s.%N)
 src_child src_hang 0 'report_step_start agent_install
 report_fail agent_install agent_install_failed
-exit 1' 'REPORT_PROBE_CAP=2'
-echo 30 >"$CHILD_DIR/fake/repomd_sleep"
-start=$(date +%s.%N)
-run_child
+exit 1' 'REPORT_PROBE_CAP=2' 30
 ELAPSED=$(awk -v a="$start" -v b="$(date +%s.%N)" 'BEGIN { printf "%.1f", b - a }')
 check "--source, hanging mirror: the probe keeps to its total cap (2 s, took ${ELAPSED}s)" awk -v e="$ELAPSED" 'BEGIN { exit !(e < 4.5) }'
 eq "--source, hanging mirror: reported as repo_download_failed" "repo_setup repo_download_failed" "$(field "$(event install_finished)" .failed_step) $(field "$(event install_finished)" .reason)"
