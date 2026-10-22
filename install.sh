@@ -1175,12 +1175,20 @@ selinux_not_enforcing() {
 }
 
 # Sets the caller's TRIAL_LICENCE_OK to 1 when a trial licence was issued.
-# run_or_warn evaluates the command in this shell, so the assignment records
-# the outcome. The address is quoted with %q for that eval: whatever
-# characters it holds (' $ ` | & and the like are valid in an address), none
-# is ever parsed as shell code.
+# Same output as run_or_warn, but bolt-cli is called directly with the
+# address as one argument: the address never becomes part of a command text
+# and never goes through eval (AB-2211). A refused request only warns.
 request_trial_licence() {
-    run_or_warn "bolt-cli request-trial-license --email=$(printf '%q' "$ADMIN_EMAIL") && TRIAL_LICENCE_OK=1" "Request trial licence"
+    local desc="Request trial licence"
+    print_info "$desc"
+    report_step_start ""
+    if bolt-cli request-trial-license "--email=${ADMIN_EMAIL}"; then
+        TRIAL_LICENCE_OK=1
+        print_success "$desc completed"; report_step_result "" ok
+    else
+        echo -e "${YELLOW}WARNING:${NC} $desc failed (continuing)"; report_step_result "" failed
+    fi
+    echo -e ""
 }
 
 # ---------- Stage 2: Prepare → Prerequisite packages → Bolt packages ----------
@@ -1511,14 +1519,18 @@ main() {
         esac
     fi
 
-    # Before the @: letters, digits and the other characters RFC 5322 allows
-    # in an address (! # $ % & ' * + / = ? ^ _ ` { | } ~ . -); after it: a
-    # domain of letters, digits, hyphens and dots. No spaces, no control
-    # characters. Some of these mean something to a shell, so the address is
-    # only ever passed on quoted (request_trial_licence).
-    local email_re="^[A-Za-z0-9!#\$%&'*+/=?^_\`{|}~.-]+@[A-Za-z0-9-]+(\.[A-Za-z0-9-]+)+\$"
+    # Before the @: letters, digits and most other characters RFC 5322 allows
+    # in an address (! # % & ' * + / = ? ^ _ { | } ~ . -); after it: a domain
+    # of letters, digits, hyphens and dots. Refused before anything is
+    # installed (AB-2211): $ and ` (valid by the RFC, but no real address
+    # needs them), quotes, ;, any whitespace and control characters. The
+    # address still only ever reaches bolt-cli as one argument.
+    local email_re="^[A-Za-z0-9!#%&'*+/=?^_{|}~.-]+@[A-Za-z0-9-]+(\.[A-Za-z0-9-]+)+\$"
     if [[ -n "$ADMIN_EMAIL" && ! "$ADMIN_EMAIL" =~ $email_re ]]; then
-        print_error "Invalid --email=${ADMIN_EMAIL}"
+        local shown="${ADMIN_EMAIL:0:80}"
+        shown="${shown//[^[:print:]]/?}"
+        printf '%bERROR:%b Invalid --email=%s (expected name@domain.tld; no spaces, ", $, `, ; or control characters)\n' \
+            "$RED" "$NC" "$shown" >&2
         print_usage
         report_fail parse_arguments invalid_argument
         exit 1
