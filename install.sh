@@ -1062,7 +1062,10 @@ stage_prerequisites() {
     check_port_8443
     # AB-2106: a bad key stops the install here, before anything is changed.
     if [[ -n "$SSH_KEY_ARG" ]]; then
-        ssh_key_load || exit 1
+        # Reported as a bad argument, not as the port check that ran before it.
+        report_step_start parse_arguments
+        ssh_key_load || { report_fail parse_arguments invalid_argument; exit 1; }
+        report_step_result parse_arguments ok
         print_success "SSH key checked ($(grep -c . <<<"$SSH_KEYS") key(s))"
     fi
     print_success "Stage 1 completed: ready for installation"
