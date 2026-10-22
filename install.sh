@@ -13,6 +13,7 @@
 #   sudo ./install.sh --version=1.0.0.beta3-v46.el9 # install specific bolt-panel version from repo
 #   sudo ./install.sh --source=staging         # use staging pulp repos (stable|staging|testing); default unchanged
 #   sudo ./install.sh --email=user@example.com # activate a 24h trial license for this e-mail (confirmation link extends it to 30 days)
+#   sudo ./install.sh --admin-username=random  # first administrator: admin-<6 random characters> instead of "admin" (or a name of your choice)
 #
 set -e
 
@@ -25,6 +26,8 @@ BOLT_SOURCE=""
 # E-mail for the trial license; empty = skip the trial request (activate manually on the License page).
 ADMIN_EMAIL=""
 MARIADB_SERIES=""
+# Name of the first panel administrator; empty = "admin". "random" = admin-<6 random characters>.
+ADMIN_USERNAME=""
 readonly WEB_INSTALL_ROOT="/usr/local/bolt/web"
 readonly POST_INSTALL_DB_PATH="/var/lib/adminbolt/db.sqlite3"
 
@@ -1445,21 +1448,45 @@ stage_configuration() {
         report_trial_licence skipped
         print_info "No --email= provided; skipping trial licence request. Activate a licence later on the panel's License page."
     fi
-    local SSO_URL=$(bolt-cli admin-sso-generate 2>/dev/null || echo "")
-    [ -z "${SSO_URL}" ] && echo -e "${YELLOW}WARNING:${NC} SSO URL not generated" || print_success "SSO URL generated"
+    # The SSO link creates the first administrator, under the --admin-username= name when one was given.
+    local SSO_ARGS=()
+    [[ -n "$ADMIN_USERNAME" ]] && SSO_ARGS+=("--first-admin=${ADMIN_USERNAME}")
+    local SSO_URL=""
+    local SSO_OUT=""
+    local SSO_RETRY="bolt-cli admin-sso-generate"
+    local SSO_ERR_FILE
+    SSO_ERR_FILE=$(mktemp)
+    if SSO_OUT=$(bolt-cli admin-sso-generate "${SSO_ARGS[@]}" 2>"$SSO_ERR_FILE"); then
+        SSO_URL="${SSO_OUT}"
+        print_success "SSO URL generated"
+    elif [[ -n "$ADMIN_USERNAME" ]] && { grep -qi 'option does not exist' "$SSO_ERR_FILE" || grep -qi 'option does not exist' <<<"$SSO_OUT"; }; then
+        # A panel that predates --first-admin: nothing was created, so fall back to the default name, loudly.
+        echo -e "${YELLOW}WARNING:${NC} the installed panel does not support --admin-username yet; the first administrator is named admin"
+        if SSO_OUT=$(bolt-cli admin-sso-generate 2>/dev/null); then
+            SSO_URL="${SSO_OUT}"
+            print_success "SSO URL generated"
+        else
+            echo -e "${YELLOW}WARNING:${NC} SSO URL not generated${SSO_OUT:+: ${SSO_OUT}}"
+        fi
+    else
+        echo -e "${YELLOW}WARNING:${NC} SSO URL not generated${SSO_OUT:+: ${SSO_OUT}}"
+        # The reason above says whether the panel refused the name; a refused name needs another one on retry.
+        [[ -n "$ADMIN_USERNAME" ]] && SSO_RETRY+=" --first-admin=<name|random>"
+    fi
+    rm -f "$SSO_ERR_FILE"
     echo -e "\n${BOLD}${GREEN}+----------------------------------------------------------+${NC}"
     echo -e "${BOLD}${GREEN}|          Installation Completed Successfully             |${NC}"
     echo -e "${BOLD}${GREEN}+----------------------------------------------------------+${NC}\n"
     [ -n "${ADMIN_EMAIL}" ] && [ "${TRIAL_LICENCE_OK}" -eq 0 ] && echo -e "${YELLOW}NOTE:${NC} Trial licence not issued (request refused or licence server unreachable). The installation itself succeeded and the panel is usable; activate a licence on its License page.\n"
     [ -n "${SSO_URL:-}" ] && echo -e "${BOLD}${CYAN}--- Access ---${NC}\n${GREEN}Admin Panel:${NC}\n${BOLD}${SSO_URL}${NC}\n"
-    echo -e "${GREEN}New SSO URL:${NC}\n${BOLD}bolt-cli admin-sso-generate${NC}"
+    echo -e "${GREEN}New SSO URL:${NC}\n${BOLD}${SSO_RETRY}${NC}"
     print_progress "100% — post-install"
     print_success "Stage 3 completed: all post-install actions done"
 }
 
 # ---------- Main ----------
 print_usage() {
-    echo "Usage: sudo $0 [--help] [--version=<PANEL_VERSION>] [--source=<stable|staging|testing>] [--email=<address>] [--mariadb-version=<10.11|11.4>] [--channel=<name>] [--no-telemetry]"
+    echo "Usage: sudo $0 [--help] [--version=<PANEL_VERSION>] [--source=<stable|staging|testing>] [--email=<address>] [--mariadb-version=<10.11|11.4>] [--channel=<name>] [--no-telemetry] [--admin-username=<name|random>]"
     echo "AlmaLinux 9 / Rocky Linux 9. Stages: 1=ready check, 2=(2.1 settings, 2.2 prereq packages, 2.3 bolt packages), 3=post-install."
     echo "If --version is not provided, latest bolt-panel from repo is installed."
     echo "If --source is not provided, the bolt-repo RPM from adminbolt is used (default). Otherwise repos point at pulp content stable/staging/testing."
@@ -1468,6 +1495,7 @@ print_usage() {
     echo "Without --email the install proceeds unlicensed; activate on the panel's License page."
     echo "--channel names what started the install (${REPORT_CHANNELS// /, }); default direct."
     echo "The installer reports its progress and result (no hostnames, e-mail addresses or passwords) to AdminBolt; --no-telemetry (or ADMINBOLT_NO_TELEMETRY=1) turns this off for the installer and the panel."
+    echo "If --admin-username is not provided, the first panel administrator is named admin. --admin-username=random names it admin- plus 6 random characters; any other value is used as the name (3-32 characters: lowercase letters, numbers, dots, dashes or underscores, starting with a letter; not a reserved system name, a hosting account or an existing Linux user). The setup wizard can still rename it."
 }
 
 main() {
@@ -1499,6 +1527,9 @@ main() {
                 ;;
             --no-telemetry)
                 REPORT_NO_TELEMETRY=1
+                ;;
+            --admin-username=*)
+                ADMIN_USERNAME="${arg#--admin-username=}"
                 ;;
         esac
     done
@@ -1540,6 +1571,13 @@ main() {
         print_error "Invalid --email=${ADMIN_EMAIL}"
         print_usage
         report_fail parse_arguments invalid_argument
+        exit 1
+    fi
+
+    # Format only; the panel checks the rest (reserved names, hosting accounts, Linux users) when it creates the account.
+    if [[ -n "$ADMIN_USERNAME" && "$ADMIN_USERNAME" != "random" && ! "$ADMIN_USERNAME" =~ ^[a-z][a-z0-9._-]{2,31}$ ]]; then
+        print_error "Invalid --admin-username=${ADMIN_USERNAME} (3-32 characters: lowercase letters, numbers, dots, dashes or underscores, starting with a letter; or random)"
+        print_usage
         exit 1
     fi
 
