@@ -13,6 +13,7 @@
 #   sudo ./install.sh --version=1.0.0.beta3-v46.el9 # install specific bolt-panel version from repo
 #   sudo ./install.sh --source=staging         # use staging pulp repos (stable|staging|testing); default unchanged
 #   sudo ./install.sh --email=user@example.com # activate a 24h trial license for this e-mail (confirmation link extends it to 30 days)
+#   sudo ./install.sh --admin-username=random  # first administrator: admin-<6 random characters> instead of "admin" (or a name of your choice)
 #
 set -e
 
@@ -25,6 +26,8 @@ BOLT_SOURCE=""
 # E-mail for the trial license; empty = skip the trial request (activate manually on the License page).
 ADMIN_EMAIL=""
 MARIADB_SERIES=""
+# Name of the first panel administrator; empty = "admin". "random" = admin-<6 random characters>.
+ADMIN_USERNAME=""
 readonly WEB_INSTALL_ROOT="/usr/local/bolt/web"
 readonly POST_INSTALL_DB_PATH="/var/lib/adminbolt/db.sqlite3"
 
@@ -366,27 +369,40 @@ stage_configuration() {
     else
         print_info "No --email= provided; skipping trial licence request. Activate a licence later on the panel's License page."
     fi
-    local SSO_URL=$(bolt-cli admin-sso-generate 2>/dev/null || echo "")
-    [ -z "${SSO_URL}" ] && echo -e "${YELLOW}WARNING:${NC} SSO URL not generated" || print_success "SSO URL generated"
+    # The SSO link creates the first administrator, under the --admin-username= name when one was given.
+    local SSO_ARGS=()
+    [[ -n "$ADMIN_USERNAME" ]] && SSO_ARGS+=("--first-admin=${ADMIN_USERNAME}")
+    local SSO_URL=""
+    local SSO_OUT=""
+    local SSO_RETRY="bolt-cli admin-sso-generate"
+    if SSO_OUT=$(bolt-cli admin-sso-generate "${SSO_ARGS[@]}" 2>/dev/null); then
+        SSO_URL="${SSO_OUT}"
+        print_success "SSO URL generated"
+    else
+        echo -e "${YELLOW}WARNING:${NC} SSO URL not generated${SSO_OUT:+: ${SSO_OUT}}"
+        # Until an administrator exists, a retry needs the same name (or another one) to get it.
+        [[ -n "$ADMIN_USERNAME" ]] && SSO_RETRY+=" --first-admin=${ADMIN_USERNAME}"
+    fi
     echo -e "\n${BOLD}${GREEN}+----------------------------------------------------------+${NC}"
     echo -e "${BOLD}${GREEN}|          Installation Completed Successfully             |${NC}"
     echo -e "${BOLD}${GREEN}+----------------------------------------------------------+${NC}\n"
     [ -n "${ADMIN_EMAIL}" ] && [ "${TRIAL_LICENCE_OK}" -eq 0 ] && echo -e "${YELLOW}NOTE:${NC} Trial licence not issued (request refused or licence server unreachable). The installation itself succeeded and the panel is usable; activate a licence on its License page.\n"
     [ -n "${SSO_URL:-}" ] && echo -e "${BOLD}${CYAN}--- Access ---${NC}\n${GREEN}Admin Panel:${NC}\n${BOLD}${SSO_URL}${NC}\n"
-    echo -e "${GREEN}New SSO URL:${NC}\n${BOLD}bolt-cli admin-sso-generate${NC}"
+    echo -e "${GREEN}New SSO URL:${NC}\n${BOLD}${SSO_RETRY}${NC}"
     print_progress "100% — post-install"
     print_success "Stage 3 completed: all post-install actions done"
 }
 
 # ---------- Main ----------
 print_usage() {
-    echo "Usage: sudo $0 [--help] [--version=<PANEL_VERSION>] [--source=<stable|staging|testing>] [--email=<address>] [--mariadb-version=<10.11|11.4>]"
+    echo "Usage: sudo $0 [--help] [--version=<PANEL_VERSION>] [--source=<stable|staging|testing>] [--email=<address>] [--mariadb-version=<10.11|11.4>] [--admin-username=<name|random>]"
     echo "AlmaLinux 9 / Rocky Linux 9. Stages: 1=ready check, 2=(2.1 settings, 2.2 prereq packages, 2.3 bolt packages), 3=post-install."
     echo "If --version is not provided, latest bolt-panel from repo is installed."
     echo "If --source is not provided, the bolt-repo RPM from adminbolt is used (default). Otherwise repos point at pulp content stable/staging/testing."
     echo "If --mariadb-version is not provided, MariaDB 10.11 is installed; 11.4 is the newer long-term series (supported until 2029)."
     echo "If --email is provided, a 24h trial licence is requested for that address at the very end of the install (clicking the e-mailed confirmation link extends it to the full trial period); the install completes even if the request is refused."
     echo "Without --email the install proceeds unlicensed; activate on the panel's License page."
+    echo "If --admin-username is not provided, the first panel administrator is named admin. --admin-username=random names it admin- plus 6 random characters; any other value is used as the name (3-32 characters: lowercase letters, numbers, dots, dashes or underscores, starting with a letter; not a reserved system name, a hosting account or an existing Linux user). The setup wizard can still rename it."
 }
 
 main() {
@@ -408,6 +424,9 @@ main() {
             --mariadb-version=*)
                 MARIADB_SERIES="${arg#--mariadb-version=}"
                 ;;
+            --admin-username=*)
+                ADMIN_USERNAME="${arg#--admin-username=}"
+                ;;
         esac
     done
 
@@ -424,6 +443,13 @@ main() {
 
     if [[ -n "$ADMIN_EMAIL" && ! "$ADMIN_EMAIL" =~ ^[^[:space:]@]+@[^[:space:]@]+\.[^[:space:]@]+$ ]]; then
         print_error "Invalid --email=${ADMIN_EMAIL}"
+        print_usage
+        exit 1
+    fi
+
+    # Format only; the panel checks the rest (reserved names, hosting accounts, Linux users) when it creates the account.
+    if [[ -n "$ADMIN_USERNAME" && "$ADMIN_USERNAME" != "random" && ! "$ADMIN_USERNAME" =~ ^[a-z][a-z0-9._-]{2,31}$ ]]; then
+        print_error "Invalid --admin-username=${ADMIN_USERNAME} (3-32 characters: lowercase letters, numbers, dots, dashes or underscores, starting with a letter; or random)"
         print_usage
         exit 1
     fi

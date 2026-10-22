@@ -41,6 +41,7 @@ sudo ./install.sh --source=staging
 |---------|-------------|
 | `sudo ./install.sh` | Install latest bolt-panel from repo |
 | `sudo ./install.sh --source=<stable\|staging\|testing>` | Install from a specific repository source |
+| `sudo ./install.sh --admin-username=<name\|random>` | Name the first panel administrator (default `admin`; `random` = `admin-` plus 6 random characters) |
 | `sudo ./install.sh --help` | Show usage information |
 
 ## Install flow
