@@ -375,14 +375,26 @@ stage_configuration() {
     local SSO_URL=""
     local SSO_OUT=""
     local SSO_RETRY="bolt-cli admin-sso-generate"
-    if SSO_OUT=$(bolt-cli admin-sso-generate "${SSO_ARGS[@]}" 2>/dev/null); then
+    local SSO_ERR_FILE
+    SSO_ERR_FILE=$(mktemp)
+    if SSO_OUT=$(bolt-cli admin-sso-generate "${SSO_ARGS[@]}" 2>"$SSO_ERR_FILE"); then
         SSO_URL="${SSO_OUT}"
         print_success "SSO URL generated"
+    elif [[ -n "$ADMIN_USERNAME" ]] && { grep -qi 'option does not exist' "$SSO_ERR_FILE" || grep -qi 'option does not exist' <<<"$SSO_OUT"; }; then
+        # A panel that predates --first-admin: nothing was created, so fall back to the default name, loudly.
+        echo -e "${YELLOW}WARNING:${NC} the installed panel does not support --admin-username yet; the first administrator is named admin"
+        if SSO_OUT=$(bolt-cli admin-sso-generate 2>/dev/null); then
+            SSO_URL="${SSO_OUT}"
+            print_success "SSO URL generated"
+        else
+            echo -e "${YELLOW}WARNING:${NC} SSO URL not generated${SSO_OUT:+: ${SSO_OUT}}"
+        fi
     else
         echo -e "${YELLOW}WARNING:${NC} SSO URL not generated${SSO_OUT:+: ${SSO_OUT}}"
-        # The panel refused the requested name, so no administrator exists yet; a retry needs another one.
-        [[ -n "$ADMIN_USERNAME" ]] && SSO_RETRY+=" --first-admin=<another name|random>"
+        # The reason above says whether the panel refused the name; a refused name needs another one on retry.
+        [[ -n "$ADMIN_USERNAME" ]] && SSO_RETRY+=" --first-admin=<name|random>"
     fi
+    rm -f "$SSO_ERR_FILE"
     echo -e "\n${BOLD}${GREEN}+----------------------------------------------------------+${NC}"
     echo -e "${BOLD}${GREEN}|          Installation Completed Successfully             |${NC}"
     echo -e "${BOLD}${GREEN}+----------------------------------------------------------+${NC}\n"
