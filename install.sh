@@ -380,8 +380,8 @@ stage_configuration() {
         print_success "SSO URL generated"
     else
         echo -e "${YELLOW}WARNING:${NC} SSO URL not generated${SSO_OUT:+: ${SSO_OUT}}"
-        # Until an administrator exists, a retry needs the same name (or another one) to get it.
-        [[ -n "$ADMIN_USERNAME" ]] && SSO_RETRY+=" --first-admin=${ADMIN_USERNAME}"
+        # The panel refused the requested name, so no administrator exists yet; a retry needs another one.
+        [[ -n "$ADMIN_USERNAME" ]] && SSO_RETRY+=" --first-admin=<another name|random>"
     fi
     echo -e "\n${BOLD}${GREEN}+----------------------------------------------------------+${NC}"
     echo -e "${BOLD}${GREEN}|          Installation Completed Successfully             |${NC}"
