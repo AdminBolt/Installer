@@ -178,6 +178,31 @@ run_case off-restricted "$OFF"
 check "key also listed with command=: no drop-in" test ! -e "$DROP_IN"
 check "key also listed with command=: reason given" out_has "also lists the key with restrictions"
 
+# sshd reads root's keys from a second file first; there the key has a forced command.
+mkdir -p "$T/keys"; printf 'command="/bin/false" %s\n' "$K1" >"$T/keys/root"
+printf 'AuthorizedKeysFile %s/keys/%%u .ssh/authorized_keys\n' "$T" >"$T/other-file.conf"
+mkdir -p "$T/off-other-file"; cp "$T/off-ok/auth.log" "$T/off-other-file/"
+run_case off-other-file "cp '$T/other-file.conf' $DROP_IN_DIR/00-a.conf; $OFF"
+check "key with command= in another AuthorizedKeysFile: no drop-in" test ! -e "$DROP_IN"
+check "key with command= in another AuthorizedKeysFile: file named" out_has "$T/keys/root also lists the key with restrictions"
+
+mkdir -p /root/.ssh; printf 'no-pty %s\n' "$K1" >/root/.ssh/ab2106_test_keys
+mkdir -p "$T/off-other-home"; cp "$T/off-ok/auth.log" "$T/off-other-home/"
+run_case off-other-home "printf 'AuthorizedKeysFile .ssh/authorized_keys %%h/.ssh/ab2106_test_keys\n' >$DROP_IN_DIR/00-a.conf; $OFF"
+check "key with no-pty in %h file: no drop-in" test ! -e "$DROP_IN"
+check "key with no-pty in %h file: file named" out_has "/root/.ssh/ab2106_test_keys also lists the key"
+
+printf 'restrict %s\n' "$K2" >/root/.ssh/ab2106_test_keys
+mkdir -p "$T/off-other-key-restricted"; cp "$T/off-ok/auth.log" "$T/off-other-key-restricted/"
+run_case off-other-key-restricted "printf 'AuthorizedKeysFile .ssh/authorized_keys %%h/.ssh/ab2106_test_keys\n' >$DROP_IN_DIR/00-a.conf; $OFF"
+check "another key restricted in the second file: password off" test -f "$DROP_IN"
+rm -f "$DROP_IN" /root/.ssh/ab2106_test_keys
+
+mkdir -p "$T/off-keys-command"; cp "$T/off-ok/auth.log" "$T/off-keys-command/"
+run_case off-keys-command "printf 'AuthorizedKeysCommand /bin/true\nAuthorizedKeysCommandUser nobody\n' >$DROP_IN_DIR/00-a.conf; $OFF"
+check "keys from AuthorizedKeysCommand: no drop-in" test ! -e "$DROP_IN"
+check "keys from AuthorizedKeysCommand: reason given" out_has "AuthorizedKeysCommand /bin/true"
+
 mkdir -p "$T/off-already-off"
 run_case off-already-off "printf 'PasswordAuthentication no\n' >$DROP_IN_DIR/00-a.conf; $OFF"
 check "already off elsewhere: note does not claim it is on" out_has "sshd already has it off"

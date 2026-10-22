@@ -53,6 +53,7 @@ At the end of the install, SSH password login for root is turned off only when a
 
 - the key is still in root's `authorized_keys`;
 - sshd lets root sign in with a key, for the address the key was used from;
+- none of the files sshd reads root's keys from (its `AuthorizedKeysFile` list) holds the key with options such as `command=`, `restrict` or `no-pty`, and sshd does not take root's keys from an `AuthorizedKeysCommand`;
 - sshd logs a root sign-in with that key after the installer has set up SSH. The installer asks you to sign in with the key from a new terminal and waits up to 10 minutes (Enter skips). Without a terminal (for example cloud-init) there is no such sign-in, so password login stays on.
 
 Otherwise password login stays on and the installer prints the reason and the command to turn it off later.

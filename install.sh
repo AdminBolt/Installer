@@ -209,6 +209,48 @@ ssh_key_restricted() {
     [[ -f "$2" ]] && awk -v t="$type" -v k="$b64" '$1 !~ /^#/ { for (i = 2; i < NF; i++) if ($i == t && $(i + 1) == k) f = 1 } END { exit !f }' "$2"
 }
 
+# Root's AuthorizedKeysFile paths from `sshd -T` output $1, one per line, with %h, %u, %U and %%
+# expanded as sshd does and relative paths under root's home. 1 when the list cannot be worked out.
+ssh_root_key_files() {
+    local v f home
+    local -a files
+    home=$(getent passwd root 2>/dev/null | cut -d: -f6)
+    v=$(sshd_value authorizedkeysfile "$1")
+    [[ -n "$home" && -n "$v" ]] || return 1
+    read -ra files <<<"$v"
+    for f in "${files[@]}"; do
+        [[ "$f" == none ]] && continue
+        f=${f//"%%"/$'\001'}
+        f=${f//"%h"/$home}
+        f=${f//"%u"/root}
+        f=${f//"%U"/0}
+        [[ "$f" != *%* ]] || return 1
+        f=${f//$'\001'/%}
+        [[ "$f" == /* ]] || f="$home/$f"
+        printf '%s\n' "$f"
+    done
+}
+
+# Why a sign-in with the key may give no shell under `sshd -T` output $1; empty when it cannot.
+# sshd takes the first file that lists the key, so the key behind options (command=, restrict,
+# no-pty, ...) in any of root's key files, or keys from a command, means the log proves nothing.
+ssh_key_restriction_blocker() {
+    local v files f line
+    v=$(sshd_value authorizedkeyscommand "$1")
+    [[ -z "$v" || "$v" == none ]] || { echo "sshd also takes root's keys from AuthorizedKeysCommand ${v}"; return; }
+    files=$(ssh_root_key_files "$1") || { echo "could not work out root's AuthorizedKeysFile list"; return; }
+    while IFS= read -r f; do
+        [[ -n "$f" ]] || continue
+        while IFS= read -r line; do
+            [[ -n "$line" ]] || continue
+            if ssh_key_restricted "$line" "$f"; then
+                echo "${f} also lists the key with restrictions (command=, restrict, no-pty, ...)"
+                return
+            fi
+        done <<<"$SSH_KEYS"
+    done <<<"$ROOT_AUTHORIZED_KEYS"$'\n'"$files"
+}
+
 ssh_keys_in_place() {
     local line
     while IFS= read -r line; do
@@ -267,6 +309,7 @@ ssh_root_key_login_blocker() {
     [[ -z "$v" || "$v" == any || "$v" == publickey ]] || { echo "sshd requires more than a key (AuthenticationMethods ${v})"; return; }
     v=$(sshd_value forcecommand "$cfg")
     [[ -z "$v" || "$v" == none ]] || { echo "root's SSH sessions are forced to run ${v}"; return; }
+    ssh_key_restriction_blocker "$cfg"
 }
 
 # Set SSH_KEY_LOGIN_ADDR to the client address of the latest root sign-in with one of the keys
@@ -337,20 +380,14 @@ ssh_drop_in_restore() {
 ssh_password_login_off() {
     [[ -n "$SSH_KEYS" ]] || return 0
     print_info "SSH: turning password login for root off (--ssh-key)"
-    local blocker saved="" tmp cfg line
+    local blocker saved="" tmp cfg
     # Only a sign-in from now on counts: it ran under the sshd settings the install left behind.
     SSH_KEY_PROOF_SINCE=$(date +%s)
     if ! ssh_keys_in_place; then
         ssh_password_kept "the key is no longer in ${ROOT_AUTHORIZED_KEYS}"
         return 0
     fi
-    while IFS= read -r line; do
-        [[ -n "$line" ]] || continue
-        if ssh_key_restricted "$line" "$ROOT_AUTHORIZED_KEYS"; then
-            ssh_password_kept "${ROOT_AUTHORIZED_KEYS} also lists the key with restrictions (command=, from=, ...)"
-            return 0
-        fi
-    done <<<"$SSH_KEYS"
+    # Also checks every file sshd reads root's keys from for the key behind options.
     blocker=$(ssh_root_key_login_blocker "$(sshd_effective_for_root 127.0.0.1)")
     if [[ -n "$blocker" ]]; then
         ssh_password_kept "$blocker"
