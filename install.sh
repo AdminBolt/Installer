@@ -13,6 +13,7 @@
 #   sudo ./install.sh --version=1.0.0.beta3-v46.el9 # install specific bolt-panel version from repo
 #   sudo ./install.sh --source=staging         # use staging pulp repos (stable|staging|testing); default unchanged
 #   sudo ./install.sh --email=user@example.com # activate a 24h trial license for this e-mail (confirmation link extends it to 30 days)
+#   sudo ./install.sh --mariadb-version=10.11  # MariaDB 10.11 instead of the default 11.4 (10.11 or 11.4)
 #
 set -e
 
@@ -24,7 +25,10 @@ PANEL_VERSION=""
 BOLT_SOURCE=""
 # E-mail for the trial license; empty = skip the trial request (activate manually on the License page).
 ADMIN_EMAIL=""
+# --mariadb-version=; empty = the default below on a new box (see stage_configuration).
 MARIADB_SERIES=""
+# AB-2228: the MariaDB series of a new install (10.11 until then).
+readonly DEFAULT_MARIADB_SERIES="11.4"
 readonly WEB_INSTALL_ROOT="/usr/local/bolt/web"
 readonly POST_INSTALL_DB_PATH="/var/lib/adminbolt/db.sqlite3"
 
@@ -1368,8 +1372,12 @@ stage_configuration() {
     run_or_warn "bolt-cli manage-nftable --action=install" "Nftable" nftables
     run_or_warn "bolt-cli manage-sshd --action=install" "SSH server" ssh_server
     run_or_warn "bolt-cli manage-powerdns --action=install" "PowerDNS" powerdns
-    # AB-1446: the MariaDB series is a choice; without --mariadb-version the
-    # panel's default series is installed.
+    # AB-1446: the MariaDB series is a choice. AB-2228: without
+    # --mariadb-version a new box gets DEFAULT_MARIADB_SERIES, asked for
+    # explicitly so a panel with an older default installs it too. A box that
+    # already runs MariaDB (the installer run again) is asked for no series,
+    # so the panel keeps the one installed there.
+    MARIADB_SERIES=$(mariadb_series_to_install "$MARIADB_SERIES")
     if [[ -n "$MARIADB_SERIES" ]]; then
         # QA F1: a panel that predates the --series option (an older channel
         # head, a pinned older version) refused the flag and the box was left
@@ -1457,13 +1465,25 @@ stage_configuration() {
     print_success "Stage 3 completed: all post-install actions done"
 }
 
+# The series stage_configuration asks the panel for: the one given with
+# --mariadb-version, else DEFAULT_MARIADB_SERIES when no MariaDB server
+# package is installed yet, else none (the panel keeps the installed one).
+mariadb_series_to_install() {
+    local given="${1:-}"
+    if [[ -n "$given" ]]; then
+        echo "$given"
+    elif ! rpm -q MariaDB-server >/dev/null 2>&1 && ! rpm -q mariadb-server >/dev/null 2>&1; then
+        echo "$DEFAULT_MARIADB_SERIES"
+    fi
+}
+
 # ---------- Main ----------
 print_usage() {
     echo "Usage: sudo $0 [--help] [--version=<PANEL_VERSION>] [--source=<stable|staging|testing>] [--email=<address>] [--mariadb-version=<10.11|11.4>] [--channel=<name>] [--no-telemetry]"
     echo "AlmaLinux 9 / Rocky Linux 9. Stages: 1=ready check, 2=(2.1 settings, 2.2 prereq packages, 2.3 bolt packages), 3=post-install."
     echo "If --version is not provided, latest bolt-panel from repo is installed."
     echo "If --source is not provided, the bolt-repo RPM from adminbolt is used (default). Otherwise repos point at pulp content stable/staging/testing."
-    echo "If --mariadb-version is not provided, MariaDB 10.11 is installed; 11.4 is the newer long-term series (supported until 2029)."
+    echo "If --mariadb-version is not provided, MariaDB ${DEFAULT_MARIADB_SERIES} is installed (long-term series, supported until 2029); --mariadb-version=10.11 installs the previous long-term series (supported until 2028). Without the option, a server that already runs MariaDB keeps its series."
     echo "If --email is provided, a 24h trial licence is requested for that address at the very end of the install (clicking the e-mailed confirmation link extends it to the full trial period); the install completes even if the request is refused."
     echo "Without --email the install proceeds unlicensed; activate on the panel's License page."
     echo "--channel names what started the install (${REPORT_CHANNELS// /, }); default direct."
