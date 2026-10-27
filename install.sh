@@ -1339,7 +1339,9 @@ install_report_replaced_files() {
     echo "${dir}/files.tar.gz holds the files as they were before the install (see ${dir}/README.txt)."
     check_rc=2
     if [[ -s "$dir/manifest.sha256" ]]; then
-        sha256sum --check --quiet "$dir/manifest.sha256" 2>/dev/null | sed -n 's/: FAILED.*$//p' | sort >"$dir/replaced-files.txt"
+        # Root-only like the rest of the backup (the umask is the install's again here).
+        install -m 600 /dev/null "$dir/replaced-files.txt"
+        sha256sum --check --quiet "$dir/manifest.sha256" 2>/dev/null | sed -n 's/: FAILED.*$//p' | sort >>"$dir/replaced-files.txt"
         check_rc=${PIPESTATUS[0]}
     fi
     # 0: every file as it was, 1: some changed or gone; anything else (or no
