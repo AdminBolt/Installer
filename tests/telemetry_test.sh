@@ -1413,6 +1413,109 @@ exit 0'
 done
 
 # ---------------------------------------------------------------------------
+echo "# error excerpts of failed steps (AB-2233)"
+# ---------------------------------------------------------------------------
+child excerpts '
+ADMIN_EMAIL=owner@customer-mail.org
+report_init
+report_stage_begin configuration
+run_or_warn true "Nftable" nftables
+run_or_warn "printf \"Installing MariaDB 11.4 on %s\\n\" \"$(uname -n)\"; echo \"connect to 203.0.113.9 as owner@customer-mail.org\" >&2; echo \"ERROR 2002 (HY000): Cant connect to server\"; (exit 3)" "MariaDB" mariadb
+run_or_warn "echo postfix profile failed; (exit 1)" "Postfix profiles" postfix_profiles
+run_or_warn "printf \"\\033[0;31mdovecot\\033[0m profile failed\\r\\n\"; (exit 2)" "Dovecot profiles" dovecot_profiles
+echo "Admin Panel: https://203.0.113.9:8443/sso/abcdef0123456789abcdef0123456789"
+report_stage_end
+exit 0'
+fin=$(event install_finished)
+eq "excerpts: one entry per failed step, the decisive one first" "mariadb postfix_profiles dovecot_profiles" "$(jq -r '[.errors[].step] | join(" ")' <<<"$fin")"
+eq "excerpts: exit code of each step's command" "3 1 2" "$(jq -r '[.errors[].exit_code] | map(tostring) | join(" ")' <<<"$fin")"
+eq "excerpts: result and reason unchanged" "failed mariadb required_step_failed 0" "$(field "$fin" .result) $(field "$fin" .failed_step) $(field "$fin" .reason) $(field "$fin" .exit_code)"
+m_out=$(jq -r '.errors[0].output' <<<"$fin")
+check "excerpt: the final error line is there" grep -q 'ERROR 2002 (HY000): Cant connect to server$' <<<"$(jq -r '.errors[0].output' <<<"$fin" | sed -n '$p')"
+check "excerpt: stderr of the step is in it" grep -q 'connect to <ip> as <email>' <<<"$m_out"
+check "excerpt: ends with the command's error, not the runner's warning" bash -c '! grep -q "MariaDB failed (continuing)" <<<"$1"' _ "$m_out"
+check "excerpt: this host's name replaced" grep -q 'Installing MariaDB 11.4 on <host>' <<<"$m_out"
+check "excerpt: no host name, IP or e-mail left" bash -c '! grep -qiF -- "$(uname -n)" <<<"$1" && ! grep -q "203.0.113.9\|customer-mail" <<<"$1"' _ "$fin"
+eq "excerpt: colour codes and the carriage return removed" "dovecot profile failed" "$(jq -r '.errors[2].output' <<<"$fin" | head -n 1)"
+check "excerpt: output after the last step (the sign-in link) never sent" bash -c '! grep -q "sso" <<<"$1"' _ "$fin"
+check "excerpt: output of a step that worked never sent" bash -c '! grep -q "Nftable" <<<"$1"' _ "$(jq -r '[.errors[].output] | join("\n")' <<<"$fin")"
+check "terminal: the step output is printed as before" grep -q 'ERROR 2002 (HY000): Cant connect to server' "$CHILD_DIR/out"
+check "terminal: colours still reach it" grep -q $'\033\\[0;31mdovecot' "$CHILD_DIR/out"
+check "the step copies are removed at exit" bash -c '! ls -d "${TMPDIR:-/tmp}"/adminbolt-install-steps.* 2>/dev/null | grep -q .'
+
+child excerpt_fail '
+report_init
+report_stage_begin configuration
+run_or_fail "echo agent: connection refused; (exit 7)" "Connect bolt-agent to panel" agent_panel_connect'
+fin=$(event install_finished)
+eq "run_or_fail: the step that stopped the install, with its own exit code" "agent_panel_connect 7 1" "$(jq -r '"\(.errors[0].step) \(.errors[0].exit_code) \(.exit_code)"' <<<"$fin")"
+eq "run_or_fail: the command's output, without the runner's message" 'agent: connection refused' "$(jq -r '.errors[0].output' <<<"$fin")"
+
+child excerpt_sete '
+report_init
+report_stage_begin packages
+report_step_start web_services_enable
+echo "Failed to enable unit: Unit file bolt-nginx.service does not exist."
+false'
+fin=$(event install_finished)
+eq "stopped by set -e: the running step, the script's exit code" "web_services_enable 1" "$(jq -r '"\(.errors[0].step) \(.errors[0].exit_code)"' <<<"$fin")"
+check "stopped by set -e: its output" grep -q 'bolt-nginx.service does not exist' <<<"$(jq -r '.errors[0].output' <<<"$fin")"
+
+child excerpt_limits '
+report_init
+report_stage_begin configuration
+big() { for n in $(seq 1 100); do printf "line %03d %s\n" "$n" "$(printf "$1%.0s" $(seq 1 90))"; done; echo "final error $2"; return 1; }
+run_or_warn "big y mariadb" "MariaDB" mariadb
+run_or_warn "big z redis" "Redis" redis
+run_or_warn "big x greeting" "Greeting" greeting
+for s in rspamd mlmmj vsftpd disk_quota fail2ban ssh_profiles postfix_profiles dovecot_profiles redis_profiles rspamd_profiles \
+    system_email dns_template vsftpd_profile fail2ban_profile cron_jobs hidepid rspamd_restart app_git app_metrics app_adminer app_roundcube; do
+    run_or_warn "echo $s failed; false" "$s" "$s"
+done
+report_stage_end
+exit 0'
+fin=$(event install_finished)
+eq "limits: required steps first" "mariadb redis" "$(jq -r '[.errors[0,1].step] | join(" ")' <<<"$fin")"
+check "limits: 2 KB per step" jq -e 'all(.errors[]; (.output | length) <= 2048)' <<<"$fin"
+check "limits: 6 KB in all" jq -e '([.errors[].output | length] | add) <= 6144' <<<"$fin"
+eq "limits: at most 20 entries (24 steps failed)" 20 "$(jq '.errors | length' <<<"$fin")"
+check "limits: at most 40 lines" jq -e 'all(.errors[]; (.output | split("\n") | length) <= 40)' <<<"$fin"
+eq "limits: the oldest lines go, the final error stays" "final error mariadb" "$(jq -r '.errors[0].output' <<<"$fin" | tail -n 1)"
+check "limits: whole lines kept" bash -c '[[ "$(jq -r ".errors[0].output" <<<"$1" | head -n 1)" =~ ^line\ [0-9]{3}\ y+$ ]]' _ "$fin"
+check "limits: a step past the 6 KB budget is listed without output" jq -e '.errors[-1].output == "" and (.errors[-1].exit_code == 1)' <<<"$fin"
+check "limits: no cut-off line from the budget" jq -e 'all(.errors[]; .output == "" or (.output | test("^(line|final|[a-z_0-9]+ failed)")))' <<<"$fin"
+check "limits: event body fits the receiver's 16 KB" test "$(jq -c . <<<"$fin" | wc -c)" -le 16384
+
+child excerpt_stderr_apart '
+report_init
+report_stage_begin configuration
+run_or_warn "echo out-line; echo err-line >&2; (exit 1)" "Postfix" postfix
+report_stage_end
+exit 0'
+# Run again with stderr to its own file: both still captured, each stays on its stream.
+(cd "$CHILD_DIR" && FAKE_DIR="$CHILD_DIR/fake" PATH="$FAKEPATH" "$BASH" child.sh >"$CHILD_DIR/out1" 2>"$CHILD_DIR/err1")
+fin=$(spool_events | jq -c 'select(.type == "install_finished")' | tail -n 1)
+check "stdout and stderr apart: both in the excerpt" bash -c 'o=$(jq -r ".errors[0].output" <<<"$1"); grep -q out-line <<<"$o" && grep -q err-line <<<"$o"' _ "$fin"
+check "stdout and stderr apart: stderr still on stderr" bash -c 'grep -q err-line "$1/err1" && ! grep -q err-line "$1/out1"' _ "$CHILD_DIR"
+
+child excerpt_no_gawk '
+_report_redact() { return 1; }
+report_init
+report_stage_begin configuration
+run_or_warn "echo secret stuff; (exit 1)" "Postfix" postfix
+report_stage_end
+exit 0'
+eq "redaction unavailable: the step is listed without output" "postfix||1" "$(jq -r '.errors[0] | "\(.step)|\(.output)|\(.exit_code)"' <<<"$(event install_finished)")"
+
+child excerpt_off '
+REPORT_NO_TELEMETRY=1
+report_init
+run_or_warn "echo boom; (exit 1)" "Postfix" postfix
+exit 0'
+eq "--no-telemetry: nothing sent" 0 "$(ls "$CHILD_DIR/fake/req" 2>/dev/null | wc -l | tr -d " ")"
+check "--no-telemetry: the step output still on the terminal" grep -q boom "$CHILD_DIR/out"
+
+# ---------------------------------------------------------------------------
 echo "# every event of every run above against the KONTRAKT field rules"
 # ---------------------------------------------------------------------------
 SCHEMA='
@@ -1435,7 +1538,11 @@ common and (
     and (.stage | IN("prerequisites","packages","configuration","readiness")) and (.duration_s | int(0; 86400))
     and (.result | IN("ok","warnings","failed"))
   elif .type == "install_finished" then
-    (keys | sort) == (["schema","install_id","event_id","type","sent_at","result","failed_step","reason","exit_code","signal","failed_optional_steps","failed_required_steps","panel_version","agent_version","trial_licence","duration_s"] | sort)
+    ((keys - ["errors"]) | sort) == (["schema","install_id","event_id","type","sent_at","result","failed_step","reason","exit_code","signal","failed_optional_steps","failed_required_steps","panel_version","agent_version","trial_licence","duration_s"] | sort)
+    and ((has("errors") | not) or (.errors | type == "array" and length >= 1 and length <= 20
+      and all(.[]; type == "object" and ((keys - ["step","exit_code","output"]) == []) and (.step | re("^[a-z0-9_-]{1,48}$"))
+        and ((has("exit_code") | not) or (.exit_code | int(0; 255))) and (.output | type == "string" and (utf8bytelength <= 2048) and test("^[\t\n -~]*$")))
+      and (map(.output | utf8bytelength) | add) <= 6144))
     and (.result | IN("succeeded","succeeded_with_warnings","failed","cancelled"))
     and (.failed_step | re("^[a-z0-9_-]{0,48}$"))
     and (.reason | IN("","not_root","unsupported_os","invalid_argument","missing_command","port_in_use","repo_download_failed","package_install_failed","agent_install_failed","panel_scriptlet_failed","agent_panel_connect_failed","required_step_failed","readiness_check_failed","interrupted","unclassified"))
@@ -1451,8 +1558,8 @@ bad=$(printf '%s\n' "$all_files" | while read -r f; do jq -e "$SCHEMA" "$f" >/de
 eq "all $total stored or sent events match the field rules" "" "$bad"
 check "no e-mail address in any of them" bash -c '! cat "$@" | grep -q "@"' _ $all_files
 check "no os-release hostname in any of them" bash -c '! cat "$@" | grep -q "host.example.com"' _ $all_files
-big=$(printf '%s\n' "$all_files" | while read -r f; do [[ $(wc -c <"$f") -le 8192 ]] || echo "$f"; done)
-eq "every event under 8 KB" "" "$big"
+big=$(printf '%s\n' "$all_files" | while read -r f; do [[ $(wc -c <"$f") -le 16384 ]] || echo "$f"; done)
+eq "every event under 16 KB" "" "$big"
 
 echo
 echo "# passed: $PASS, failed: $FAIL"
