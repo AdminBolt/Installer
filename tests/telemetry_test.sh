@@ -1511,7 +1511,10 @@ report_fail parse_arguments invalid_argument
 ss() { printf "tcp LISTEN 0 128 0.0.0.0:8443 0.0.0.0:* users:((\"httpd\",pid=1,fd=3))\n"; }
 check_port_8443'
 fin=$(event install_finished)
-eq "Stage 1 refusals: listed, without output" "parse_arguments||check_port_8443|" "$(jq -r '[.errors[] | "\(.step)|\(.output)"] | join("|")' <<<"$fin")"
+eq "Stage 1 refusals: listed, without output, except the port 8443 listener (redacted)" \
+    'parse_arguments||check_port_8443|ERROR: Port 8443 is already in use by another service. Please free it before running this installer.
+Current listener:
+tcp LISTEN 0 128 <ip>:8443 <ip>:* users:(("httpd",pid=1,fd=3))' "$(jq -r '[.errors[] | "\(.step)|\(.output)"] | join("|")' <<<"$fin" | sed 's/\x1b\[[0-9;]*m//g')"
 check "Stage 1 refusals: still printed on the terminal" grep -q 'jkowalski' "$CHILD_DIR/out"
 
 # One deadline for all the excerpts: slow redaction of 20 failed steps with a

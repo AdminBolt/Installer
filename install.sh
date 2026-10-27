@@ -1067,11 +1067,12 @@ _report_capture_init() {
 }
 
 # Stage 1 refuses to install for reasons its step id and reason code already
-# say (not root, the OS, a missing command, port 8443, a server already in
-# use, a bad argument). What it prints there names local users, home
-# directories and arguments, so these steps send no output: their output is
-# not even copied.
-_report_step_sends_output() { [[ "$1" != parse_arguments && "$1" != check_* ]]; }
+# say (not root, the OS, a missing command, a server already in use, a bad
+# argument). What it prints there names local users, home directories and
+# arguments, so these steps send no output: their output is not even copied.
+# The one exception is the port 8443 check: its output is the listener that
+# holds the port, which the alert shows as the error line.
+_report_step_sends_output() { [[ "$1" == check_port_8443 ]] || [[ "$1" != parse_arguments && "$1" != check_* ]]; }
 
 # Starts copying the output of step $1. Never fails: without a capture the
 # step runs as before and its excerpt is empty.
