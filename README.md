@@ -4,6 +4,7 @@
 
 - **AlmaLinux 9** or **Rocky Linux 9**
 - Root access (run with `sudo`)
+- A **fresh** server: the installer sets up its own web, mail, DNS, database and firewall stack (see [Servers already in use](#servers-already-in-use))
 
 ## Installation
 
@@ -42,6 +43,7 @@ sudo ./install.sh --source=staging
 | `sudo ./install.sh` | Install latest bolt-panel from repo |
 | `sudo ./install.sh --source=<stable\|staging\|testing>` | Install from a specific repository source |
 | `sudo ./install.sh --channel=<name>` | Name what started the install (`direct` by default; `get-script`, `web-installer`, `vultr`, `akamai`, `node`, `image-build`, `test`, `hostinger`, `digitalocean`, `aws`, `azure`); any other value prints a warning and the install is reported as `direct` |
+| `sudo ./install.sh --force-existing-server` | Install on a server that is already in use, after backing up its configuration (see [Servers already in use](#servers-already-in-use)) |
 | `sudo ./install.sh --no-telemetry` | Do not send the install report (same as `ADMINBOLT_NO_TELEMETRY=1`) |
 | `sudo ./install.sh --help` | Show usage information |
 
@@ -49,9 +51,29 @@ sudo ./install.sh --source=staging
 
 The installer runs in 3 stages:
 
-1. Check prerequisites (root, supported OS, required commands, port 8443 availability)
+1. Check prerequisites (root, supported OS, required commands, port 8443 availability, no existing web/mail/DNS/database setup)
 2. Prepare system and install prerequisite/Bolt packages
 3. Run `bolt-cli` post-install actions and print access details
+
+## Servers already in use
+
+The installer is meant for a fresh AlmaLinux 9 or Rocky Linux 9 server. It does not import existing sites, mailboxes or databases; to bring those over, install on a fresh server and use the panel's migration tools.
+
+Before it installs anything, the installer checks whether the server is already in use and stops if it finds any of:
+
+- an installed web, mail, DNS or database server package (`httpd`, `nginx`, `postfix`, `sendmail`, `exim`, `dovecot`, `bind`, `pdns`, `mariadb-server`, `mysql-server`, `community-mysql-server`) or such a service running;
+- something listening on a web, mail, FTP, DNS or database port (21, 25, 53, 80, 110, 143, 443, 465, 587, 993, 995, 3306);
+- an nftables table not created by firewalld, or firewalld rules beyond an image's default zone (services other than `ssh`, `dhcpv6-client`, `cockpit`; open ports, rich or direct rules);
+- a user with uid 1000 or above whose home holds files of their own, or anything else in `/home` that holds files;
+- files in `/var/www`, or database files in `/var/lib/mysql`.
+
+A fresh cloud image passes: its firewalld default zone and its cloud user (whose home holds only the skeleton files, `~/.ssh` and tool caches) do not count. A server that already has AdminBolt (a reinstall, or a rerun after a failed install) is not checked.
+
+When it stops, it lists what it found and what the install would change: SELinux is switched off, firewalld is stopped and the nftables table `ip filter` is replaced by AdminBolt's, whose INPUT and forward chains drop everything but the panel's own ports, the main configuration files of Apache, Postfix, Dovecot, PowerDNS, Redis, vsftpd, Fail2Ban and sshd are written over, and an existing MariaDB is replaced with a new root password. The refusal is reported as `check_existing_server` / `existing_server` in the install report.
+
+`--force-existing-server` installs anyway. Before anything is installed, `/etc`, `/var/spool/cron`, `/root/.my.cnf`, `/usr/bin/mlmmj-make-ml.sh` and `/var/www/html/index.html` / `index.php` are copied to `/root/adminbolt-preinstall-backup-<date>/` (root only), with the firewall's live ruleset (`nft-ruleset.nft`) and the SELinux mode; the install does not start if that copy fails. At the end the installer lists the backed-up files it changed or removed (`replaced-files.txt`). Site files and databases are not part of the backup, and nothing is restored automatically: restore single files from `files.tar.gz` as `README.txt` in that directory shows.
+
+Tests (no network, no root): `bash tests/preflight_test.sh`.
 
 ## Install report
 
