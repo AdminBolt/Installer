@@ -1337,7 +1337,25 @@ _report_excerpt_clean() {
     tail -n "$REPORT_EXCERPT_SCAN_LINES" -- "$1" 2>/dev/null | tail -c 65536 \
         | LC_ALL=C awk '{ if (length($0) > 4096) $0 = substr($0, length($0) - 4095); print }' \
         | LC_ALL=C sed -e 's/\x1b\[[0-9;?]*[A-Za-z]//g' -e 's/\x1b[()][A-Za-z0-9]//g' -e 's/\r$//' -e 's/.*\r//' \
-        | LC_ALL=C tr -c '\11\12\40-\176' '?'
+        | _report_to_ascii \
+        | LC_ALL=C awk '
+        # A progress bar printed as one line per update (bolt-cli off a
+        # terminal): only its last state is kept, so it does not use up
+        # the 40 lines the error needs.
+        function bar(l) { return l ~ /^ *[0-9]+\/[0-9]+ +\[[^]]*\] +[0-9]+%/ }
+        { if (NR > 1 && !(bar(prev) && bar($0))) print prev; prev = $0 }
+        END { if (NR > 0) print prev }'
+}
+
+# One "?" per character that is not printable ASCII (a box drawn with
+# UTF-8 would otherwise turn into three per character); tabs and new lines
+# stay.
+_report_to_ascii() {
+    if command -v iconv >/dev/null 2>&1; then
+        LC_ALL=C.UTF-8 iconv -c -f UTF-8 -t ASCII//TRANSLIT 2>/dev/null | LC_ALL=C tr -c '\11\12\40-\176' '?'
+    else
+        LC_ALL=C tr -c '\11\12\40-\176' '?'
+    fi
 }
 
 # The last REPORT_EXCERPT_LINES lines of stdin within $1 bytes, trailing
