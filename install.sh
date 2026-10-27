@@ -1285,7 +1285,7 @@ _report_redact() {
         # name=value or name: value where the name says it is a secret; "pass"
         # and "key" only end a name, so "passed: 3" stays.
         rest = s; s = ""
-        while (match(rest, /([a-z0-9_.-]*(password|passwd|passphrase|pwd|secret|token|api[_-]?key|apikey|access[_-]?key|private[_-]?key|auth[_-]?key|licen[cs]e[_-]?key|credential)[a-z0-9_.-]*|[a-z0-9_.-]*pass|[a-z0-9_.-]*[_-]key)(["\047\]]?[ \t]*(=>|[=:])[ \t]*)("([^"\\]|\\.)*"|\047([^\047\\]|\\.|\047\047)*\047|[^ \t"\047,;]+)/, m)) {
+        while (match(rest, /([a-z0-9_.-]*(password|passwd|passphrase|pwd|secret|token|api[_-]?key|apikey|access[_-]?key|private[_-]?key|auth[_-]?key|licen[cs]e[_-]?key|credential)[a-z0-9_.-]*|[a-z0-9_.-]*pass|[a-z0-9_.-]*[_-]key)(\\?["\047\]]?[ \t]*(=>|:=|==|[=:])[ \t]*)(\\"([^\\]|\\[^"])*\\"|"([^"\\]|\\.)*"|\047([^\047\\]|\\.|\047\047)*\047|"[^"]*|\047[^\047]*|[^ \t"\047,;]+)/, m)) {
             val = m[5, "length"] ? substr(rest, m[5, "start"], m[5, "length"]) : ""
             if (val ~ /^(yes|no)\)?$/) { s = s substr(rest, 1, RSTART + RLENGTH - 1) }
             else { s = s substr(rest, 1, m[5, "start"] - 1) "<secret>" }
@@ -1293,14 +1293,18 @@ _report_redact() {
         }
         s = s rest
         # --password VALUE, with a space instead of "=".
-        s = gensub(/(--[a-z0-9-]*(password|passwd|pass|secret|token|api-?key|access-?key|auth-?key|licen[cs]e-?key)[ \t]+)("([^"\\]|\\.)*"|\047([^\047\\]|\\.|\047\047)*\047|[^ \t"\047,;]+)/, "\\1<secret>", "g", s)
+        s = gensub(/(--[a-z0-9-]*(password|passwd|pass|secret|token|api-?key|access-?key|auth-?key|licen[cs]e-?key)[ \t]+)(\\"([^\\]|\\[^"])*\\"|"([^"\\]|\\.)*"|\047([^\047\\]|\\.|\047\047)*\047|"[^"]*|\047[^\047]*|[^ \t"\047,;]+)/, "\\1<secret>", "g", s)
+        # SQL: PASSWORD('x'), SET PASSWORD ... = PASSWORD("x").
+        s = gensub(/(\<password[ \t]*\([ \t]*)(\\"([^\\]|\\[^"])*\\"|"([^"\\]|\\.)*"|\047([^\047\\]|\\.|\047\047)*\047|"[^"]*|\047[^\047]*)/, "\\1<secret>", "g", s)
+        # A licence key after the word, also with a space (license ABCD-1234-...).
+        s = gensub(/(\<licen[cs]e([ _-]?key)?\>[ \t]*[:=]?[ \t]*)([a-z0-9]{2,8}(-[a-z0-9]{4,8}){2,})/, "\\1<secret>", "g", s)
         # SQL: IDENTIFIED BY 'x', IDENTIFIED WITH plugin BY|AS 'x'.
-        s = gensub(/(\<identified[ \t]+(with[ \t]+[^ \t]+[ \t]+)?(by|as)[ \t]+)("([^"\\]|\\.)*"|\047([^\047\\]|\\.|\047\047)*\047|[^ \t"\047,;]+)/, "\\1<secret>", "g", s)
+        s = gensub(/(\<identified[ \t]+(with[ \t]+[^ \t]+[ \t]+)?(by|as)[ \t]+)(\\"([^\\]|\\[^"])*\\"|"([^"\\]|\\.)*"|\047([^\047\\]|\\.|\047\047)*\047|"[^"]*|\047[^\047]*|[^ \t"\047,;]+)/, "\\1<secret>", "g", s)
         if (match(s, /\<sshpass\>/))
-            s = substr(s, 1, RSTART + RLENGTH - 1) gensub(/([ \t]-p[ \t]*)("([^"\\]|\\.)*"|\047([^\047\\]|\\.|\047\047)*\047|[^ \t]+)/, "\\1<secret>", "g", substr(s, RSTART + RLENGTH))
+            s = substr(s, 1, RSTART + RLENGTH - 1) gensub(/([ \t]-p[ \t]*)(\\"([^\\]|\\[^"])*\\"|"([^"\\]|\\.)*"|\047([^\047\\]|\\.|\047\047)*\047|"[^"]*|\047[^\047]*|[^ \t]+)/, "\\1<secret>", "g", substr(s, RSTART + RLENGTH))
         # mysql / mariadb -pSECRET: every -p after the client name.
         if (match(s, /\<(mysql|mariadb)[a-z-]*\>/))
-            s = substr(s, 1, RSTART + RLENGTH - 1) gensub(/([ \t]-p)("([^"\\]|\\.)*"|\047([^\047\\]|\\.|\047\047)*\047|[^ \t]+)/, "\\1<secret>", "g", substr(s, RSTART + RLENGTH))
+            s = substr(s, 1, RSTART + RLENGTH - 1) gensub(/([ \t]-p)(\\"([^\\]|\\[^"])*\\"|"([^"\\]|\\.)*"|\047([^\047\\]|\\.|\047\047)*\047|"[^"]*|\047[^\047]*|[^ \t]+)/, "\\1<secret>", "g", substr(s, RSTART + RLENGTH))
         IGNORECASE = 0
         s = emails(s)
         s = scan(s, "([0-9A-Fa-f]{0,4}:){2,7}([0-9]{1,3}(\\.[0-9]{1,3}){3}|[0-9A-Fa-f]{1,4})?(%[0-9A-Za-z_.-]+)?", "v6", "<ip>")
@@ -1359,10 +1363,22 @@ _report_redact() {
 # Cleaned end of a step's output file $1: colour codes and carriage-return
 # overwrites removed, anything but printable ASCII and tabs as '?'.
 _report_excerpt_clean() {
-    # Bytes are capped too (and every line to the end of its last 4 KB): the
-    # redaction time grows with the length of a line.
-    tail -n "$REPORT_EXCERPT_SCAN_LINES" -- "$1" 2>/dev/null | tail -c 65536 \
-        | LC_ALL=C awk '{ if (length($0) > 4096) $0 = substr($0, length($0) - 4095); print }' \
+    # Bytes are capped too, whole lines from the end up to 64 KB and every
+    # line to its last 1 KB: the redaction time grows with the length of a
+    # line. A cut line loses its first, partial word, which could be the end
+    # of a secret whose name was cut off (...word=Hunter2).
+    tail -n "$REPORT_EXCERPT_SCAN_LINES" -- "$1" 2>/dev/null \
+        | LC_ALL=C awk '
+        { l[NR] = $0 }
+        END {
+            total = 0; first = NR + 1
+            for (i = NR; i >= 1; i--) {
+                if (length(l[i]) > 1024) { l[i] = substr(l[i], length(l[i]) - 1023); sub(/^[^ \t]*/, "?", l[i]) }
+                if (total + length(l[i]) + 1 > 65536) break
+                total += length(l[i]) + 1; first = i
+            }
+            for (i = first; i <= NR; i++) print l[i]
+        }' \
         | LC_ALL=C sed -e 's/\x1b\[[0-9;?]*[A-Za-z]//g' -e 's/\x1b[()][A-Za-z0-9]//g' -e 's/\r$//' -e 's/.*\r//' \
         | _report_to_ascii \
         | LC_ALL=C awk '

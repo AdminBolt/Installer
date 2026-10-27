@@ -30,3 +30,12 @@ mysql -u root -p'hun ter2' db; mariadb -p"x y" z; sshpass -p 'a b' ssh	mysql -u 
 Use correlation ID 0d4c1f5e-1a2b-4c3d-8e9f-001122334455 if it keeps failing; job 0123456789abcdef0123456789abcdef	Use correlation ID 0d4c1f5e-1a2b-4c3d-8e9f-001122334455 if it keeps failing; job <secret>
 server1.example.pl vps.firma.info mail.shop.in firma.pl x.firm.rs srv.example.link host.example.sh	<host> <host> <host> <host> <host> <host> <host>	receiver
 /root/install.sh /usr/share/perl5/Foo.pm libcurl.so.4 logger.info(x) nginx.conf	/root/install.sh /usr/share/perl5/Foo.pm libcurl.so.4 logger.info(x) nginx.conf	receiver
+{\"password\":\"hunter2x\"} next; password:= hunter2x; password=="x"	{\"password\":<secret>} next; password:= <secret>; password==<secret>
+password="abc def	password=<secret>
+password='abc def	password=<secret>
+set password for root@localhost = PASSWORD("hunter2x"); USING PASSWORD('hunter2x');	set password for root@localhost = PASSWORD(<secret>); USING PASSWORD(<secret>);
+license ABCD-1234-EFGH-5678 and licence key: abcd-1234-efgh; Trial license activated for 24 hours.	license <secret> and licence key: <secret>; Trial license activated for 24 hours.
+curl https://mirror.customer.pl/repo https://repo.klient.de/x.rpm ldap://ad.firma.pl:389 //shop.example.pl	curl https://<host>/repo https://<host>/x.rpm ldap://<host>:389 //<host>	receiver
+/var/www/shop.example.pl/ /home/shop.example.pl/public_html/index.php cd /home/client.example.co.uk	/var/www/<host>/ /home/<host>/public_html/index.php cd /home/<host>	receiver
+/etc/nginx/conf.d/shop.example.com.conf:12 vhost-shop.example.com.conf shop.example.pl.log x.tar.gz	/etc/nginx/conf.d/<host>.conf:12 <host>.conf <host>.log x.tar.gz	receiver
+Could not reach https://firma.pl: https://firma.pl/x /home/firma.pl/public_html /home/shop.example.pl /usr/bin/foo.pl	Could not reach https://<host>: https://<host>/x /home/<host>/public_html /home/<host> /usr/bin/foo.pl	receiver

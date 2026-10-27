@@ -199,6 +199,15 @@ t0=$(date +%s%N)
 huge=$(_report_excerpt_clean "$T/huge" | _report_redact "$PRIV")
 ms=$((($(date +%s%N) - t0) / 1000000))
 check "a 1 MB line is redacted quickly (${ms} ms), its end kept" bash -c '[[ "$1" -lt 2000 && "$2" == *" <ip> final" ]]' _ "$ms" "$huge"
+# The 1 KB cut lands inside the name: "...pass|word=Hunter2xSecret ...".
+printf '%s password=Hunter2xSecret %s tail\n' "$(printf 'a%.0s' $(seq 1 200))" "$(printf 'y%.0s' $(seq 1 999))" >"$T/cutname"
+cut_out=$(_report_excerpt_clean "$T/cutname" | _report_redact "$PRIV")
+check "a line cut before redaction loses its partial first word (no secret without its name)" bash -c '! grep -q Hunter2x <<<"$1" && grep -q " tail$" <<<"$1"' _ "$cut_out"
+for i in $(seq 1 16); do printf '%s\n' "$(printf 'x.y.%.0s' $(seq 1 1000))"; done >"$T/longlines"
+t0=$(date +%s%N)
+long_out=$(_report_excerpt_clean "$T/longlines" | _report_redact "$PRIV")
+ms=$((($(date +%s%N) - t0) / 1000000))
+check "16 long lines are redacted within the time limit (${ms} ms), not dropped" bash -c '[[ "$1" -lt 1500 && -n "$2" ]]' _ "$ms" "$long_out"
 eq "a line that misses only the rest of the budget is left out" "" "$(printf 'abcdef\n' | _report_excerpt_cut 3)"
 
 # ---------------------------------------------------------------------------
