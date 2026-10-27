@@ -58,9 +58,11 @@ time_total_end() {
 # Every run gets a random install ID and reports, to the AdminBolt install
 # receiver, that it started (channel, platform, OS, requested version, package
 # source, installer revision), how long each stage took, and how it ended
-# (result, failed step, reason code, exit code, versions installed). Nothing
-# else: no hostnames, e-mail addresses, passwords, licence keys or command
-# output. Every value sent is checked against a fixed list or pattern first.
+# (result, failed step, reason code, exit code, versions installed), and for
+# each failed step the end of its output, redacted on this server first (see
+# "Error excerpts"). Nothing else: no hostnames, e-mail addresses, passwords
+# or licence keys. Every other value sent is checked against a fixed list or
+# pattern first.
 #
 # Reporting never changes the install: every report_* call ignores its own
 # errors, intermediate events go out in the background, and only the final
@@ -146,6 +148,40 @@ REPORT_READINESS=""
 REPORT_REPO_UNREACHABLE=0
 INSTALL_MARKER_CREATED=0
 
+# Error excerpts: the output of every step is copied to a private
+# file while the step runs; for each failed step install_finished carries the
+# last REPORT_EXCERPT_LINES lines of it, redacted, at most
+# REPORT_EXCERPT_BYTES per step and REPORT_EXCERPTS_BYTES in all.
+REPORT_EXCERPT_LINES=40
+REPORT_EXCERPT_BYTES=2048
+REPORT_EXCERPTS_BYTES=6144
+REPORT_EXCERPTS_MAX=20
+# Lines read before redaction: a private key block cut by the 40 line limit
+# is still seen whole.
+REPORT_EXCERPT_SCAN_LINES=200
+REPORT_CAPTURE_DIR=""
+# Saved stdout/stderr while a step's output is copied; "" = no capture open.
+REPORT_CAPTURE_OUT=""
+REPORT_CAPTURE_ERR=""
+REPORT_CAPTURE_LEVEL=0
+REPORT_CAPTURE_PIDS=""
+REPORT_CAPTURE_OPEN_PIDS=""
+# Exit code of the command a step runner just saw fail (report_exit_code).
+REPORT_CMD_RC=""
+declare -A REPORT_STEP_FILE=()
+declare -A REPORT_ERR_FILE=()
+declare -A REPORT_ERR_RC=()
+REPORT_ERR_ORDER=""
+# The panel database, read for the licence key that the excerpts must not carry.
+REPORT_PANEL_DB="/var/lib/adminbolt/db.sqlite3"
+
+# Full log of the run: root only, also with --no-telemetry.
+INSTALL_LOG="/var/log/bolt-install.log"
+INSTALL_LOG_ACTIVE=0
+INSTALL_LOG_OUT=""
+INSTALL_LOG_ERR=""
+INSTALL_LOG_PIDS=""
+
 REPORT_CHANNELS="direct get-script web-installer vultr akamai node image-build test hostinger digitalocean aws azure"
 REPORT_REASONS="not_root unsupported_os invalid_argument missing_command port_in_use repo_download_failed package_install_failed agent_install_failed panel_scriptlet_failed agent_panel_connect_failed required_step_failed readiness_check_failed interrupted unclassified"
 
@@ -196,7 +232,9 @@ _report_in_list() {
 _report_bounded() {
     if command -v timeout >/dev/null 2>&1; then
         timeout -k 1 "$REPORT_CALL_TIMEOUT" "$@"
-        return
+        # Explicit: a bare return in a function run from the EXIT trap
+        # returns the status the script exited with.
+        return $?
     fi
     # No timeout(1): the same bound in bash. The command runs in the
     # background and is stopped (TERM, then KILL a second later) once it
@@ -415,6 +453,7 @@ _report_send_bg() {
     if [[ "$REPORT_MODE" == spool ]]; then
         (
             set +e
+            _report_close_saved_fds
             _report_cd_install_dir || exit 0
             [[ -e "sent/$id" ]] && exit 0
             code=$(_report_post "@events/$id.json")
@@ -423,6 +462,7 @@ _report_send_bg() {
     else
         (
             set +e
+            _report_close_saved_fds
             printf '%s' "$json" | _report_post @- >/dev/null
         ) </dev/null >/dev/null 2>&1 &
     fi
@@ -452,6 +492,14 @@ _report_flush() {
     local id pid i running ticks
     ticks=$(((REPORT_BUDGET_MS - REPORT_SPENT_MS) / 100))
     ((ticks <= REPORT_FINAL_WAIT * 10)) || ticks=$((REPORT_FINAL_WAIT * 10))
+    # The work at exit before the send (the error excerpts, which stop at
+    # their own deadline inside this wait) comes out of the same wait: the
+    # exit takes no longer than the final wait did without the excerpts.
+    if ((REPORT_FINISH_START > 0)); then
+        local finish_ticks=$(((REPORT_FINAL_WAIT * 1000 - ($(_report_now_ms) - REPORT_FINISH_START)) / 100))
+        ((finish_ticks >= 0)) || finish_ticks=0
+        ((ticks <= finish_ticks)) || ticks=$finish_ticks
+    fi
     for id in "${!REPORT_EVENTS[@]}"; do
         if [[ "$REPORT_MODE" == spool ]]; then
             [[ -e "$REPORT_DIR/$INSTALL_ID/sent/$id" ]] && continue
@@ -469,6 +517,8 @@ _report_flush() {
         sleep 0.1
     done
 }
+
+_report_step_begin() { REPORT_STEP="${1:-}"; REPORT_STEP_RUN=$((REPORT_STEP_RUN + 1)); }
 
 _report_stage_begin() {
     REPORT_STAGE="$1"
@@ -495,6 +545,7 @@ _report_step_result() {
     ((REPORT_INT_SEEN)) && _report_is_int_run "$step" && int_run=1
     [[ "$REPORT_STEP" == "$step" ]] && REPORT_STEP=""
     [[ -n "$step" && "$outcome" == failed ]] || return 0
+    _report_capture_failed "$step"
     class=$(report_step_class "$step")
     if [[ "$class" == optional ]]; then
         _report_in_list "$step" "$REPORT_FAILED_OPTIONAL" || REPORT_FAILED_OPTIONAL+="${REPORT_FAILED_OPTIONAL:+ }$step"
@@ -636,6 +687,7 @@ _report_finish() {
             # Stopped by an error nothing reported (set -e, an unexpected
             # exit): the step running at the time, with its own reason code.
             local current="$REPORT_STEP"
+            REPORT_CMD_RC="$rc"
             [[ -n "$current" ]] && _report_step_result "$current" failed
             if [[ "$REPORT_EUID" -ne 0 && -z "$REPORT_REASON" ]]; then
                 REPORT_FAILED_STEP="check_root"
@@ -676,9 +728,12 @@ _report_finish() {
     _report_pkg_versions
     local duration=$(($(date +%s) - REPORT_START))
     ((duration >= 0 && duration <= 86400)) || duration=0
-    local trial
+    local trial errors
     trial=$(_report_clean "$REPORT_TRIAL" '^(ok|failed|skipped)$' "")
-    _report_emit install_finished "\"result\":$(_report_json_str "$result"),\"failed_step\":$(_report_json_str "$failed_step"),\"reason\":$(_report_json_str "$reason"),\"exit_code\":${rc},\"signal\":$(_report_json_str "$sig"),\"failed_optional_steps\":$(_report_json_steps "$REPORT_FAILED_OPTIONAL"),\"failed_required_steps\":$(_report_json_steps "$REPORT_FAILED_REQUIRED"),\"panel_version\":$(_report_json_str "$REPORT_PANEL_VERSION"),\"agent_version\":$(_report_json_str "$REPORT_AGENT_VERSION"),\"trial_licence\":$(_report_json_str "$trial"),\"duration_s\":${duration}" final
+    # The excerpts only add detail; the result and the reason are set above.
+    REPORT_FAILED_STEP="$failed_step"
+    errors=$(_report_errors_json "$rc")
+    _report_emit install_finished "\"result\":$(_report_json_str "$result"),\"failed_step\":$(_report_json_str "$failed_step"),\"reason\":$(_report_json_str "$reason"),\"exit_code\":${rc},\"signal\":$(_report_json_str "$sig"),\"failed_optional_steps\":$(_report_json_steps "$REPORT_FAILED_OPTIONAL"),\"failed_required_steps\":$(_report_json_steps "$REPORT_FAILED_REQUIRED"),\"panel_version\":$(_report_json_str "$REPORT_PANEL_VERSION"),\"agent_version\":$(_report_json_str "$REPORT_AGENT_VERSION"),\"trial_licence\":$(_report_json_str "$trial"),\"duration_s\":${duration}${errors:+,\"errors\":$errors}" final
     _report_spool_mark_finished
     REPORT_SPENT_MS=$((REPORT_SPENT_MS + $(_report_now_ms) - REPORT_FINISH_START))
     _report_flush
@@ -693,7 +748,17 @@ report_on_exit() {
     set +e
     if ((INSTALL_MARKER_CREATED)); then rm -f "$REPORT_MARKER"; fi
     REPORT_FINISH_START=$(_report_now_ms)
+    _report_capture_end
     [[ "$REPORT_MODE" == off ]] || _report_finish "$rc" </dev/null >/dev/null 2>&1
+    [[ -z "$REPORT_CAPTURE_DIR" ]] || rm -rf -- "$REPORT_CAPTURE_DIR"
+    if ((INSTALL_LOG_ACTIVE)); then
+        if ((rc != 0)) || [[ -n "$REPORT_SIGNAL" ]]; then
+            print_error "The install did not complete. The full install log is in ${INSTALL_LOG} (root only)."
+        else
+            print_info "The full install log is in ${INSTALL_LOG} (root only)."
+        fi
+    fi
+    install_log_stop
     if [[ -n "$REPORT_SIGNAL" ]]; then
         trap - "$REPORT_SIGNAL"
         kill -s "$REPORT_SIGNAL" "$$"
@@ -809,6 +874,7 @@ _report_install_timer() {
     [[ -d "$REPORT_UNIT_DIR" ]] || return 1
     (
         set +e
+        _report_close_saved_fds
         if command -v flock >/dev/null 2>&1 && exec 9>>"$REPORT_DIR/.lock"; then
             flock -w 60 9
         fi
@@ -829,10 +895,17 @@ _report_put_timer() {
     _report_bounded systemctl enable --now "$REPORT_UNIT_NAME.timer" </dev/null >/dev/null 2>&1
 }
 
+# --no-telemetry or ADMINBOLT_NO_TELEMETRY=1.
+_report_telemetry_off() {
+    ((REPORT_NO_TELEMETRY)) && return 0
+    case "${ADMINBOLT_NO_TELEMETRY:-}" in 1|true|TRUE|yes|YES) return 0 ;; esac
+    return 1
+}
+
 _report_init() {
     REPORT_START=$(date +%s)
     if _report_in_list "$REPORT_CHANNEL_ARG" "$REPORT_CHANNELS"; then REPORT_CHANNEL="$REPORT_CHANNEL_ARG"; fi
-    case "${ADMINBOLT_NO_TELEMETRY:-}" in 1|true|TRUE|yes|YES) REPORT_NO_TELEMETRY=1 ;; esac
+    _report_telemetry_off && REPORT_NO_TELEMETRY=1
     if ((REPORT_NO_TELEMETRY)); then
         REPORT_MODE="off"
         print_info "Install report is off (--no-telemetry): nothing about this install is sent."
@@ -841,7 +914,8 @@ _report_init() {
     if [[ -n "${ADMINBOLT_INSTALL_REPORT_URL:-}" ]]; then
         REPORT_URL=$(_report_clean "$ADMINBOLT_INSTALL_REPORT_URL" "$REPORT_URL_RE" "$REPORT_URL")
     fi
-    INSTALL_ID=$(_report_new_uuid) || { INSTALL_ID=""; return 0; }
+    # install_log_start may have made it already, for the log header.
+    if ! _report_valid_uuid "$INSTALL_ID"; then INSTALL_ID=$(_report_new_uuid) || { INSTALL_ID=""; return 0; }; fi
     REPORT_REV=$(_report_installer_rev)
     if [[ "$REPORT_EUID" -ne 0 ]]; then
         REPORT_MODE="deferred"
@@ -859,12 +933,13 @@ _report_init() {
             REPORT_MODE="memory"
         fi
     fi
+    _report_capture_init
     trap '_report_on_int "$?"' INT
     trap '_report_on_signal TERM' TERM
     trap '_report_on_signal HUP' HUP
     local host="${REPORT_URL#*://}"
     host="${host%%/*}"
-    print_info "This installer reports its progress and result to ${host} (install ID, OS, platform, versions, step results; no hostnames, e-mail addresses, passwords or command output). To turn this off, rerun with --no-telemetry or ADMINBOLT_NO_TELEMETRY=1."
+    print_info "This installer reports its progress and result to ${host} (install ID, OS, platform, versions, step results; when a step fails, the last lines of its output, after host names, IP addresses, e-mail addresses and secrets are removed). To turn this off, rerun with --no-telemetry or ADMINBOLT_NO_TELEMETRY=1."
     _report_stage_begin prerequisites
     _report_emit install_started "\"channel\":$(_report_json_str "$REPORT_CHANNEL"),\"platform\":$(_report_json_str "$(_report_platform)"),\"installer_rev\":$(_report_json_str "$REPORT_REV"),\"os_name\":$(_report_json_str "$(_report_clean "$(_report_os_field ID)" '^[a-z0-9._-]{1,32}$' "unknown")"),\"os_version\":$(_report_json_str "$(_report_clean "$(_report_os_field VERSION_ID)" '^[0-9A-Za-z._-]{1,16}$' "unknown")"),\"arch\":$(_report_json_str "$(_report_arch)"),\"requested_version\":$(_report_json_str "$(_report_clean "$PANEL_VERSION" '^[0-9A-Za-z.+~_-]{0,40}$' "")"),\"source\":$(_report_json_str "$(_report_clean "${BOLT_SOURCE:-default}" '^[a-z0-9_-]{1,16}$' "other")"),\"telemetry_notice\":true"
 }
@@ -959,7 +1034,8 @@ _report_ready() {
 _report_readiness_check() {
     [[ "$REPORT_MODE" != off ]] || return 0
     _report_stage_begin readiness
-    report_step_start readiness
+    # No capture: no command output, and this runs inside a redirected call.
+    _report_step_begin readiness
     if _report_ready; then
         REPORT_READINESS="ok"
         _report_step_result readiness ok
@@ -970,6 +1046,520 @@ _report_readiness_check() {
     _report_stage_end
 }
 
+# ---------------------------------------------------------------------------
+# Error excerpts
+#
+# While a step runs, its output (stdout and stderr) is copied, unchanged on
+# the terminal, to a file of its own in a private temporary directory: the
+# shell's stdout and stderr go through a tee from the start of the step until its
+# result is recorded or the next step starts. Only in the main shell:
+# a capture opened in a subshell would end with it. The excerpt of a failed
+# step is built at exit: the end of its output, cleaned (no colour codes, no
+# carriage returns, printable ASCII only), redacted on this server
+# (_report_redact) and cut to the limits from the oldest line, so the final
+# error always stays. The directory is removed at exit; only the redacted
+# excerpts leave it, in install_finished.
+# ---------------------------------------------------------------------------
+
+_report_capture_init() {
+    [[ "$REPORT_MODE" != off ]] || return 0
+    REPORT_CAPTURE_DIR=$(mktemp -d "${TMPDIR:-/tmp}/adminbolt-install-steps.XXXXXX" 2>/dev/null) || REPORT_CAPTURE_DIR=""
+}
+
+# Stage 1 refuses to install for reasons its step id and reason code already
+# say (not root, the OS, a missing command, a server already in use, a bad
+# argument). What it prints there names local users, home directories and
+# arguments, so these steps send no output: their output is not even copied.
+# The one exception is the port 8443 check: its output is the listener that
+# holds the port, which the alert shows as the error line.
+_report_step_sends_output() { [[ "$1" == check_port_8443 ]] || [[ "$1" != parse_arguments && "$1" != check_* ]]; }
+
+# Starts copying the output of step $1. Never fails: without a capture the
+# step runs as before and its excerpt is empty.
+_report_capture_begin() {
+    local step="$1" file
+    [[ -n "$step" && -n "$REPORT_CAPTURE_DIR" && -z "$REPORT_CAPTURE_OUT" ]] || return 0
+    _report_step_sends_output "$step" || return 0
+    file="$REPORT_CAPTURE_DIR/$REPORT_STEP_RUN.$step"
+    : >"$file" 2>/dev/null || return 0
+    exec {REPORT_CAPTURE_OUT}>&1 {REPORT_CAPTURE_ERR}>&2 || { REPORT_CAPTURE_OUT=""; REPORT_CAPTURE_ERR=""; return 0; }
+    REPORT_CAPTURE_LEVEL=$BASH_SUBSHELL
+    # Both to one terminal: one pipe, so their order stays as it was.
+    if [[ /dev/fd/1 -ef /dev/fd/2 ]]; then
+        exec 1> >(trap '' INT TERM HUP; exec tee -i -a "$file" 2>/dev/null) 2>&1 || { _report_capture_end; return 0; }
+        REPORT_CAPTURE_PIDS+=" $!"
+        REPORT_CAPTURE_OPEN_PIDS="$!"
+    else
+        exec 1> >(trap '' INT TERM HUP; exec tee -i -a "$file" 2>/dev/null) || { _report_capture_end; return 0; }
+        REPORT_CAPTURE_PIDS+=" $!"
+        REPORT_CAPTURE_OPEN_PIDS="$!"
+        exec 2> >(trap '' INT TERM HUP; exec tee -i -a "$file" 2>/dev/null >&"$REPORT_CAPTURE_ERR") || { _report_capture_end; return 0; }
+        REPORT_CAPTURE_PIDS+=" $!"
+        REPORT_CAPTURE_OPEN_PIDS+=" $!"
+    fi
+    REPORT_STEP_FILE[$step]="$file"
+}
+
+# Ends the open capture: stdout and stderr go back to where they went before.
+_report_capture_end() {
+    [[ -n "$REPORT_CAPTURE_OUT" && "$BASH_SUBSHELL" == "$REPORT_CAPTURE_LEVEL" ]] || return 0
+    exec 1>&"$REPORT_CAPTURE_OUT" 2>&"$REPORT_CAPTURE_ERR" || true
+    exec {REPORT_CAPTURE_OUT}>&- {REPORT_CAPTURE_ERR}>&- || true
+    REPORT_CAPTURE_OUT=""
+    REPORT_CAPTURE_ERR=""
+    # The step's last lines are still in its tee: wait for them (at most a
+    # second, when a job of the step keeps its output open), so what the
+    # installer prints next does not overtake them on the terminal.
+    _report_wait_pids 10 $REPORT_CAPTURE_OPEN_PIDS
+    REPORT_CAPTURE_OPEN_PIDS=""
+}
+
+# For a background job: closes the copies of stdout and stderr kept while a
+# step's output is captured, so a caller reading the installer's output
+# through a pipe is not kept waiting for the job.
+_report_close_saved_fds() {
+    [[ -z "$REPORT_CAPTURE_OUT" ]] || exec {REPORT_CAPTURE_OUT}>&- {REPORT_CAPTURE_ERR}>&- 2>/dev/null
+}
+
+# Records that step $1 failed, with the output of its current run and the
+# exit code its runner saw (report_exit_code), for the excerpts.
+_report_capture_failed() {
+    local step="$1"
+    [[ -n "$step" && "$(report_step_class "$step")" != unknown ]] || return 0
+    _report_in_list "$step" "$REPORT_ERR_ORDER" || REPORT_ERR_ORDER+="${REPORT_ERR_ORDER:+ }$step"
+    # A step without output of its own (agent_scriptlet, panel_scriptlet:
+    # found in the output of the package step) gets that of the step running.
+    REPORT_ERR_FILE[$step]="${REPORT_STEP_FILE[$step]:-${REPORT_STEP_FILE[${REPORT_STEP:-none}]:-}}"
+    if [[ "$REPORT_CMD_RC" =~ ^[0-9]{1,3}$ ]] && ((REPORT_CMD_RC <= 255)); then REPORT_ERR_RC[$step]=$REPORT_CMD_RC; fi
+    REPORT_CMD_RC=""
+}
+
+# Waits at most $1 tenths of a second for the processes $2... to end,
+# looking every 10 ms: a tee usually ends within a few.
+_report_wait_pids() {
+    local ticks=$(($1 * 10)) i pid running
+    shift
+    for ((i = 0; i < ticks; i++)); do
+        running=0
+        for pid in "$@"; do
+            if kill -0 "$pid" 2>/dev/null; then running=1; break; fi
+        done
+        ((running)) || return 0
+        sleep 0.01
+    done
+}
+
+# Names and values on this server that an excerpt must not carry, one per
+# line: host names (full and first label, generic ones left out), the
+# --email address and its domain, the licence keys in the panel database.
+# Each line is "<kind> <value>": host, email or key.
+_report_private_values() {
+    local n first names="" e
+    names+="$(uname -n 2>/dev/null)"$'\n'
+    names+="$(cat /proc/sys/kernel/hostname 2>/dev/null)"$'\n'
+    names+="$(tr -d '[:space:]' </etc/hostname 2>/dev/null)"$'\n'
+    if command -v hostname >/dev/null 2>&1; then
+        names+="$(_report_bounded hostname -f </dev/null 2>/dev/null)"$'\n'
+    fi
+    while read -r n; do
+        n="${n,,}"
+        [[ "$n" =~ ^[a-z0-9._-]+$ ]] || continue
+        case "$n" in localhost|localhost.*|localdomain) continue ;; esac
+        printf 'host %s\n' "$n"
+        first="${n%%.*}"
+        if [[ "$n" == *.* && ${#first} -ge 4 ]]; then printf 'host %s\n' "$first"; fi
+    done <<<"$names"
+    if [[ -n "$ADMIN_EMAIL" ]]; then
+        printf 'email %s\n' "$ADMIN_EMAIL" "${ADMIN_EMAIL//@/%40}"
+        e="${ADMIN_EMAIL##*@}"
+        [[ "$e" == *.* ]] && printf 'host %s\n' "${e,,}"
+    fi
+    if [[ -r "$REPORT_PANEL_DB" ]] && command -v bolt-php >/dev/null 2>&1; then
+        _report_bounded bolt-php -r '
+            try { $d = new PDO("sqlite:" . $argv[1]); foreach ($d->query("SELECT license_key FROM licenses") as $r) { if (is_string($r[0]) && $r[0] !== "") echo "key ", $r[0], "\n"; } } catch (Throwable $e) {}
+        ' "$REPORT_PANEL_DB" </dev/null 2>/dev/null
+    fi
+}
+
+# Redacts stdin (at most REPORT_EXCERPT_SCAN_LINES lines of cleaned output)
+# with the private values in file $1 (see _report_private_values). Replaced
+# with <host>, <ip>, <email> or <secret>: those values; every IPv4 and IPv6
+# address; e-mail addresses; private key blocks (also one whose BEGIN line
+# was cut off); user:password@ in URLs; Authorization headers and bearer
+# tokens; values of names that say they are a secret (password=, token:,
+# APP_KEY=, mysql -p...); long random tokens; the host of syslog lines and
+# "hostname:" fields. The receiver runs the same rules again (bolt-ai-hub,
+# installevents/redact.go). Needs gawk (awk on AlmaLinux and Rocky Linux);
+# fails without it, and the caller then sends no output at all.
+_report_redact() {
+    command -v gawk >/dev/null 2>&1 || return 1
+    # Bounded: a failure or a timeout sends no output at all.
+    _report_bounded env LC_ALL=C gawk -v privfile="$1" '
+    function isword(c) { return c ~ /^[A-Za-z0-9_]$/ }
+    # Literal, case-insensitive; with bounded, not inside a longer name.
+    function lit(s, needle, rep, bounded,   out, ln, i, b, a) {
+        out = ""; ln = tolower(needle)
+        while ((i = index(tolower(s), ln)) > 0) {
+            b = (i > 1) ? substr(s, i - 1, 1) : ""; a = substr(s, i + length(needle), 1)
+            if (bounded && (b ~ /^[A-Za-z0-9]$/ || a ~ /^[A-Za-z0-9]$/)) {
+                out = out substr(s, 1, i + length(needle) - 1)
+            } else {
+                out = out substr(s, 1, i - 1) rep
+            }
+            s = substr(s, i + length(needle))
+        }
+        return out s
+    }
+    function v4ok(t,   p, n, k) {
+        if (t !~ /^[0-9]{1,3}(\.[0-9]{1,3}){3}$/) return 0
+        n = split(t, p, ".")
+        for (k = 1; k <= n; k++) if (p[k] + 0 > 255) return 0
+        return 1
+    }
+    # As net.ParseIP: one "::" at most, eight groups without it, an IPv4 tail.
+    function v6ok(t,   n, k, parts, dbl, groups) {
+        sub(/%.*/, "", t)
+        if (t !~ /:.*:/ || t ~ /:::/ || t ~ /^:[^:]/ || t ~ /[^:]:$/) return 0
+        dbl = index(t, "::") > 0
+        if (dbl && index(substr(t, index(t, "::") + 2), "::") > 0) return 0
+        n = split(t, parts, ":")
+        groups = 0
+        for (k = 1; k <= n; k++) {
+            if (parts[k] == "") continue
+            if (k == n && parts[k] ~ /\./) { if (!v4ok(parts[k])) return 0; groups += 2; continue }
+            if (parts[k] !~ /^[0-9A-Fa-f]{1,4}$/) return 0
+            groups++
+        }
+        return dbl ? groups <= 7 : groups == 8
+    }
+    # Long runs that look random: letters and digits mixed (base64 with all
+    # three kinds, so file paths stay).
+    function tokok(t) {
+        if (t ~ /[+\/]/) return t ~ /[0-9]/ && t ~ /[a-z]/ && t ~ /[A-Z]/
+        return t ~ /[0-9]/ && t ~ /[A-Za-z]/
+    }
+    # Replaces each match of re that is valid for kind (v4, v6, tok) and does
+    # not continue a word, a version or another address.
+    function scan(s, re, kind, rep,   out, st, ln, t, b, a, a2, okb, oka, ok, trimmed) {
+        out = ""
+        while (match(s, re)) {
+            st = RSTART; ln = RLENGTH; t = substr(s, st, ln)
+            b = (st > 1) ? substr(s, st - 1, 1) : ""; a = substr(s, st + ln, 1); a2 = substr(s, st + ln + 1, 1)
+            if (kind == "v4") {
+                ok = (!isword(b) || b == "_") && b != "." && !isword(a) && !(a == "." && a2 ~ /^[0-9]$/) && v4ok(t)
+            } else if (kind == "v6") {
+                # "2001:db8::5: refused": the colon after the address was taken in.
+                trimmed = 0
+                while (ln > 2 && substr(t, ln, 1) == ":" && !v6ok(t)) { ln--; t = substr(t, 1, ln); trimmed = 1 }
+                a = substr(s, st + ln, 1); a2 = substr(s, st + ln + 1, 1)
+                # A colon right after a whole address ends it ("...:7348: x").
+                oka = (!isword(a) && a != ":" && !(a == "." && isword(a2))) || (a == ":" && (trimmed || a2 !~ /^[0-9A-Fa-f:]$/))
+                okb = !isword(b) && b != ":" && b != "."
+                ok = okb && v6ok(t)
+                # "addr:2001:db8::1": the address starts after the colon.
+                if (!ok && substr(t, 1, 1) == ":" && v6ok(substr(t, 2))) { out = out substr(s, 1, st); s = substr(s, st + 1); st = 1; ln--; ok = 1 }
+                ok = ok && oka
+            } else {
+                ok = tokok(t)
+            }
+            if (ok) out = out substr(s, 1, st - 1) rep
+            else out = out substr(s, 1, st + ln - 1)
+            s = substr(s, st + ln)
+        }
+        return out s
+    }
+    # user:password@ in a URL, also with no user (redis://:password@host)
+    function urlcreds(s,   m) {
+        while (match(s, /([A-Za-z][A-Za-z0-9+.-]*:\/\/)[^\/ \t:@]*:[^\/ \t@]*@/, m))
+            s = substr(s, 1, RSTART - 1) m[1] "<secret>@" substr(s, RSTART + RLENGTH)
+        return s
+    }
+    function emails(s) {
+        gsub(/[A-Za-z0-9!#$%&\047*+\/=?^_`{|}~.-]+@[A-Za-z0-9-]+(\.[A-Za-z0-9-]+)*\.[A-Za-z][A-Za-z]+/, "<email>", s)
+        return s
+    }
+    function redact_line(s,   pre, rest, val, m, cid, ncid, k) {
+        IGNORECASE = 1
+        if (match(s, /(proxy-)?authorization["\047]?[ \t]*[:=][ \t]*/))
+            s = substr(s, 1, RSTART + RLENGTH - 1) "<secret>"
+        s = gensub(/\<(bearer)([ \t]+)[a-z0-9._~+\/=-]{8,}/, "\\1\\2<secret>", "g", s)
+        # name=value or name: value where the name says it is a secret; "pass"
+        # and "key" only end a name, so "passed: 3" stays.
+        rest = s; s = ""
+        while (match(rest, /([a-z0-9_.-]*(password|passwd|passphrase|pwd|secret|token|api[_-]?key|apikey|access[_-]?key|private[_-]?key|auth[_-]?key|licen[cs]e[_-]?key|credential)[a-z0-9_.-]*|[a-z0-9_.-]*pass|[a-z0-9_.-]*[_-]key)(\\?["\047\]]?[ \t]*(=>|:=|==|[=:])[ \t]*)(\\"([^\\]|\\[^"])*\\"|"([^"\\]|\\.)*"|\047([^\047\\]|\\.|\047\047)*\047|"[^"]*|\047[^\047]*|[^ \t"\047,;]+)/, m)) {
+            val = m[5, "length"] ? substr(rest, m[5, "start"], m[5, "length"]) : ""
+            if (val ~ /^(yes|no)\)?$/) { s = s substr(rest, 1, RSTART + RLENGTH - 1) }
+            else { s = s substr(rest, 1, m[5, "start"] - 1) "<secret>" }
+            rest = substr(rest, RSTART + RLENGTH)
+        }
+        s = s rest
+        # --password VALUE, with a space instead of "=".
+        s = gensub(/(--[a-z0-9-]*(password|passwd|pass|secret|token|api-?key|access-?key|auth-?key|licen[cs]e-?key)[ \t]+)(\\"([^\\]|\\[^"])*\\"|"([^"\\]|\\.)*"|\047([^\047\\]|\\.|\047\047)*\047|"[^"]*|\047[^\047]*|[^ \t"\047,;]+)/, "\\1<secret>", "g", s)
+        # SQL: PASSWORD('x'), SET PASSWORD ... = PASSWORD("x").
+        s = gensub(/(\<password[ \t]*\([ \t]*)(\\"([^\\]|\\[^"])*\\"|"([^"\\]|\\.)*"|\047([^\047\\]|\\.|\047\047)*\047|"[^"]*|\047[^\047]*)/, "\\1<secret>", "g", s)
+        # A licence key after the word, also with a space (license ABCD-1234-...).
+        s = gensub(/(\<licen[cs]e([ _-]?key)?\>[ \t]*[:=]?[ \t]*)([a-z0-9]{2,8}(-[a-z0-9]{4,8}){2,})/, "\\1<secret>", "g", s)
+        # SQL: IDENTIFIED BY 'x', IDENTIFIED WITH plugin BY|AS 'x'.
+        s = gensub(/(\<identified[ \t]+(with[ \t]+[^ \t]+[ \t]+)?(by|as)[ \t]+)(\\"([^\\]|\\[^"])*\\"|"([^"\\]|\\.)*"|\047([^\047\\]|\\.|\047\047)*\047|"[^"]*|\047[^\047]*|[^ \t"\047,;]+)/, "\\1<secret>", "g", s)
+        if (match(s, /\<sshpass\>/))
+            s = substr(s, 1, RSTART + RLENGTH - 1) gensub(/([ \t]-p[ \t]*)(\\"([^\\]|\\[^"])*\\"|"([^"\\]|\\.)*"|\047([^\047\\]|\\.|\047\047)*\047|"[^"]*|\047[^\047]*|[^ \t]+)/, "\\1<secret>", "g", substr(s, RSTART + RLENGTH))
+        # mysql / mariadb -pSECRET: every -p after the client name.
+        if (match(s, /\<(mysql|mariadb)[a-z-]*\>/))
+            s = substr(s, 1, RSTART + RLENGTH - 1) gensub(/([ \t]-p)(\\"([^\\]|\\[^"])*\\"|"([^"\\]|\\.)*"|\047([^\047\\]|\\.|\047\047)*\047|"[^"]*|\047[^\047]*|[^ \t]+)/, "\\1<secret>", "g", substr(s, RSTART + RLENGTH))
+        IGNORECASE = 0
+        s = emails(s)
+        s = scan(s, "([0-9A-Fa-f]{0,4}:){2,7}([0-9]{1,3}(\\.[0-9]{1,3}){3}|[0-9A-Fa-f]{1,4})?(%[0-9A-Za-z_.-]+)?", "v6", "<ip>")
+        s = scan(s, "[0-9]{1,3}(\\.[0-9]{1,3}){3}", "v4", "<ip>")
+        # "Use correlation ID <uuid>": set aside from the token rule (the UUID
+        # bolt-cli logs a failure under, no secret).
+        ncid = 0
+        IGNORECASE = 1
+        while (match(s, /(correlation[ _-]?id:?[ \t]+)([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})/, m)) {
+            cid[++ncid] = m[2]
+            s = substr(s, 1, RSTART - 1) m[1] "\001" ncid "\001" substr(s, RSTART + RLENGTH)
+        }
+        IGNORECASE = 0
+        s = scan(s, "[A-Za-z0-9_-]{32,}|[A-Za-z0-9+\\/]{40,}={0,2}", "tok", "<secret>")
+        for (k = 1; k <= ncid; k++) sub("\001" k "\001", cid[k], s)
+        s = gensub(/^([A-Z][a-z][a-z] [ 0-9][0-9] [0-9][0-9]:[0-9][0-9]:[0-9][0-9] |[0-9]{4}-[0-9][0-9]-[0-9][0-9]T[0-9:.+-]+Z? )[^ \t\[]+/, "\\1<host>", 1, s)
+        IGNORECASE = 1
+        s = gensub(/\<((static |transient |pretty )?host ?name["\047]?[ \t]*[:=][ \t]*)[^ \t"\047,;]+/, "\\1<host>", "g", s)
+        IGNORECASE = 0
+        return s
+    }
+    BEGIN {
+        while ((getline pl < privfile) > 0) {
+            k = substr(pl, 1, index(pl, " ") - 1); v = substr(pl, index(pl, " ") + 1)
+            if (v == "" || (k != "host" && k != "email" && k != "key")) continue
+            np++; pkind[np] = k; pval[np] = v
+        }
+        close(privfile)
+        # Longest first, so a full name goes before its first label.
+        for (i = 1; i <= np; i++) for (j = i + 1; j <= np; j++) if (length(pval[j]) > length(pval[i])) {
+            t = pval[i]; pval[i] = pval[j]; pval[j] = t; t = pkind[i]; pkind[i] = pkind[j]; pkind[j] = t
+        }
+    }
+    { line[++nl] = $0 }
+    END {
+        inkey = 0
+        for (i = 1; i <= nl; i++) {
+            if (line[i] ~ /-----BEGIN [A-Z0-9 ]*PRIVATE KEY[A-Z ]*-----/) { inkey = 1; line[i] = "<secret>"; continue }
+            if (line[i] ~ /-----END [A-Z0-9 ]*PRIVATE KEY[A-Z ]*-----/) {
+                if (!inkey) for (j = 1; j < i; j++) line[j] = "<secret>"
+                inkey = 0; line[i] = "<secret>"; continue
+            }
+            if (inkey) line[i] = "<secret>"
+        }
+        for (i = 1; i <= nl; i++) {
+            s = line[i]
+            for (p = 1; p <= np; p++) if (pkind[p] != "host") s = lit(s, pval[p], (pkind[p] == "email") ? "<email>" : "<secret>", 0)
+            # Addresses before host names: root@<host> would no longer read as one.
+            s = emails(urlcreds(s))
+            for (p = 1; p <= np; p++) if (pkind[p] == "host") s = lit(s, pval[p], "<host>", 1)
+            print redact_line(s)
+        }
+    }'
+}
+
+# Cleaned end of a step's output file $1: colour codes and carriage-return
+# overwrites removed, anything but printable ASCII and tabs as '?'.
+_report_excerpt_clean() {
+    # Bytes are capped too, whole lines from the end up to 64 KB and every
+    # line to its last 1 KB: the redaction time grows with the length of a
+    # line. A cut line loses its first, partial word, which could be the end
+    # of a secret whose name was cut off (...word=Hunter2).
+    tail -n "$REPORT_EXCERPT_SCAN_LINES" -- "$1" 2>/dev/null \
+        | LC_ALL=C awk '
+        { l[NR] = $0 }
+        END {
+            total = 0; first = NR + 1
+            for (i = NR; i >= 1; i--) {
+                if (length(l[i]) > 1024) { l[i] = substr(l[i], length(l[i]) - 1023); sub(/^[^ \t]*/, "?", l[i]) }
+                if (total + length(l[i]) + 1 > 65536) break
+                total += length(l[i]) + 1; first = i
+            }
+            for (i = first; i <= NR; i++) print l[i]
+        }' \
+        | LC_ALL=C sed -e 's/\x1b\[[0-9;?]*[A-Za-z]//g' -e 's/\x1b[()][A-Za-z0-9]//g' -e 's/\r$//' -e 's/.*\r//' \
+        | _report_to_ascii \
+        | LC_ALL=C awk '
+        # A progress bar printed as one line per update (bolt-cli off a
+        # terminal): only its last state is kept, so it does not use up
+        # the 40 lines the error needs.
+        function bar(l) { return l ~ /^ *[0-9]+\/[0-9]+ +\[[^]]*\] +[0-9]+%/ }
+        { if (NR > 1 && !(bar(prev) && bar($0))) print prev; prev = $0 }
+        END { if (NR > 0) print prev }'
+}
+
+# One "?" per character that is not printable ASCII (a box drawn with
+# UTF-8 would otherwise turn into three per character); tabs and new lines
+# stay.
+_report_to_ascii() {
+    if command -v iconv >/dev/null 2>&1; then
+        LC_ALL=C.UTF-8 iconv -c -f UTF-8 -t ASCII//TRANSLIT 2>/dev/null | LC_ALL=C tr -c '\11\12\40-\176' '?'
+    else
+        LC_ALL=C tr -c '\11\12\40-\176' '?'
+    fi
+}
+
+# The last REPORT_EXCERPT_LINES lines of stdin within $1 bytes, trailing
+# empty lines left out; the oldest lines go first. A last line longer than
+# the per-step limit keeps its end; one that only misses the rest of the
+# total budget ($1 below that limit) is left out with the rest.
+_report_excerpt_cut() {
+    LC_ALL=C awk -v max="$1" -v keep="$REPORT_EXCERPT_LINES" -v step_max="$REPORT_EXCERPT_BYTES" '
+    { l[NR] = $0 }
+    END {
+        n = NR
+        while (n > 0 && l[n] ~ /^[ \t]*$/) n--
+        if (n == 0 || max <= 0) exit
+        if (length(l[n]) > max) { if (max >= step_max) printf "%s", substr(l[n], length(l[n]) - max + 1); exit }
+        total = 0; first = n
+        for (i = n; i > n - keep && i >= 1; i--) {
+            add = length(l[i]) + (i < n ? 1 : 0)
+            if (total + add > max) break
+            total += add; first = i
+        }
+        for (i = first; i <= n; i++) printf "%s%s", l[i], (i < n ? "\n" : "")
+    }'
+}
+
+# install_finished.errors: the failed steps (the one that decided the result
+# first, then the other required ones, then the optional ones; at most
+# REPORT_EXCERPTS_MAX), each with the exit code its command returned
+# ($1, the installer's, for the step that ended the install when its runner
+# saw none) and its redacted excerpt. Nothing when no step failed. A step
+# whose output cannot be redacted (no gawk, an error) is sent without output.
+_report_errors_json() {
+    local final_rc="$1" order="" s priv file out rc entry json="" left=$REPORT_EXCERPTS_BYTES n=0 limit LC_ALL=C
+    # All of it within the final wait less 2 s (each bounded call may run
+    # 1 s past its own limit, and the send needs a moment): steps reached
+    # after that go without output. The flush takes the time used off its wait.
+    local started=$REPORT_FINISH_START time_left REPORT_CALL_TIMEOUT=$REPORT_CALL_TIMEOUT
+    ((started > 0)) || started=$(_report_now_ms)
+    local deadline=$((started + REPORT_FINAL_WAIT * 1000 - 2000))
+    [[ -n "$REPORT_ERR_ORDER" ]] || return 0
+    if [[ -n "$REPORT_FAILED_STEP" ]] && _report_in_list "$REPORT_FAILED_STEP" "$REPORT_ERR_ORDER"; then order="$REPORT_FAILED_STEP"; fi
+    for s in $REPORT_ERR_ORDER; do
+        [[ "$(report_step_class "$s")" == required ]] && ! _report_in_list "$s" "$order" && order+="${order:+ }$s"
+    done
+    for s in $REPORT_ERR_ORDER; do _report_in_list "$s" "$order" || order+="${order:+ }$s"; done
+    priv=""
+    REPORT_CALL_TIMEOUT=1
+    if [[ -n "$REPORT_CAPTURE_DIR" ]] && priv=$(mktemp "$REPORT_CAPTURE_DIR/private.XXXXXX" 2>/dev/null); then
+        _report_private_values >"$priv" 2>/dev/null || priv=""
+    fi
+    _report_wait_pids 10 $REPORT_CAPTURE_PIDS
+    for s in $order; do
+        ((n < REPORT_EXCERPTS_MAX)) || break
+        limit=$REPORT_EXCERPT_BYTES
+        ((left < limit)) && limit=$left
+        out=""
+        file="${REPORT_ERR_FILE[$s]:-}"
+        time_left=$((deadline - $(_report_now_ms)))
+        REPORT_CALL_TIMEOUT=$((time_left / 1000))
+        _report_step_sends_output "$s" || file=""
+        if [[ -n "$priv" && -n "$file" && -s "$file" ]] && ((limit > 0 && REPORT_CALL_TIMEOUT >= 1)); then
+            if out=$(_report_excerpt_clean "$file" | _report_redact "$priv"); then
+                out=$(printf '%s\n' "$out" | _report_excerpt_cut "$limit")
+            else
+                out=""
+            fi
+        fi
+        left=$((left - ${#out}))
+        rc="${REPORT_ERR_RC[$s]:-}"
+        [[ -z "$rc" && "$s" == "$REPORT_FAILED_STEP" ]] && rc="$final_rc"
+        entry="{\"step\":$(_report_json_str "$s")"
+        [[ -n "$rc" ]] && entry+=",\"exit_code\":$rc"
+        entry+=",\"output\":$(_report_json_str "$out")}"
+        json+="${json:+,}$entry"
+        n=$((n + 1))
+    done
+    printf '[%s]' "$json"
+}
+
+# ---------------------------------------------------------------------------
+# Full install log
+#
+# As root, everything the run prints (stdout and stderr of every step) is
+# also appended to INSTALL_LOG (0600, root only), each line with its UTC time
+# and without colour codes; the terminal gets exactly the same bytes as
+# before through a tee. Programs that draw progress bars only on a terminal
+# (dnf) print plain lines instead, as they do when the install is piped. A
+# rerun appends after a header with the install ID and the start time.
+# Written with --no-telemetry too: nothing in it is sent anywhere.
+# ---------------------------------------------------------------------------
+
+# stdin, line by line, to stdout with a UTC time in front and the colour
+# codes and carriage-return overwrites removed.
+_install_log_lines() {
+    if command -v gawk >/dev/null 2>&1; then
+        LC_ALL=C exec gawk '{ sub(/\r$/, ""); sub(/.*\r/, ""); gsub(/\033\[[0-9;?]*[A-Za-z]/, ""); gsub(/\033[()][A-Za-z0-9]/, "")
+            print strftime("%Y-%m-%dT%H:%M:%SZ", systime(), 1), $0; fflush() }'
+    fi
+    local line
+    shopt -s extglob
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        line="${line%$'\r'}"
+        line="${line##*$'\r'}"
+        line="${line//$'\e'\[*([0-9;?])[A-Za-z]/}"
+        TZ=UTC printf '%(%Y-%m-%dT%H:%M:%SZ)T %s\n' -1 "$line"
+    done
+}
+
+# Opens the log and sends stdout and stderr through it. As root only; any
+# problem (a symlink or something else than a file there, no space) leaves
+# the install exactly as without the log.
+install_log_start() {
+    local f="$INSTALL_LOG" id
+    [[ "$REPORT_EUID" -eq 0 && ! -L "$f" ]] || return 0
+    if [[ ! -e "$f" ]]; then ( umask 077; : >>"$f" ) 2>/dev/null || return 0; fi
+    [[ -f "$f" && ! -L "$f" ]] || return 0
+    chmod 0600 "$f" 2>/dev/null || return 0
+    chown 0:0 "$f" 2>/dev/null || true
+    # The install ID is made here, so the header can name it (_report_init keeps it).
+    if ! _report_telemetry_off && ! _report_valid_uuid "$INSTALL_ID"; then INSTALL_ID=$(_report_new_uuid) || INSTALL_ID=""; fi
+    id="${INSTALL_ID:-none (install report off)}"
+    printf '\n===== AdminBolt install, install ID %s, started %s =====\n' "$id" "$(date -u '+%Y-%m-%d %H:%M:%S UTC')" >>"$f" 2>/dev/null || return 0
+    # The originals are kept only until the tees have their own copies: a
+    # copy held open here would be inherited by every job the install starts.
+    exec {INSTALL_LOG_OUT}>&1 {INSTALL_LOG_ERR}>&2 || return 0
+    if _install_log_redirect "$f"; then
+        INSTALL_LOG_ACTIVE=1
+    else
+        exec 1>&"$INSTALL_LOG_OUT" 2>&"$INSTALL_LOG_ERR" || true
+    fi
+    exec {INSTALL_LOG_OUT}>&- {INSTALL_LOG_ERR}>&- || true
+    INSTALL_LOG_OUT=""
+    INSTALL_LOG_ERR=""
+}
+
+# stdout and stderr through the log tees (one when both go to the same
+# place, so their order stays as it was).
+_install_log_redirect() {
+    local f="$1"
+    if [[ /dev/fd/1 -ef /dev/fd/2 ]]; then
+        exec 1> >(trap '' INT TERM HUP; exec tee -i >(trap '' INT TERM HUP; _install_log_lines >>"$f" 2>/dev/null)) 2>&1 || return 1
+        INSTALL_LOG_PIDS+=" $!"
+        return 0
+    fi
+    exec 1> >(trap '' INT TERM HUP; exec tee -i >(trap '' INT TERM HUP; _install_log_lines >>"$f" 2>/dev/null)) || return 1
+    INSTALL_LOG_PIDS+=" $!"
+    exec 2> >(trap '' INT TERM HUP; exec tee -i >(trap '' INT TERM HUP; _install_log_lines >>"$f" 2>/dev/null) >&"$INSTALL_LOG_ERR") || return 1
+    INSTALL_LOG_PIDS+=" $!"
+}
+
+# Closes stdout and stderr, so the tees reach the end of their input, and
+# waits (at most 2 seconds) for the log to be written out. Last thing a run
+# does: nothing is printed after it.
+install_log_stop() {
+    ((INSTALL_LOG_ACTIVE)) || return 0
+    INSTALL_LOG_ACTIVE=0
+    _report_capture_end
+    exec 1>/dev/null 2>/dev/null
+    _report_wait_pids 20 $INSTALL_LOG_PIDS
+}
+
 # Hook points used by the install steps. None of them can fail or print
 # (apart from the start notice and a --no-telemetry warning).
 report_init() {
@@ -978,10 +1568,16 @@ report_init() {
 }
 report_stage_begin() { [[ "$REPORT_MODE" == off ]] || { _report_stage_end 2>/dev/null; _report_stage_begin "$1"; } || true; }
 report_stage_end() { _report_stage_end 2>/dev/null || true; }
-report_step_start() { REPORT_STEP="${1:-}"; REPORT_STEP_RUN=$((REPORT_STEP_RUN + 1)); }
-report_step_result() { _report_step_result "$@" 2>/dev/null || true; }
+# The output capture is opened and closed here, never inside a call with a
+# redirection: bash would undo the change of stdout and stderr on return.
+report_step_start() { _report_capture_end; _report_step_begin "${1:-}"; _report_capture_begin "${1:-}"; }
+report_step_result() { _report_capture_end; _report_step_result "$@" 2>/dev/null || true; }
 # report_fail [step] [reason]: the step failed (default: the current one).
-report_fail() { _report_step_result "${1:-$REPORT_STEP}" failed "${2:-}" 2>/dev/null || true; }
+report_fail() { _report_capture_end; _report_step_result "${1:-$REPORT_STEP}" failed "${2:-}" 2>/dev/null || true; }
+# report_exit_code rc: the exit code of the command whose failure is reported
+# next. It also ends the step's output capture, so the excerpt ends with the
+# command's own error, not with the installer's message about it.
+report_exit_code() { _report_capture_end; REPORT_CMD_RC="${1:-}"; }
 report_trial_licence() { REPORT_TRIAL="$1"; }
 report_write_panel_settings() { _report_write_panel_settings 2>/dev/null || true; }
 report_readiness_check() { _report_timed _report_readiness_check 2>/dev/null || true; }
@@ -1126,11 +1722,11 @@ install_repo_rhel() {
     local rpm_url="${REPO_BASE_URL}/rhel/${el_version}/noarch/Packages/b/${REPO_PACKAGE}.el${el_version}.noarch.rpm"
     local temp_rpm="/tmp/bolt-repo-${el_version}.rpm"
     print_info "Downloading repository package..."
-    curl -f -L -k -o "$temp_rpm" "$rpm_url" || { print_error "Failed to download repo"; report_fail repo_setup repo_download_failed; exit 1; }
+    curl -f -L -k -o "$temp_rpm" "$rpm_url" || { report_exit_code $?; print_error "Failed to download repo"; report_fail repo_setup repo_download_failed; exit 1; }
     # A failed install of the downloaded package stops the script as before
     # (with rpm's exit code), reported as a package failure.
     (command -v dnf >/dev/null 2>&1 && dnf install -y "$temp_rpm") || (command -v yum >/dev/null 2>&1 && yum install -y "$temp_rpm") || rpm -ivh "$temp_rpm" \
-        || { rc=$?; report_fail repo_setup package_install_failed; exit "$rc"; }
+        || { rc=$?; report_exit_code "$rc"; report_fail repo_setup package_install_failed; exit "$rc"; }
     rm -f "$temp_rpm"
     print_success "Repository installed"
 }
@@ -1152,6 +1748,7 @@ install_packages() {
     fi
     "$pm" install -y "${dnf_opts[@]}" "${missing[@]}" || {
         local status=$?
+        report_exit_code "$status"
         print_error "Installing packages failed ($pm exit $status): ${missing[*]}. See $pm's output above."
         report_fail
         exit "$status"
@@ -1164,14 +1761,13 @@ run_or_warn() {
     local cmd="$1" desc="${2:-Command}" step="${3:-}"
     print_info "$desc"
     report_step_start "$step"
-    if eval "$cmd"; then print_success "$desc completed"; report_step_result "$step" ok; else echo -e "${YELLOW}WARNING:${NC} $desc failed (continuing)"; report_step_result "$step" failed; fi
+    if eval "$cmd"; then print_success "$desc completed"; report_step_result "$step" ok; else report_exit_code $?; echo -e "${YELLOW}WARNING:${NC} $desc failed (continuing)"; report_step_result "$step" failed; fi
     echo -e ""
 }
 run_or_fail() {
     local cmd="$1" desc="${2:-Command}" step="${3:-}"
     report_step_start "$step"
-    if ! eval "$cmd"; then print_error "${desc} failed"; report_fail "$step"; exit 1; fi
-    report_step_result "$step" ok
+    if eval "$cmd"; then report_step_result "$step" ok; else report_exit_code $?; print_error "${desc} failed"; report_fail "$step"; exit 1; fi
     print_success "${desc} completed"
     echo -e ""
 }
@@ -1264,6 +1860,7 @@ install_bolt_agent_and_check_post() {
 
     if [[ "$dnf_status" -ne 0 ]]; then
         rm -f "$log"
+        report_exit_code "$dnf_status"
         print_error "Installing bolt-agent failed"
         report_fail agent_install agent_install_failed
         exit 1
@@ -1315,6 +1912,7 @@ install_bolt_panel_and_check_post() {
     ((errexit)) && set -e
     if [[ "$status" -ne 0 ]]; then
         rm -f "$log"
+        report_exit_code "$status"
         report_fail panel_install package_install_failed
         exit "$status"
     fi
@@ -1376,9 +1974,10 @@ stage_configuration() {
         # without a database. Fall back to the panel's default series, loudly,
         # rather than install nothing.
         print_info "MariaDB ${MARIADB_SERIES}"
-        local MARIADB_OUT
+        local MARIADB_OUT MARIADB_RC=0
         report_step_start mariadb
-        if MARIADB_OUT=$(bolt-cli manage-mariadb --action=install --series="${MARIADB_SERIES}" 2>&1); then
+        MARIADB_OUT=$(bolt-cli manage-mariadb --action=install --series="${MARIADB_SERIES}" 2>&1) || MARIADB_RC=$?
+        if ((MARIADB_RC == 0)); then
             echo "$MARIADB_OUT"
             report_step_result mariadb ok
             print_success "MariaDB ${MARIADB_SERIES} completed"
@@ -1388,6 +1987,7 @@ stage_configuration() {
             run_or_warn "bolt-cli manage-mariadb --action=install" "MariaDB (default series)" mariadb
         else
             echo "$MARIADB_OUT"
+            report_exit_code "$MARIADB_RC"
             echo -e "${YELLOW}WARNING:${NC} MariaDB ${MARIADB_SERIES} failed (continuing)"
             report_step_result mariadb failed
         fi
@@ -1467,7 +2067,8 @@ print_usage() {
     echo "If --email is provided, a 24h trial licence is requested for that address at the very end of the install (clicking the e-mailed confirmation link extends it to the full trial period); the install completes even if the request is refused."
     echo "Without --email the install proceeds unlicensed; activate on the panel's License page."
     echo "--channel names what started the install (${REPORT_CHANNELS// /, }); default direct."
-    echo "The installer reports its progress and result (no hostnames, e-mail addresses or passwords) to AdminBolt; --no-telemetry (or ADMINBOLT_NO_TELEMETRY=1) turns this off for the installer and the panel."
+    echo "The installer reports its progress and result to AdminBolt (no hostnames, e-mail addresses or passwords; when a step fails, the last lines of its output, after host names, IP addresses, e-mail addresses and secrets are removed); --no-telemetry (or ADMINBOLT_NO_TELEMETRY=1) turns this off for the installer and the panel."
+    echo "Everything the installer prints is also written to ${INSTALL_LOG} (root only), with --no-telemetry too."
 }
 
 main() {
@@ -1503,6 +2104,8 @@ main() {
         esac
     done
 
+    # Full log of the run, before anything else is printed (root only).
+    install_log_start
     # Install report: ID, start event, signal traps and the one EXIT trap.
     report_init
     report_step_start parse_arguments

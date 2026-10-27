@@ -1,0 +1,41 @@
+# Redaction vectors shared by bolt-ai-hub (installevents/testdata/redaction-vectors.tsv) and the Installer
+# (tests/redaction-vectors.tsv): the two copies must stay identical. input<TAB>expected[<TAB>receiver], one per line;
+# "receiver" marks a rule only the receiver has (host names by their domain: the installer knows the server's names).
+connect to 192.0.2.10:443 failed; seen from 192.0.2.11.	connect to <ip>:443 failed; seen from <ip>.
+fe80::1%eth0 ::ffff:192.0.2.1 addr:2001:db8::2 http://[2001:db8::3]:8443/ 2001:0db8:0000:0000:0000:ff00:0042:8329	<ip> <ip> addr:<ip> http://[<ip>]:8443/ <ip>
+listen [::]:80; ::1 is local; 2001:DB8::ABCD uppercase	listen [<ip>]:80; <ip> is local; <ip> uppercase
+APP_KEY=base64:abc --db-pass='x y' "password":"p" api_token: "abc123"	APP_KEY=<secret> --db-pass=<secret> "password":<secret> api_token: <secret>
+Static hostname: web01	Static hostname: <host>
+mail for root@srv1.example.com, OWNER@Customer-Mail.org	mail for <email>, <email>
+mysql -uroot -pS3cr3tPw! -h 203.0.113.9 -e 'SELECT 1'	mysql -uroot -p<secret> -h <ip> -e 'SELECT 1'
+ERROR 1045 (28000): Access denied for user 'root'@'localhost' (using password: YES)	ERROR 1045 (28000): Access denied for user 'root'@'localhost' (using password: YES)
+Authorization: Bearer eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxIn0.c2ln	Authorization: <secret>
+curl -H "x" https://deploy:tok3nValue@mirror.adminbolt.com/repo.git	curl -H "x" https://<secret>@mirror.adminbolt.com/repo.git
+Oct 23 14:30:01 srv7 mariadbd[5121]: [ERROR] Can't start server	Oct 23 14:30:01 <host> mariadbd[5121]: [ERROR] Can't start server
+machine-id 0123456789abcdef0123456789abcdef	machine-id <secret>
+14:30:01 MariaDB 10.11.6 v1.2.3.4 1.2.3.4.5 Foo::bar std::string 52:54:00:12:34:56 tests passed: 3 self::add()	14:30:01 MariaDB 10.11.6 v1.2.3.4 1.2.3.4.5 Foo::bar std::string 52:54:00:12:34:56 tests passed: 3 self::add()
+/usr/local/bolt/web/vendor/laravel/framework/src/Illuminate/Database/Connectors/Connector.php:66	/usr/local/bolt/web/vendor/laravel/framework/src/Illuminate/Database/Connectors/Connector.php:66
+SQLSTATE[HY000] [2002] Connection refused (Connection: mysql, SQL: select * from "settings" where "key" = mail_hostname)	SQLSTATE[HY000] [2002] Connection refused (Connection: mysql, SQL: select * from "settings" where "key" = mail_hostname)
+connect to 2001:db8::5: Connection refused	connect to <ip>: Connection refused
+from 2001:db8:85a3:8d3:1319:8a2e:370:7348: x	from <ip>: x
+{"password":"ab\"cdSECRET1"} 'db_pass'='it''s SECRET13'	{"password":<secret>} 'db_pass'=<secret>
+mariadb -uroot -pSECRET2 && mariadb-admin -u root -pSECRET3	mariadb -uroot -p<secret> && mariadb-admin -u root -p<secret>
+mysql -u root --password SECRET14 --api-key "k e y"	mysql -u root --password <secret> --api-key <secret>
+CREATE USER 'x'@'%' IDENTIFIED BY 'SECRET15'; ALTER USER y IDENTIFIED WITH mysql_native_password AS "SECRET16"	CREATE USER 'x'@'%' IDENTIFIED BY <secret>; ALTER USER y IDENTIFIED WITH mysql_native_password AS <secret>
+sshpass -p X1secret ssh root@localhost	sshpass -p <secret> ssh root@localhost
+ip_10.0.0.5 and 045.076.086.120	ip_<ip> and <ip>
+'password' => 'hunter2', [password] => hunter2, "db_password" => "a b"	'password' => <secret>, [password] => <secret>, "db_password" => <secret>
+redis://:hunter2@localhost:6379 and amqp://guest:pw@mq/	redis://<secret>@localhost:6379 and amqp://<secret>@mq/
+mysql -u root -p'hun ter2' db; mariadb -p"x y" z; sshpass -p 'a b' ssh	mysql -u root -p<secret> db; mariadb -p<secret> z; sshpass -p <secret> ssh
+Use correlation ID 0d4c1f5e-1a2b-4c3d-8e9f-001122334455 if it keeps failing; job 0123456789abcdef0123456789abcdef	Use correlation ID 0d4c1f5e-1a2b-4c3d-8e9f-001122334455 if it keeps failing; job <secret>
+server1.example.pl vps.firma.info mail.shop.in firma.pl x.firm.rs srv.example.link host.example.sh	<host> <host> <host> <host> <host> <host> <host>	receiver
+/root/install.sh /usr/share/perl5/Foo.pm libcurl.so.4 logger.info(x) nginx.conf	/root/install.sh /usr/share/perl5/Foo.pm libcurl.so.4 logger.info(x) nginx.conf	receiver
+{\"password\":\"hunter2x\"} next; password:= hunter2x; password=="x"	{\"password\":<secret>} next; password:= <secret>; password==<secret>
+password="abc def	password=<secret>
+password='abc def	password=<secret>
+set password for root@localhost = PASSWORD("hunter2x"); USING PASSWORD('hunter2x');	set password for root@localhost = PASSWORD(<secret>); USING PASSWORD(<secret>);
+license ABCD-1234-EFGH-5678 and licence key: abcd-1234-efgh; Trial license activated for 24 hours.	license <secret> and licence key: <secret>; Trial license activated for 24 hours.
+curl https://mirror.customer.pl/repo https://repo.klient.de/x.rpm ldap://ad.firma.pl:389 //shop.example.pl	curl https://<host>/repo https://<host>/x.rpm ldap://<host>:389 //<host>	receiver
+/var/www/shop.example.pl/ /home/shop.example.pl/public_html/index.php cd /home/client.example.co.uk	/var/www/<host>/ /home/<host>/public_html/index.php cd /home/<host>	receiver
+/etc/nginx/conf.d/shop.example.com.conf:12 vhost-shop.example.com.conf shop.example.pl.log x.tar.gz	/etc/nginx/conf.d/<host>.conf:12 <host>.conf <host>.log x.tar.gz	receiver
+Could not reach https://firma.pl: https://firma.pl/x /home/firma.pl/public_html /home/shop.example.pl /usr/bin/foo.pl	Could not reach https://<host>: https://<host>/x /home/<host>/public_html /home/<host> /usr/bin/foo.pl	receiver
