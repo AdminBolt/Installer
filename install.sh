@@ -695,6 +695,11 @@ report_on_exit() {
     trap '' PIPE INT TERM HUP
     set +e
     if ((INSTALL_MARKER_CREATED)); then rm -f "$REPORT_MARKER"; fi
+    # A failed install with --force-existing-server: the backup path again,
+    # since the install never reaches the summary that names it.
+    if ((rc != 0)) && [[ -n "$PREINSTALL_BACKUP_DIR" ]]; then
+        echo "The configuration from before this install is in ${PREINSTALL_BACKUP_DIR} (see README.txt there)." >&2
+    fi
     REPORT_FINISH_START=$(_report_now_ms)
     [[ "$REPORT_MODE" == off ]] || _report_finish "$rc" </dev/null >/dev/null 2>&1
     if [[ -n "$REPORT_SIGNAL" ]]; then
@@ -1032,9 +1037,9 @@ check_port_8443() {
 # Vultr's: they run firewalld with its default zone (ssh, dhcpv6-client,
 # cockpit) and have a cloud user (uid 1000) whose home holds only the
 # skeleton files, ~/.ssh and a tool cache. None of that counts.
-EXISTING_PACKAGES="httpd nginx postfix sendmail exim dovecot bind pdns mariadb-server mysql-server community-mysql-server"
-EXISTING_UNITS="httpd nginx postfix sendmail exim dovecot named pdns mariadb mysqld"
-EXISTING_PORTS="21 25 53 80 110 143 443 465 587 993 995 3306"
+EXISTING_PACKAGES="httpd nginx lighttpd caddy haproxy postfix sendmail exim dovecot bind pdns mariadb-server MariaDB-server mysql-server community-mysql-server mysql-community-server percona-server-server postgresql-server"
+EXISTING_UNITS="httpd nginx lighttpd caddy haproxy postfix sendmail exim dovecot named pdns mariadb mysqld postgresql"
+EXISTING_PORTS="21 25 53 80 110 143 443 465 587 993 995 3306 5432"
 # Services an image's firewalld allows by itself in its default zone.
 FIREWALLD_IMAGE_SERVICES="ssh dhcpv6-client cockpit"
 # What in a home is not its owner's data: the skeleton and these files at
@@ -1043,7 +1048,7 @@ HOME_IGNORED_FILES=".bash_history .lesshst .viminfo .python_history .wget-hsts .
 HOME_IGNORED_DIRS=".ssh .cache .ansible"
 EXISTING_HOME_DIR="/home"
 EXISTING_WWW_DIR="/var/www"
-EXISTING_MYSQL_DIR="/var/lib/mysql"
+EXISTING_DATABASE_DIRS="/var/lib/mysql /var/lib/pgsql/data"
 EXISTING_SKEL_DIR="/etc/skel"
 EXISTING_PASSWD="/etc/passwd"
 SELINUX_CONFIG="/etc/selinux/config"
@@ -1053,6 +1058,8 @@ SELINUX_CONFIG="/etc/selinux/config"
 BACKUP_PATHS="/etc /var/spool/cron /root/.my.cnf /usr/bin/mlmmj-make-ml.sh /var/www/html/index.html /var/www/html/index.php"
 BACKUP_PARENT="/root"
 PREINSTALL_BACKUP_DIR=""
+# Set by check_existing_server when bolt-agent or bolt-panel is installed.
+ADMINBOLT_ALREADY_INSTALLED=0
 
 # Names of the packages in EXISTING_PACKAGES that are installed.
 _existing_packages() {
@@ -1064,16 +1071,23 @@ _existing_packages() {
     return 0
 }
 
+# Running units of EXISTING_UNITS, each once: mysqld is an alias of mariadb.
 _existing_running_units() {
-    local unit
+    local unit id seen=" "
     command -v systemctl >/dev/null 2>&1 || return 0
     for unit in $EXISTING_UNITS; do
-        if systemctl is-active --quiet "$unit" 2>/dev/null; then echo "$unit"; fi
+        systemctl is-active --quiet "$unit" 2>/dev/null || continue
+        id=$(systemctl show -p Id --value "$unit" 2>/dev/null)
+        id="${id:-$unit.service}"
+        [[ "$seen" != *" $id "* ]] || continue
+        seen+="$id "
+        echo "$unit"
     done
     return 0
 }
 
-# "<port> <process>" for each port in EXISTING_PORTS something listens on (TCP).
+# "<port> <process>" for each port in EXISTING_PORTS something listens on.
+# TCP only: a DNS server on UDP 53 is found by its package or unit.
 _existing_listeners() {
     command -v ss >/dev/null 2>&1 || return 0
     ss -Htlnp 2>/dev/null | awk -v ports=" $EXISTING_PORTS " '{
@@ -1098,7 +1112,8 @@ _existing_firewalld_rules() {
     local zone service extra list opt
     command -v firewall-cmd >/dev/null 2>&1 || return 0
     firewall-cmd --state >/dev/null 2>&1 || return 0
-    for zone in $(firewall-cmd --get-active-zones 2>/dev/null | awk '/^[A-Za-z0-9_-]+$/'); do
+    # The default zone too: with no interface bound to it, it is not "active".
+    for zone in $( { firewall-cmd --get-default-zone; firewall-cmd --get-active-zones; } 2>/dev/null | awk '/^[A-Za-z0-9_-]+$/ && !seen[$0]++'); do
         extra=""
         for service in $(firewall-cmd --zone="$zone" --list-services 2>/dev/null); do
             _report_in_list "$service" "$FIREWALLD_IMAGE_SERVICES" || extra+=" $service"
@@ -1129,7 +1144,8 @@ _home_first_data_file() {
     for name in "$EXISTING_SKEL_DIR"/* "$EXISTING_SKEL_DIR"/.[!.]*; do
         if [[ -e "$name" ]]; then args+=(-path "$pattern/${name##*/}" -prune -o); fi
     done
-    find "$dir" -mindepth 1 "${args[@]}" -type f -print -quit 2>/dev/null
+    # -H: a home that is a symlink is followed, inside it nothing is.
+    find -H "$dir" -mindepth 1 "${args[@]}" -type f -print -quit 2>/dev/null
     return 0
 }
 
@@ -1173,13 +1189,15 @@ existing_server_findings() {
     done < <(_existing_firewalld_rules)
     _existing_user_data
     if [[ -d "$EXISTING_WWW_DIR" ]]; then
-        count=$(find "$EXISTING_WWW_DIR" -type f 2>/dev/null | head -n 1000 | wc -l)
+        count=$(find -H "$EXISTING_WWW_DIR" -type f 2>/dev/null | head -n 1000 | wc -l)
         ((count < 1000)) || count="1000 or more"
         [[ "$count" == 0 ]] || echo "${EXISTING_WWW_DIR} holds ${count} file(s)"
     fi
-    if [[ -d "$EXISTING_MYSQL_DIR" ]] && [[ -n "$(find "$EXISTING_MYSQL_DIR" -mindepth 1 -print -quit 2>/dev/null)" ]]; then
-        echo "${EXISTING_MYSQL_DIR} holds database files"
-    fi
+    for name in $EXISTING_DATABASE_DIRS; do
+        if [[ -d "$name" && -n "$(find -H "$name" -type f -print -quit 2>/dev/null)" ]]; then
+            echo "${name} holds database files"
+        fi
+    done
     return 0
 }
 
@@ -1188,7 +1206,7 @@ existing_server_changes() {
     if ! selinux_not_enforcing || grep -Eqs '^SELINUX=(enforcing|permissive)' "$SELINUX_CONFIG"; then
         echo "SELinux: enforcement is switched off now and SELinux is disabled from the next boot (${SELINUX_CONFIG})"
     fi
-    echo "firewall: firewalld is stopped and disabled, and the nftables table \"ip filter\" is replaced by AdminBolt's, whose INPUT and forward chains have policy drop: only the panel's own ports stay open (other nftables tables are kept)"
+    echo "firewall: firewalld is stopped and disabled, and the nftables tables \"ip filter\" and \"ip6 filter\" are replaced by AdminBolt's, whose INPUT and forward chains have policy drop: only the panel's own ports stay open (other nftables tables are kept)"
     echo "configuration files written over with AdminBolt's own, among them /etc/httpd/conf/httpd.conf, /etc/postfix/main.cf and master.cf, /etc/dovecot/dovecot.conf, /etc/pdns/pdns.conf, /etc/redis/redis.conf, /etc/vsftpd/vsftpd.conf, /etc/fail2ban/jail.local, /etc/ssh/sshd_config.d/00-adminbolt.conf and 99-adminbolt.conf, /etc/sysconfig/nftables.conf, /var/www/html/index.html and index.php"
     echo "MariaDB: a distribution mariadb-server is replaced by MariaDB from mariadb.org, the database root password is reset (/root/.my.cnf), root logins from other hosts, anonymous users and the test database are removed"
 }
@@ -1202,6 +1220,7 @@ check_existing_server() {
     report_step_start check_existing_server
     if rpm -q bolt-agent >/dev/null 2>&1 || rpm -q bolt-panel >/dev/null 2>&1; then
         print_info "AdminBolt is already installed on this server; not checking it for an existing web, mail, DNS or database setup"
+        ADMINBOLT_ALREADY_INSTALLED=1
         report_step_result check_existing_server ok
         return 0
     fi
@@ -1229,6 +1248,15 @@ check_existing_server() {
     exit 1
 }
 
+# A failed backup stops the install before anything is installed. $1 is the
+# backup directory to remove (it may hold a partial copy of /etc), or empty.
+_backup_abort() {
+    print_error "$2"
+    if [[ -n "$1" && -d "$1" ]]; then rm -rf "$1"; fi
+    report_fail preinstall_backup
+    exit 1
+}
+
 # --force-existing-server: copies BACKUP_PATHS, the firewall's live ruleset
 # and the SELinux mode into a new root-only directory before anything is
 # installed, with a checksum list that install_report_replaced_files compares
@@ -1241,9 +1269,7 @@ backup_existing_configuration() {
     umask_before=$(umask)
     umask 077
     if ! mkdir "$dir"; then
-        print_error "Cannot create ${dir} for the backup"
-        report_fail preinstall_backup
-        exit 1
+        _backup_abort "" "Cannot create ${dir} for the backup"
     fi
     list=()
     for path in $BACKUP_PATHS; do
@@ -1252,22 +1278,20 @@ backup_existing_configuration() {
     need=$(du -sk "${list[@]}" 2>/dev/null | awk '{ s += $1 } END { print s + 0 }')
     avail=$(df -Pk "$dir" 2>/dev/null | awk 'NR == 2 { print $4 + 0 }')
     if [[ -z "$avail" ]] || ((avail < need + 102400)); then
-        print_error "Not enough free space in ${BACKUP_PARENT} for the backup (${need} KB needed, ${avail:-0} KB free, plus 100 MB to spare)"
-        rm -rf "$dir"
-        report_fail preinstall_backup
-        exit 1
+        _backup_abort "$dir" "Not enough free space in ${BACKUP_PARENT} for the backup (${need} KB needed, ${avail:-0} KB free, plus 100 MB to spare)"
     fi
     rc=0
     tar --create --gzip --file "$dir/files.tar.gz" --preserve-permissions --numeric-owner \
         --xattrs --acls --selinux "${list[@]}" 2>"$dir/tar-warnings.log" || rc=$?
     # 1: a file changed while it was read; the archive is still complete.
     if ((rc > 1)); then
-        print_error "The backup failed (tar exit ${rc}): $(tail -n 3 "$dir/tar-warnings.log" 2>/dev/null | tr '\n' ' ')"
-        rm -rf "$dir"
-        report_fail preinstall_backup
-        exit 1
+        _backup_abort "$dir" "The backup failed (tar exit ${rc}): $(tail -n 3 "$dir/tar-warnings.log" 2>/dev/null | tr '\n' ' ')"
     fi
     find "${list[@]}" -type f -print0 2>/dev/null | xargs -0 -r sha256sum >"$dir/manifest.sha256" 2>/dev/null || true
+    # Without the checksums the end of the install could not tell what it replaced.
+    if [[ ! -s "$dir/manifest.sha256" ]]; then
+        _backup_abort "$dir" "The backup failed: no checksums could be taken of ${list[*]}"
+    fi
     if command -v nft >/dev/null 2>&1; then nft list ruleset >"$dir/nft-ruleset.nft" 2>/dev/null || true; fi
     if command -v getenforce >/dev/null 2>&1; then getenforce >"$dir/selinux-mode.txt" 2>/dev/null || true; fi
     cat >"$dir/README.txt" <<NOTE
@@ -1292,14 +1316,24 @@ NOTE
 # End of an install with a backup: lists the backed-up files the install
 # changed or removed, and where the originals are.
 install_report_replaced_files() {
-    local dir="$PREINSTALL_BACKUP_DIR" count
-    [[ -n "$dir" && -f "$dir/manifest.sha256" ]] || return 0
-    sha256sum --check --quiet "$dir/manifest.sha256" 2>/dev/null | sed -n 's/: FAILED.*$//p' >"$dir/replaced-files.txt" || true
-    count=$(grep -c . "$dir/replaced-files.txt" 2>/dev/null || true)
+    local dir="$PREINSTALL_BACKUP_DIR" count check_rc
+    [[ -n "$dir" ]] || return 0
     echo -e "\n${BOLD}${CYAN}--- Backup of the previous configuration ---${NC}"
     echo "${dir}/files.tar.gz holds the files as they were before the install (see ${dir}/README.txt)."
-    if [[ "${count:-0}" == 0 ]]; then
+    check_rc=2
+    if [[ -s "$dir/manifest.sha256" ]]; then
+        sha256sum --check --quiet "$dir/manifest.sha256" 2>/dev/null | sed -n 's/: FAILED.*$//p' >"$dir/replaced-files.txt"
+        check_rc=${PIPESTATUS[0]}
+    fi
+    # 0: every file as it was, 1: some changed or gone; anything else (or no
+    # checksum list) says nothing about the files, and must not read as "none".
+    if ((check_rc == 0)); then
         echo "None of them was changed by the install."
+        return 0
+    fi
+    count=$(grep -c . "$dir/replaced-files.txt" 2>/dev/null || true)
+    if ((check_rc > 1)) || [[ "${count:-0}" == 0 ]]; then
+        echo -e "${YELLOW}WARNING:${NC} could not compare the files with the backup; compare them by hand with ${dir}/manifest.sha256"
         return 0
     fi
     echo "The install changed or removed ${count} of them (full list: ${dir}/replaced-files.txt):"
@@ -1338,7 +1372,8 @@ stage_prerequisites() {
     done
     check_port_8443
     check_existing_server
-    if ((FORCE_EXISTING_SERVER)); then backup_existing_configuration; fi
+    # A reinstall is the panel's own configuration: nothing to back up.
+    if ((FORCE_EXISTING_SERVER && !ADMINBOLT_ALREADY_INSTALLED)); then backup_existing_configuration; fi
     print_success "Stage 1 completed: ready for installation"
     print_progress "33% — prerequisites"
 }

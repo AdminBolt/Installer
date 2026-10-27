@@ -15,6 +15,9 @@ HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 INSTALL_SH=${INSTALL_SH:-$HERE/../install.sh}
 INSTALL_SH=$(cd "$(dirname "$INSTALL_SH")" && pwd)/$(basename "$INSTALL_SH")
 
+# The lists the check uses, for the README comparison.
+ADMINBOLT_INSTALL_SOURCE_ONLY=1 . "$INSTALL_SH"
+set +e
 T=$(mktemp -d)
 trap 'rm -rf "$T"' EXIT
 export LC_ALL=C
@@ -73,13 +76,19 @@ rpm() {
     done
     return \$rc
 }
-systemctl() { [[ "\$1 \$2" == "is-active --quiet" ]] && grep -qx "\$3" "\$F/units"; }
+systemctl() {
+    case "\$1" in
+        is-active) grep -qx "\$3" "\$F/units" ;;
+        show) if [[ -f "\$F/unit_id_\$5" ]]; then cat "\$F/unit_id_\$5"; else echo "\$5.service"; fi ;;
+    esac
+}
 ss() { cat "\$F/ss"; }
 nft() { case "\$*" in "list tables") cat "\$F/nft" ;; "list ruleset") echo "ruleset" ;; esac; }
 firewall-cmd() {
     case "\$1" in
         --state) return "\$(cat "\$F/fw_state")" ;;
         --get-active-zones) cat "\$F/fw_active" ;;
+        --get-default-zone) cat "\$F/fw_default" 2>/dev/null || echo public ;;
         --direct) cat "\$F/fw_direct" 2>/dev/null ;;
         --zone=*) local z="\${1#--zone=}" o="\${2#--list-}"; cat "\$F/fw_\${z}_\${o}" 2>/dev/null ;;
     esac
@@ -89,7 +98,7 @@ getenforce() { cat "\$F/selinux"; }
 if [[ -f "\$F/df_avail" ]]; then df() { printf 'Filesystem 1024-blocks Used Available Capacity Mounted\nfake 1 1 %s 1%% /\n' "\$(cat "\$F/df_avail")"; }; fi
 EXISTING_HOME_DIR="$S/home"
 EXISTING_WWW_DIR="$S/var/www"
-EXISTING_MYSQL_DIR="$S/var/lib/mysql"
+EXISTING_DATABASE_DIRS="$S/var/lib/mysql $S/var/lib/pgsql/data"
 EXISTING_SKEL_DIR="$S/etc/skel"
 EXISTING_PASSWD="$S/etc/passwd"
 SELINUX_CONFIG="$S/etc/selinux/config"
@@ -155,7 +164,17 @@ finding "user home outside /home" 'mkdir -p "$S/srv/app" && echo x >"$S/srv/app/
 finding "/home entry that is no user's home" 'mkdir -p "$S/home/old" && echo x >"$S/home/old/site.tar"' '$S/home/old holds files'
 finding "plain file in /home" 'echo x >"$S/home/backup.tar"' '$S/home/backup.tar holds files'
 finding "/var/www with a site" 'mkdir -p "$S/var/www/html" && echo hi >"$S/var/www/html/index.html" && echo hi >"$S/var/www/html/a.css"' '$S/var/www holds 2 file(s)'
+finding "PostgreSQL data" 'mkdir -p "$S/var/lib/pgsql/data/base" && echo x >"$S/var/lib/pgsql/data/PG_VERSION"' '$S/var/lib/pgsql/data holds database files'
+finding "MariaDB from mariadb.org" 'echo MariaDB-server >"$S/fake/rpm"' "package MariaDB-server is installed"
+finding "home that is a symlink to data" 'mkdir -p "$S/data/alice" && echo x >"$S/data/alice/site.php" && ln -s "$S/data/alice" "$S/home/alice" && echo "alice:x:1001:1001::$S/home/alice:/bin/bash" >>"$S/etc/passwd"' 'user alice (uid 1001) has files in $S/home/alice'
+finding "custom rules in a default zone no interface is bound to" ': >"$S/fake/fw_active"; echo work >"$S/fake/fw_default"; echo "8443/tcp" >"$S/fake/fw_work_ports"' "firewalld: zone work ports: 8443/tcp"
 finding "database files" 'mkdir -p "$S/var/lib/mysql" && echo x >"$S/var/lib/mysql/ibdata1"' '$S/var/lib/mysql holds database files'
+
+new_server unit_alias
+printf "mariadb\nmysqld\n" >"$S/fake/units"
+echo mariadb.service >"$S/fake/unit_id_mysqld"
+run 'existing_server_findings'
+eq "a unit and its alias (mysqld = mariadb) are listed once" "service mariadb is running|STEP= REASON=" "$(tr '\n' '|' <<<"$OUT" | sed 's/|$//')"
 
 new_server empty_www
 mkdir -p "$S/var/www/html" "$S/var/www/cgi-bin" "$S/var/lib/mysql"
@@ -196,7 +215,7 @@ has "lists the running database" "  - service mariadb is running" "$OUT"
 has "lists the port" "  - port 80 is in use by httpd" "$OUT"
 has "lists the site files" "  - $S/var/www holds 1 file(s)" "$OUT"
 has "lists the SELinux change" "  - SELinux: enforcement is switched off now" "$OUT"
-has "lists the policy drop firewall table" 'the nftables table "ip filter" is replaced by AdminBolt'"'"'s, whose INPUT and forward chains have policy drop' "$OUT"
+has "lists the policy drop firewall tables" 'the nftables tables "ip filter" and "ip6 filter" are replaced by AdminBolt'"'"'s, whose INPUT and forward chains have policy drop' "$OUT"
 has "lists the configuration files written over" "/etc/postfix/main.cf and master.cf" "$OUT"
 has "lists what happens to MariaDB" "the database root password is reset" "$OUT"
 has "names the flag" "rerun with --force-existing-server" "$OUT"
@@ -219,6 +238,11 @@ eq "AdminBolt already installed (reinstall, rerun): passes" 0 "$RC"
 has "reinstall: says why it is not checked" "AdminBolt is already installed on this server" "$OUT"
 hasnt "reinstall: nothing listed" "package httpd" "$OUT"
 
+in_use reinstall_forced
+echo bolt-panel >>"$S/fake/rpm"
+run 'FORCE_EXISTING_SERVER=1; check_existing_server; if ((FORCE_EXISTING_SERVER && !ADMINBOLT_ALREADY_INSTALLED)); then echo WOULD-BACKUP; fi'
+hasnt "reinstall with the flag: no backup (the configuration is the panel's own)" WOULD-BACKUP "$OUT"
+
 in_use forced
 run 'FORCE_EXISTING_SERVER=1; check_existing_server; echo PASSED'
 eq "--force-existing-server: passes" 0 "$RC"
@@ -238,13 +262,20 @@ has "without it the flag is off" "FORCE=0" "$OUT"
 run 'print_usage'
 has "usage names the flag" "[--force-existing-server]" "$OUT"
 grep -q -- '--force-existing-server' "$HERE/../README.md" && ok "README documents the flag" || nok "README documents the flag"
+# The README lists what the check looks for; it must not drift from the code.
+missing=""
+section=$(sed -n '/^## Servers already in use/,/^## Install report/p' "$HERE/../README.md")
+for name in $EXISTING_PACKAGES $FIREWALLD_IMAGE_SERVICES; do grep -qF -- "\`$name\`" <<<"$section" || missing+=" $name"; done
+for name in $EXISTING_PORTS; do grep -qE -- "[ (]$name[,)]" <<<"$section" || missing+=" $name"; done
+for name in $BACKUP_PATHS; do grep -qF -- "${name##*/}" <<<"$section" || missing+=" $name"; done
+eq "README lists every package, port, default firewalld service and backed-up path the code uses" "" "$missing"
 
 # Stage 1 runs the check after the port check and makes the backup only with
 # the flag (stage_prerequisites itself needs root, so its body is read).
 body=$(ADMINBOLT_INSTALL_SOURCE_ONLY=1 "$BASH" -c ". '$INSTALL_SH'; declare -f stage_prerequisites" | grep -E 'check_port_8443|check_existing_server|FORCE_EXISTING_SERVER|backup_existing_configuration' | sed 's/^ *//')
 eq "Stage 1: port check, existing-server check, backup only with the flag" "check_port_8443;
 check_existing_server;
-if ((FORCE_EXISTING_SERVER)); then
+if ((FORCE_EXISTING_SERVER && !ADMINBOLT_ALREADY_INSTALLED)); then
 backup_existing_configuration;" "$body"
 
 end_call=$(ADMINBOLT_INSTALL_SOURCE_ONLY=1 "$BASH" -c ". '$INSTALL_SH'; declare -f stage_configuration" | grep -A1 'install_report_replaced_files' | sed 's/^ *//' | tr '\n' ' ')
@@ -299,8 +330,18 @@ echo x >"$S/etc/a.conf"
 run 'backup_existing_configuration; install_report_replaced_files'
 has "end: nothing changed is said so" "None of them was changed by the install" "$OUT"
 
+run "PREINSTALL_BACKUP_DIR='$dir'; rm -f '$dir/manifest.sha256'; install_report_replaced_files"
+has "end: no checksum list is said so" "could not compare the files with the backup" "$OUT"
+hasnt "end: no checksum list never reads as nothing changed" "None of them was changed" "$OUT"
+
 run 'install_report_replaced_files; echo DONE'
 eq "end without a backup: prints nothing" "DONE STEP= REASON=" "$(tr '\n' ' ' <<<"$OUT" | sed 's/ $//')"
+
+run "trap report_on_exit EXIT; PREINSTALL_BACKUP_DIR='$dir'; exit 3"
+has "failed install after a backup: the exit names the backup again" "The configuration from before this install is in $dir" "$OUT"
+eq "failed install after a backup: exit code kept" 3 "$RC"
+run "trap report_on_exit EXIT; PREINSTALL_BACKUP_DIR='$dir'; exit 0"
+hasnt "successful install: the exit does not repeat it" "The configuration from before this install" "$OUT"
 
 new_server backup_no_parent
 run 'BACKUP_PARENT="$S/no/such/dir"; backup_existing_configuration; echo PASSED'
@@ -315,6 +356,13 @@ eq "not enough space: exit 1" 1 "$RC"
 has "not enough space: says so" "Not enough free space" "$OUT"
 has "not enough space: reported as preinstall_backup" "STEP=preinstall_backup" "$OUT"
 eq "not enough space: no backup directory left" 0 "$(find "$S/root" -mindepth 1 -maxdepth 1 -name 'adminbolt-preinstall-backup-*' | wc -l)"
+
+new_server backup_no_checksums
+mkdir -p "$S/empty"
+run 'BACKUP_PATHS="$S/empty"; backup_existing_configuration; echo PASSED'
+eq "no checksums: exit 1" 1 "$RC"
+has "no checksums: says so" "no checksums could be taken" "$OUT"
+eq "no checksums: no backup directory left" 0 "$(find "$S/root" -mindepth 1 -maxdepth 1 -name 'adminbolt-preinstall-backup-*' | wc -l)"
 
 new_server backup_tar_fails
 run 'tar() { return 2; }; backup_existing_configuration; echo PASSED'
