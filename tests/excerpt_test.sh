@@ -172,6 +172,7 @@ vals=$(_report_private_values)
 has "this host's name" "host $(uname -n | tr 'A-Z' 'a-z')" "$vals"
 has "the --email address" "email Jan.Kowalski@Example-Corp.pl" "$vals"
 has "the --email domain" "host example-corp.pl" "$vals"
+has "the --email address URL-encoded" "email Jan.Kowalski%40Example-Corp.pl" "$vals"
 hasnt "no generic names" "host localhost" "$vals"
 mkdir -p "$T/bin"
 printf '#!/bin/bash\n[[ "$1" == -r && "$3" == "%s" ]] && echo "key ABLT-1111-2222"\n' "$T/db" >"$T/bin/bolt-php"
@@ -191,6 +192,11 @@ seq 1 100 | sed 's/^/l/' >"$T/many"
 eq "only the last 40 lines" "40 l61 l100" "$(_report_excerpt_cut 2048 <"$T/many" | awk 'NR==1{f=$0} END{print NR, f, $0}')"
 eq "byte limit: oldest lines go" "l97"$'\n'"l98"$'\n'"l99"$'\n'"l100" "$(_report_excerpt_cut 16 <"$T/many")"
 eq "one line over the step limit keeps its end" "$(printf 'b%.0s' $(seq 1 2048))" "$(printf '%s%s\n' "$(printf 'a%.0s' $(seq 1 100))" "$(printf 'b%.0s' $(seq 1 2048))" | _report_excerpt_cut 2048)"
+head -c 1048576 /dev/zero | tr '\0' 'a' >"$T/huge"; printf ' 192.0.2.1 final\n' >>"$T/huge"
+t0=$(date +%s%N)
+huge=$(_report_excerpt_clean "$T/huge" | _report_redact "$PRIV")
+ms=$((($(date +%s%N) - t0) / 1000000))
+check "a 1 MB line is redacted quickly (${ms} ms), its end kept" bash -c '[[ "$1" -lt 2000 && "$2" == *" <ip> final" ]]' _ "$ms" "$huge"
 eq "a line that misses only the rest of the budget is left out" "" "$(printf 'abcdef\n' | _report_excerpt_cut 3)"
 
 # ---------------------------------------------------------------------------
@@ -275,6 +281,38 @@ echo end'
 (cd "$D" && setsid bash child.sh >"$D/term" 2>&1 & echo $! >"$D/pid"; sleep 0.5; kill -INT -- -"$(cat "$D/pid")"; wait) 2>/dev/null
 check "Ctrl+C: output after it still on the terminal" grep -qx after-int "$D/term"
 check "Ctrl+C: and in the log" grep -q 'Z after-int$' "$D/bolt-install.log"
+
+# The step's output goes through one more tee than the installer's own
+# messages; ending the capture waits for it, so the order stays.
+log_child order '
+install_log_start
+REPORT_MODE=memory
+_report_capture_init
+for i in $(seq 1 20); do
+    report_step_start check_os
+    printf "step-%s\n" "$i" >&2
+    report_exit_code 1
+    echo "msg-$i"
+done
+exit 0'
+(cd "$D" && bash child.sh >"$D/term" 2>&1)
+eq "terminal order kept: each step's output before the message after it" "$(for i in $(seq 1 20); do printf 'step-%s\nmsg-%s\n' "$i" "$i"; done)" "$(cat "$D/term")"
+
+# A job started during the install must not keep a reader of the
+# installer's output waiting: no copy of stdout is left open for it.
+log_child jobs '
+install_log_start
+REPORT_MODE=memory
+_report_capture_init
+( sleep 3 ) </dev/null >/dev/null 2>&1 &
+report_step_start check_os
+( _report_close_saved_fds; sleep 3 ) </dev/null >/dev/null 2>&1 &
+echo done
+exit 0'
+t0=$(date +%s%N)
+(cd "$D" && bash child.sh | cat >/dev/null)
+ms=$((($(date +%s%N) - t0) / 1000000))
+check "a background job does not hold the output pipe (${ms} ms)" test "$ms" -lt 1500
 
 echo
 echo "# passed: $PASS, failed: $FAIL"

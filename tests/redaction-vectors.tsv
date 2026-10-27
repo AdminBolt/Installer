@@ -15,3 +15,11 @@ machine-id 0123456789abcdef0123456789abcdef	machine-id <secret>
 14:30:01 MariaDB 10.11.6 v1.2.3.4 1.2.3.4.5 Foo::bar std::string 52:54:00:12:34:56 tests passed: 3 self::add()	14:30:01 MariaDB 10.11.6 v1.2.3.4 1.2.3.4.5 Foo::bar std::string 52:54:00:12:34:56 tests passed: 3 self::add()
 /usr/local/bolt/web/vendor/laravel/framework/src/Illuminate/Database/Connectors/Connector.php:66	/usr/local/bolt/web/vendor/laravel/framework/src/Illuminate/Database/Connectors/Connector.php:66
 SQLSTATE[HY000] [2002] Connection refused (Connection: mysql, SQL: select * from "settings" where "key" = mail_hostname)	SQLSTATE[HY000] [2002] Connection refused (Connection: mysql, SQL: select * from "settings" where "key" = mail_hostname)
+connect to 2001:db8::5: Connection refused	connect to <ip>: Connection refused
+from 2001:db8:85a3:8d3:1319:8a2e:370:7348: x	from <ip>: x
+{"password":"ab\"cdSECRET1"} 'db_pass'='it''s SECRET13'	{"password":<secret>} 'db_pass'=<secret>
+mariadb -uroot -pSECRET2 && mariadb-admin -u root -pSECRET3	mariadb -uroot -p<secret> && mariadb-admin -u root -p<secret>
+mysql -u root --password SECRET14 --api-key "k e y"	mysql -u root --password <secret> --api-key <secret>
+CREATE USER 'x'@'%' IDENTIFIED BY 'SECRET15'; ALTER USER y IDENTIFIED WITH mysql_native_password AS "SECRET16"	CREATE USER 'x'@'%' IDENTIFIED BY <secret>; ALTER USER y IDENTIFIED WITH mysql_native_password AS <secret>
+sshpass -p X1secret ssh root@localhost	sshpass -p <secret> ssh root@localhost
+ip_10.0.0.5 and 045.076.086.120	ip_<ip> and <ip>

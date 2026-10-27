@@ -1417,6 +1417,7 @@ echo "# error excerpts of failed steps (AB-2233)"
 # ---------------------------------------------------------------------------
 child excerpts '
 ADMIN_EMAIL=owner@customer-mail.org
+mkdir -p "$FAKE_DIR/../tmp"; TMPDIR="$FAKE_DIR/../tmp"
 report_init
 report_stage_begin configuration
 run_or_warn true "Nftable" nftables
@@ -1441,7 +1442,7 @@ check "excerpt: output after the last step (the sign-in link) never sent" bash -
 check "excerpt: output of a step that worked never sent" bash -c '! grep -q "Nftable" <<<"$1"' _ "$(jq -r '[.errors[].output] | join("\n")' <<<"$fin")"
 check "terminal: the step output is printed as before" grep -q 'ERROR 2002 (HY000): Cant connect to server' "$CHILD_DIR/out"
 check "terminal: colours still reach it" grep -q $'\033\\[0;31mdovecot' "$CHILD_DIR/out"
-check "the step copies are removed at exit" bash -c '! ls -d "${TMPDIR:-/tmp}"/adminbolt-install-steps.* 2>/dev/null | grep -q .'
+check "the step copies were made and are removed at exit" bash -c 'test -d "$1/tmp" && ! ls -d "$1"/tmp/adminbolt-install-steps.* 2>/dev/null | grep -q .' _ "$CHILD_DIR"
 
 child excerpt_fail '
 report_init
@@ -1485,6 +1486,15 @@ check "limits: whole lines kept" bash -c '[[ "$(jq -r ".errors[0].output" <<<"$1
 check "limits: a step past the 6 KB budget is listed without output" jq -e '.errors[-1].output == "" and (.errors[-1].exit_code == 1)' <<<"$fin"
 check "limits: no cut-off line from the budget" jq -e 'all(.errors[]; .output == "" or (.output | test("^(line|final|[a-z_0-9]+ failed)")))' <<<"$fin"
 check "limits: event body fits the receiver's 16 KB" test "$(jq -c . <<<"$fin" | wc -c)" -le 16384
+
+child excerpt_scriptlet '
+report_init
+report_stage_begin packages
+report_step_start agent_install
+echo "warning: %post(bolt-agent-1.33.0-1.el9.x86_64) scriptlet failed, exit status 1"
+report_fail agent_scriptlet agent_install_failed
+exit 1'
+eq "scriptlet failure: the package step's output" "agent_scriptlet|warning: %post(bolt-agent-1.33.0-1.el9.x86_64) scriptlet failed, exit status 1" "$(jq -r '.errors[0] | "\(.step)|\(.output)"' <<<"$(event install_finished)")"
 
 child excerpt_stderr_apart '
 report_init

@@ -165,6 +165,7 @@ REPORT_CAPTURE_OUT=""
 REPORT_CAPTURE_ERR=""
 REPORT_CAPTURE_LEVEL=0
 REPORT_CAPTURE_PIDS=""
+REPORT_CAPTURE_OPEN_PIDS=""
 # Exit code of the command a step runner just saw fail (report_exit_code).
 REPORT_CMD_RC=""
 declare -A REPORT_STEP_FILE=()
@@ -231,7 +232,9 @@ _report_in_list() {
 _report_bounded() {
     if command -v timeout >/dev/null 2>&1; then
         timeout -k 1 "$REPORT_CALL_TIMEOUT" "$@"
-        return
+        # Explicit: a bare return in a function run from the EXIT trap
+        # returns the status the script exited with.
+        return $?
     fi
     # No timeout(1): the same bound in bash. The command runs in the
     # background and is stopped (TERM, then KILL a second later) once it
@@ -450,6 +453,7 @@ _report_send_bg() {
     if [[ "$REPORT_MODE" == spool ]]; then
         (
             set +e
+            _report_close_saved_fds
             _report_cd_install_dir || exit 0
             [[ -e "sent/$id" ]] && exit 0
             code=$(_report_post "@events/$id.json")
@@ -458,6 +462,7 @@ _report_send_bg() {
     else
         (
             set +e
+            _report_close_saved_fds
             printf '%s' "$json" | _report_post @- >/dev/null
         ) </dev/null >/dev/null 2>&1 &
     fi
@@ -861,6 +866,7 @@ _report_install_timer() {
     [[ -d "$REPORT_UNIT_DIR" ]] || return 1
     (
         set +e
+        _report_close_saved_fds
         if command -v flock >/dev/null 2>&1 && exec 9>>"$REPORT_DIR/.lock"; then
             flock -w 60 9
         fi
@@ -1065,11 +1071,14 @@ _report_capture_begin() {
     if [[ /dev/fd/1 -ef /dev/fd/2 ]]; then
         exec 1> >(trap '' INT TERM HUP; exec tee -i -a "$file" 2>/dev/null) 2>&1 || { _report_capture_end; return 0; }
         REPORT_CAPTURE_PIDS+=" $!"
+        REPORT_CAPTURE_OPEN_PIDS="$!"
     else
         exec 1> >(trap '' INT TERM HUP; exec tee -i -a "$file" 2>/dev/null) || { _report_capture_end; return 0; }
         REPORT_CAPTURE_PIDS+=" $!"
+        REPORT_CAPTURE_OPEN_PIDS="$!"
         exec 2> >(trap '' INT TERM HUP; exec tee -i -a "$file" 2>/dev/null >&"$REPORT_CAPTURE_ERR") || { _report_capture_end; return 0; }
         REPORT_CAPTURE_PIDS+=" $!"
+        REPORT_CAPTURE_OPEN_PIDS+=" $!"
     fi
     REPORT_STEP_FILE[$step]="$file"
 }
@@ -1077,10 +1086,22 @@ _report_capture_begin() {
 # Ends the open capture: stdout and stderr go back to where they went before.
 _report_capture_end() {
     [[ -n "$REPORT_CAPTURE_OUT" && "$BASH_SUBSHELL" == "$REPORT_CAPTURE_LEVEL" ]] || return 0
-    exec 1>&"$REPORT_CAPTURE_OUT" 2>&"$REPORT_CAPTURE_ERR"
-    exec {REPORT_CAPTURE_OUT}>&- {REPORT_CAPTURE_ERR}>&-
+    exec 1>&"$REPORT_CAPTURE_OUT" 2>&"$REPORT_CAPTURE_ERR" || true
+    exec {REPORT_CAPTURE_OUT}>&- {REPORT_CAPTURE_ERR}>&- || true
     REPORT_CAPTURE_OUT=""
     REPORT_CAPTURE_ERR=""
+    # The step's last lines are still in its tee: wait for them (at most a
+    # second, when a job of the step keeps its output open), so what the
+    # installer prints next does not overtake them on the terminal.
+    _report_wait_pids 10 $REPORT_CAPTURE_OPEN_PIDS
+    REPORT_CAPTURE_OPEN_PIDS=""
+}
+
+# For a background job: closes the copies of stdout and stderr kept while a
+# step's output is captured, so a caller reading the installer's output
+# through a pipe is not kept waiting for the job.
+_report_close_saved_fds() {
+    [[ -z "$REPORT_CAPTURE_OUT" ]] || exec {REPORT_CAPTURE_OUT}>&- {REPORT_CAPTURE_ERR}>&- 2>/dev/null
 }
 
 # Records that step $1 failed, with the output of its current run and the
@@ -1089,17 +1110,20 @@ _report_capture_failed() {
     local step="$1"
     [[ -n "$step" && "$(report_step_class "$step")" != unknown ]] || return 0
     _report_in_list "$step" "$REPORT_ERR_ORDER" || REPORT_ERR_ORDER+="${REPORT_ERR_ORDER:+ }$step"
-    REPORT_ERR_FILE[$step]="${REPORT_STEP_FILE[$step]:-}"
+    # A step without output of its own (agent_scriptlet, panel_scriptlet:
+    # found in the output of the package step) gets that of the step running.
+    REPORT_ERR_FILE[$step]="${REPORT_STEP_FILE[$step]:-${REPORT_STEP_FILE[${REPORT_STEP:-none}]:-}}"
     if [[ "$REPORT_CMD_RC" =~ ^[0-9]{1,3}$ ]] && ((REPORT_CMD_RC <= 255)); then REPORT_ERR_RC[$step]=$REPORT_CMD_RC; fi
     REPORT_CMD_RC=""
 }
 
-# Waits at most $1 tenths of a second for the step copies to be written out.
-_report_capture_drain() {
-    local i pid running
-    for ((i = 0; i < $1; i++)); do
+# Waits at most $1 tenths of a second for the processes $2... to end.
+_report_wait_pids() {
+    local ticks="$1" i pid running
+    shift
+    for ((i = 0; i < ticks; i++)); do
         running=0
-        for pid in $REPORT_CAPTURE_PIDS; do
+        for pid in "$@"; do
             if kill -0 "$pid" 2>/dev/null; then running=1; break; fi
         done
         ((running)) || return 0
@@ -1128,7 +1152,7 @@ _report_private_values() {
         if [[ "$n" == *.* && ${#first} -ge 4 ]]; then printf 'host %s\n' "$first"; fi
     done <<<"$names"
     if [[ -n "$ADMIN_EMAIL" ]]; then
-        printf 'email %s\n' "$ADMIN_EMAIL"
+        printf 'email %s\n' "$ADMIN_EMAIL" "${ADMIN_EMAIL//@/%40}"
         e="${ADMIN_EMAIL##*@}"
         [[ "$e" == *.* ]] && printf 'host %s\n' "${e,,}"
     fi
@@ -1151,14 +1175,15 @@ _report_private_values() {
 # fails without it, and the caller then sends no output at all.
 _report_redact() {
     command -v gawk >/dev/null 2>&1 || return 1
-    LC_ALL=C gawk -v privfile="$1" '
+    # Bounded: a failure or a timeout sends no output at all.
+    _report_bounded env LC_ALL=C gawk -v privfile="$1" '
     function isword(c) { return c ~ /^[A-Za-z0-9_]$/ }
     # Literal, case-insensitive; with bounded, not inside a longer name.
     function lit(s, needle, rep, bounded,   out, ln, i, b, a) {
         out = ""; ln = tolower(needle)
         while ((i = index(tolower(s), ln)) > 0) {
             b = (i > 1) ? substr(s, i - 1, 1) : ""; a = substr(s, i + length(needle), 1)
-            if (bounded && (b ~ /^[A-Za-z0-9-]$/ || a ~ /^[A-Za-z0-9-]$/)) {
+            if (bounded && (b ~ /^[A-Za-z0-9]$/ || a ~ /^[A-Za-z0-9]$/)) {
                 out = out substr(s, 1, i + length(needle) - 1)
             } else {
                 out = out substr(s, 1, i - 1) rep
@@ -1197,15 +1222,20 @@ _report_redact() {
     }
     # Replaces each match of re that is valid for kind (v4, v6, tok) and does
     # not continue a word, a version or another address.
-    function scan(s, re, kind, rep,   out, st, ln, t, b, a, a2, okb, oka, ok) {
+    function scan(s, re, kind, rep,   out, st, ln, t, b, a, a2, okb, oka, ok, trimmed) {
         out = ""
         while (match(s, re)) {
             st = RSTART; ln = RLENGTH; t = substr(s, st, ln)
             b = (st > 1) ? substr(s, st - 1, 1) : ""; a = substr(s, st + ln, 1); a2 = substr(s, st + ln + 1, 1)
             if (kind == "v4") {
-                ok = !isword(b) && b != "." && !isword(a) && !(a == "." && a2 ~ /^[0-9]$/) && v4ok(t)
+                ok = (!isword(b) || b == "_") && b != "." && !isword(a) && !(a == "." && a2 ~ /^[0-9]$/) && v4ok(t)
             } else if (kind == "v6") {
-                oka = !isword(a) && a != ":" && !(a == "." && isword(a2))
+                # "2001:db8::5: refused": the colon after the address was taken in.
+                trimmed = 0
+                while (ln > 2 && substr(t, ln, 1) == ":" && !v6ok(t)) { ln--; t = substr(t, 1, ln); trimmed = 1 }
+                a = substr(s, st + ln, 1); a2 = substr(s, st + ln + 1, 1)
+                # A colon right after a whole address ends it ("...:7348: x").
+                oka = (!isword(a) && a != ":" && !(a == "." && isword(a2))) || (a == ":" && (trimmed || a2 !~ /^[0-9A-Fa-f:]$/))
                 okb = !isword(b) && b != ":" && b != "."
                 ok = okb && v6ok(t)
                 # "addr:2001:db8::1": the address starts after the colon.
@@ -1238,15 +1268,22 @@ _report_redact() {
         # name=value or name: value where the name says it is a secret; "pass"
         # and "key" only end a name, so "passed: 3" stays.
         rest = s; s = ""
-        while (match(rest, /([a-z0-9_.-]*(password|passwd|passphrase|pwd|secret|token|api[_-]?key|apikey|access[_-]?key|private[_-]?key|auth[_-]?key|licen[cs]e[_-]?key|credential)[a-z0-9_.-]*|[a-z0-9_.-]*pass|[a-z0-9_.-]*[_-]key)(["\047]?[ \t]*[=:][ \t]*)("[^"]*"|\047[^\047]*\047|[^ \t"\047,;]+)/, m)) {
+        while (match(rest, /([a-z0-9_.-]*(password|passwd|passphrase|pwd|secret|token|api[_-]?key|apikey|access[_-]?key|private[_-]?key|auth[_-]?key|licen[cs]e[_-]?key|credential)[a-z0-9_.-]*|[a-z0-9_.-]*pass|[a-z0-9_.-]*[_-]key)(["\047]?[ \t]*[=:][ \t]*)("([^"\\]|\\.)*"|\047([^\047\\]|\\.|\047\047)*\047|[^ \t"\047,;]+)/, m)) {
             val = m[4, "length"] ? substr(rest, m[4, "start"], m[4, "length"]) : ""
             if (val ~ /^(yes|no)\)?$/) { s = s substr(rest, 1, RSTART + RLENGTH - 1) }
             else { s = s substr(rest, 1, m[4, "start"] - 1) "<secret>" }
             rest = substr(rest, RSTART + RLENGTH)
         }
         s = s rest
-        if (match(s, /(\<mysql[a-z]*\>.*[ \t]-p)[^ \t]+/, m))
-            s = substr(s, 1, RSTART - 1) m[1] "<secret>" substr(s, RSTART + RLENGTH)
+        # --password VALUE, with a space instead of "=".
+        s = gensub(/(--[a-z0-9-]*(password|passwd|pass|secret|token|api-?key|access-?key|auth-?key|licen[cs]e-?key)[ \t]+)("([^"\\]|\\.)*"|\047([^\047\\]|\\.|\047\047)*\047|[^ \t"\047,;]+)/, "\\1<secret>", "g", s)
+        # SQL: IDENTIFIED BY 'x', IDENTIFIED WITH plugin BY|AS 'x'.
+        s = gensub(/(\<identified[ \t]+(with[ \t]+[^ \t]+[ \t]+)?(by|as)[ \t]+)("([^"\\]|\\.)*"|\047([^\047\\]|\\.|\047\047)*\047|[^ \t"\047,;]+)/, "\\1<secret>", "g", s)
+        if (match(s, /\<sshpass\>/))
+            s = substr(s, 1, RSTART + RLENGTH - 1) gensub(/([ \t]-p[ \t]*)[^ \t]+/, "\\1<secret>", "g", substr(s, RSTART + RLENGTH))
+        # mysql / mariadb -pSECRET: every -p after the client name.
+        if (match(s, /\<(mysql|mariadb)[a-z-]*\>/))
+            s = substr(s, 1, RSTART + RLENGTH - 1) gensub(/([ \t]-p)[^ \t]+/, "\\1<secret>", "g", substr(s, RSTART + RLENGTH))
         IGNORECASE = 0
         s = emails(s)
         s = scan(s, "([0-9A-Fa-f]{0,4}:){2,7}([0-9]{1,3}(\\.[0-9]{1,3}){3}|[0-9A-Fa-f]{1,4})?(%[0-9A-Za-z_.-]+)?", "v6", "<ip>")
@@ -1295,7 +1332,10 @@ _report_redact() {
 # Cleaned end of a step's output file $1: colour codes and carriage-return
 # overwrites removed, anything but printable ASCII and tabs as '?'.
 _report_excerpt_clean() {
-    tail -n "$REPORT_EXCERPT_SCAN_LINES" -- "$1" 2>/dev/null \
+    # Bytes are capped too (and every line to the end of its last 4 KB): the
+    # redaction time grows with the length of a line.
+    tail -n "$REPORT_EXCERPT_SCAN_LINES" -- "$1" 2>/dev/null | tail -c 65536 \
+        | LC_ALL=C awk '{ if (length($0) > 4096) $0 = substr($0, length($0) - 4095); print }' \
         | LC_ALL=C sed -e 's/\x1b\[[0-9;?]*[A-Za-z]//g' -e 's/\x1b[()][A-Za-z0-9]//g' -e 's/\r$//' -e 's/.*\r//' \
         | LC_ALL=C tr -c '\11\12\40-\176' '?'
 }
@@ -1340,7 +1380,7 @@ _report_errors_json() {
     if [[ -n "$REPORT_CAPTURE_DIR" ]] && priv=$(mktemp "$REPORT_CAPTURE_DIR/private.XXXXXX" 2>/dev/null); then
         _report_private_values >"$priv" 2>/dev/null || priv=""
     fi
-    _report_capture_drain 10
+    _report_wait_pids 10 $REPORT_CAPTURE_PIDS
     for s in $order; do
         ((n < REPORT_EXCERPTS_MAX)) || break
         limit=$REPORT_EXCERPT_BYTES
@@ -1409,37 +1449,43 @@ install_log_start() {
     if ! _report_telemetry_off && ! _report_valid_uuid "$INSTALL_ID"; then INSTALL_ID=$(_report_new_uuid) || INSTALL_ID=""; fi
     id="${INSTALL_ID:-none (install report off)}"
     printf '\n===== AdminBolt install, install ID %s, started %s =====\n' "$id" "$(date -u '+%Y-%m-%d %H:%M:%S UTC')" >>"$f" 2>/dev/null || return 0
+    # The originals are kept only until the tees have their own copies: a
+    # copy held open here would be inherited by every job the install starts.
     exec {INSTALL_LOG_OUT}>&1 {INSTALL_LOG_ERR}>&2 || return 0
-    if [[ /dev/fd/1 -ef /dev/fd/2 ]]; then
-        exec 1> >(trap '' INT TERM HUP; exec tee -i >(trap '' INT TERM HUP; _install_log_lines >>"$f" 2>/dev/null)) 2>&1 || { install_log_stop; return 0; }
-        INSTALL_LOG_PIDS+=" $!"
+    if _install_log_redirect "$f"; then
+        INSTALL_LOG_ACTIVE=1
     else
-        exec 1> >(trap '' INT TERM HUP; exec tee -i >(trap '' INT TERM HUP; _install_log_lines >>"$f" 2>/dev/null)) || { install_log_stop; return 0; }
-        INSTALL_LOG_PIDS+=" $!"
-        exec 2> >(trap '' INT TERM HUP; exec tee -i >(trap '' INT TERM HUP; _install_log_lines >>"$f" 2>/dev/null) >&"$INSTALL_LOG_ERR") || { install_log_stop; return 0; }
-        INSTALL_LOG_PIDS+=" $!"
+        exec 1>&"$INSTALL_LOG_OUT" 2>&"$INSTALL_LOG_ERR" || true
     fi
-    INSTALL_LOG_ACTIVE=1
-}
-
-# Puts stdout and stderr back and waits (at most 2 seconds) for the log to
-# be written out.
-install_log_stop() {
-    local i pid running
-    [[ -n "$INSTALL_LOG_OUT" ]] || return 0
-    INSTALL_LOG_ACTIVE=0
-    exec 1>&"$INSTALL_LOG_OUT" 2>&"$INSTALL_LOG_ERR"
-    exec {INSTALL_LOG_OUT}>&- {INSTALL_LOG_ERR}>&-
+    exec {INSTALL_LOG_OUT}>&- {INSTALL_LOG_ERR}>&- || true
     INSTALL_LOG_OUT=""
     INSTALL_LOG_ERR=""
-    for ((i = 0; i < 20; i++)); do
-        running=0
-        for pid in $INSTALL_LOG_PIDS; do
-            if kill -0 "$pid" 2>/dev/null; then running=1; break; fi
-        done
-        ((running)) || return 0
-        sleep 0.1
-    done
+}
+
+# stdout and stderr through the log tees (one when both go to the same
+# place, so their order stays as it was).
+_install_log_redirect() {
+    local f="$1"
+    if [[ /dev/fd/1 -ef /dev/fd/2 ]]; then
+        exec 1> >(trap '' INT TERM HUP; exec tee -i >(trap '' INT TERM HUP; _install_log_lines >>"$f" 2>/dev/null)) 2>&1 || return 1
+        INSTALL_LOG_PIDS+=" $!"
+        return 0
+    fi
+    exec 1> >(trap '' INT TERM HUP; exec tee -i >(trap '' INT TERM HUP; _install_log_lines >>"$f" 2>/dev/null)) || return 1
+    INSTALL_LOG_PIDS+=" $!"
+    exec 2> >(trap '' INT TERM HUP; exec tee -i >(trap '' INT TERM HUP; _install_log_lines >>"$f" 2>/dev/null) >&"$INSTALL_LOG_ERR") || return 1
+    INSTALL_LOG_PIDS+=" $!"
+}
+
+# Closes stdout and stderr, so the tees reach the end of their input, and
+# waits (at most 2 seconds) for the log to be written out. Last thing a run
+# does: nothing is printed after it.
+install_log_stop() {
+    ((INSTALL_LOG_ACTIVE)) || return 0
+    INSTALL_LOG_ACTIVE=0
+    _report_capture_end
+    exec 1>/dev/null 2>/dev/null
+    _report_wait_pids 20 $INSTALL_LOG_PIDS
 }
 
 # Hook points used by the install steps. None of them can fail or print
