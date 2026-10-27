@@ -148,7 +148,7 @@ REPORT_READINESS=""
 REPORT_REPO_UNREACHABLE=0
 INSTALL_MARKER_CREATED=0
 
-# Error excerpts (AB-2233): the output of every step is copied to a private
+# Error excerpts: the output of every step is copied to a private
 # file while the step runs; for each failed step install_finished carries the
 # last REPORT_EXCERPT_LINES lines of it, redacted, at most
 # REPORT_EXCERPT_BYTES per step and REPORT_EXCERPTS_BYTES in all.
@@ -174,7 +174,7 @@ REPORT_ERR_ORDER=""
 # The panel database, read for the licence key that the excerpts must not carry.
 REPORT_PANEL_DB="/var/lib/adminbolt/db.sqlite3"
 
-# Full log of the run (AB-2233): root only, also with --no-telemetry.
+# Full log of the run: root only, also with --no-telemetry.
 INSTALL_LOG="/var/log/bolt-install.log"
 INSTALL_LOG_ACTIVE=0
 INSTALL_LOG_OUT=""
@@ -1033,7 +1033,7 @@ _report_readiness_check() {
 }
 
 # ---------------------------------------------------------------------------
-# Error excerpts (AB-2233)
+# Error excerpts
 #
 # While a step runs, its output (stdout and stderr) is copied, unchanged on
 # the terminal, to a file of its own in a private temporary directory: the
@@ -1367,7 +1367,7 @@ _report_errors_json() {
 }
 
 # ---------------------------------------------------------------------------
-# Full install log (AB-2233)
+# Full install log
 #
 # As root, everything the run prints (stdout and stderr of every step) is
 # also appended to INSTALL_LOG (0600, root only), each line with its UTC time

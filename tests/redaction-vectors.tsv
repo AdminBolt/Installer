@@ -1,0 +1,17 @@
+# Redaction vectors shared by bolt-ai-hub (installevents/testdata/redaction-vectors.tsv) and the Installer
+# (tests/redaction-vectors.tsv): the two copies must stay identical. input<TAB>expected, one per line.
+connect to 192.0.2.10:443 failed; seen from 192.0.2.11.	connect to <ip>:443 failed; seen from <ip>.
+fe80::1%eth0 ::ffff:192.0.2.1 addr:2001:db8::2 http://[2001:db8::3]:8443/ 2001:0db8:0000:0000:0000:ff00:0042:8329	<ip> <ip> addr:<ip> http://[<ip>]:8443/ <ip>
+listen [::]:80; ::1 is local; 2001:DB8::ABCD uppercase	listen [<ip>]:80; <ip> is local; <ip> uppercase
+APP_KEY=base64:abc --db-pass='x y' "password":"p" api_token: "abc123"	APP_KEY=<secret> --db-pass=<secret> "password":<secret> api_token: <secret>
+Static hostname: web01	Static hostname: <host>
+mail for root@srv1.example.com, OWNER@Customer-Mail.org	mail for <email>, <email>
+mysql -uroot -pS3cr3tPw! -h 203.0.113.9 -e 'SELECT 1'	mysql -uroot -p<secret> -h <ip> -e 'SELECT 1'
+ERROR 1045 (28000): Access denied for user 'root'@'localhost' (using password: YES)	ERROR 1045 (28000): Access denied for user 'root'@'localhost' (using password: YES)
+Authorization: Bearer eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxIn0.c2ln	Authorization: <secret>
+curl -H "x" https://deploy:tok3nValue@mirror.adminbolt.com/repo.git	curl -H "x" https://<secret>@mirror.adminbolt.com/repo.git
+Oct 23 14:30:01 srv7 mariadbd[5121]: [ERROR] Can't start server	Oct 23 14:30:01 <host> mariadbd[5121]: [ERROR] Can't start server
+machine-id 0123456789abcdef0123456789abcdef	machine-id <secret>
+14:30:01 MariaDB 10.11.6 v1.2.3.4 1.2.3.4.5 Foo::bar std::string 52:54:00:12:34:56 tests passed: 3 self::add()	14:30:01 MariaDB 10.11.6 v1.2.3.4 1.2.3.4.5 Foo::bar std::string 52:54:00:12:34:56 tests passed: 3 self::add()
+/usr/local/bolt/web/vendor/laravel/framework/src/Illuminate/Database/Connectors/Connector.php:66	/usr/local/bolt/web/vendor/laravel/framework/src/Illuminate/Database/Connectors/Connector.php:66
+SQLSTATE[HY000] [2002] Connection refused (Connection: mysql, SQL: select * from "settings" where "key" = mail_hostname)	SQLSTATE[HY000] [2002] Connection refused (Connection: mysql, SQL: select * from "settings" where "key" = mail_hostname)

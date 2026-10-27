@@ -142,6 +142,23 @@ eq "times, versions, PHP calls, MACs, other names stay" "$in" "$(redact <<<"$in"
 eq "IPv4 with a port and at the end of a sentence" "connect to <ip>:443 failed; seen from <ip>." "$(redact <<<'connect to 192.0.2.10:443 failed; seen from 192.0.2.11.')"
 eq "a second pass changes nothing" "$out" "$(redact <<<"$out")"
 
+# The receiver (bolt-ai-hub, installevents/redact.go) runs the same rules:
+# both test the same vectors. HUB_REDACTION_VECTORS=/path/to/its copy also
+# checks that the two files are still identical.
+VECTORS="$HERE/redaction-vectors.tsv"
+: >"$T/nopriv"
+bad=0 nvec=0
+while IFS=$'\t' read -r vin vwant; do
+    [[ "$vin" == \#* || -z "$vin" ]] && continue
+    nvec=$((nvec + 1))
+    vgot=$(_report_redact "$T/nopriv" <<<"$vin")
+    [[ "$vgot" == "$vwant" ]] || { bad=$((bad + 1)); echo "# vector: $vin -> $vgot (want $vwant)"; }
+done <"$VECTORS"
+eq "shared redaction vectors ($nvec) give the receiver's result" 0 "$bad"
+if [[ -n "${HUB_REDACTION_VECTORS:-}" ]]; then
+    check "shared vectors identical to the receiver's copy" cmp -s "$VECTORS" "$HUB_REDACTION_VECTORS"
+fi
+
 # Without gawk the redaction fails, so the caller sends no output.
 _report_redact_nogawk=$(PATH="$T/empty" _report_redact "$PRIV" <<<"x" 2>/dev/null; echo "rc=$?")
 eq "no gawk: redaction refuses" "rc=1" "$_report_redact_nogawk"
