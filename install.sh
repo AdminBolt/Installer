@@ -492,6 +492,13 @@ _report_flush() {
     local id pid i running ticks
     ticks=$(((REPORT_BUDGET_MS - REPORT_SPENT_MS) / 100))
     ((ticks <= REPORT_FINAL_WAIT * 10)) || ticks=$((REPORT_FINAL_WAIT * 10))
+    # The work at exit before the send (the error excerpts) comes out of the
+    # same wait, so a run takes no longer than without the excerpts.
+    if ((REPORT_FINISH_START > 0)); then
+        local finish_ticks=$(((REPORT_FINAL_WAIT * 1000 - ($(_report_now_ms) - REPORT_FINISH_START)) / 100))
+        ((finish_ticks >= 0)) || finish_ticks=0
+        ((ticks <= finish_ticks)) || ticks=$finish_ticks
+    fi
     for id in "${!REPORT_EVENTS[@]}"; do
         if [[ "$REPORT_MODE" == spool ]]; then
             [[ -e "$REPORT_DIR/$INSTALL_ID/sent/$id" ]] && continue
@@ -1117,9 +1124,10 @@ _report_capture_failed() {
     REPORT_CMD_RC=""
 }
 
-# Waits at most $1 tenths of a second for the processes $2... to end.
+# Waits at most $1 tenths of a second for the processes $2... to end,
+# looking every 10 ms: a tee usually ends within a few.
 _report_wait_pids() {
-    local ticks="$1" i pid running
+    local ticks=$(($1 * 10)) i pid running
     shift
     for ((i = 0; i < ticks; i++)); do
         running=0
@@ -1127,7 +1135,7 @@ _report_wait_pids() {
             if kill -0 "$pid" 2>/dev/null; then running=1; break; fi
         done
         ((running)) || return 0
-        sleep 0.1
+        sleep 0.01
     done
 }
 

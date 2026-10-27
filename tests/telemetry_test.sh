@@ -950,6 +950,19 @@ timed_child
 check "receiver hangs: final wait capped at 5 s (took ${ELAPSED}s)" awk -v e="$ELAPSED" 'BEGIN { exit !(e < 7) }'
 eq "receiver hangs: exit code unchanged" 1 "$CHILD_RC"
 while read -r pid; do kill "$pid" 2>/dev/null; done <"$CHILD_DIR/fake/pids"
+
+# Building the error excerpts at exit (made slow here) comes out of the same
+# 5 s final wait, so a failed run with a hanging receiver takes no longer.
+new_child hang_excerpts '
+_report_private_values() { sleep 1.5; }
+report_init
+report_stage_begin configuration
+run_or_fail "echo agent: connection refused; (exit 7)" "Connect bolt-agent to panel" agent_panel_connect'
+echo 30 >"$CHILD_DIR/fake/curl_sleep"
+timed_child
+check "receiver hangs, excerpts built: still within the 5 s final wait (took ${ELAPSED}s)" awk -v e="$ELAPSED" 'BEGIN { exit !(e < 6.2) }'
+check "receiver hangs, excerpts built: the event keeps its excerpt" grep -q 'agent: connection refused' <<<"$(event install_finished)"
+while read -r pid; do kill "$pid" 2>/dev/null; done <"$CHILD_DIR/fake/pids"
 if [[ -n "$REAL_CURL" ]]; then
     new_child refused "ADMINBOLT_INSTALL_REPORT_URL=http://127.0.0.1:9/install-events; $flow"
     echo "$REAL_CURL" >"$CHILD_DIR/fake/real_curl"
