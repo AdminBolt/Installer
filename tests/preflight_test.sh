@@ -320,7 +320,7 @@ rm -f "$S/var/www/html/index.html"
 run "PREINSTALL_BACKUP_DIR='$dir'; install_report_replaced_files"
 has "end: says where the originals are" "$dir/files.tar.gz holds the files as they were" "$OUT"
 has "end: counts the replaced files" "The install changed or removed 2 of them" "$OUT"
-eq "end: list of replaced files is exact" "$(printf '%s\n' "$S/etc/postfix/main.cf" "$S/var/www/html/index.html" | sort)" "$(sort "$dir/replaced-files.txt" 2>/dev/null)"
+eq "end: list of replaced files is exact and sorted" "$(printf '%s\n' "$S/etc/postfix/main.cf" "$S/var/www/html/index.html" | sort)" "$(cat "$dir/replaced-files.txt" 2>/dev/null)"
 has "end: lists a replaced file" "  $S/etc/postfix/main.cf" "$OUT"
 hasnt "end: an untouched file is not listed" "httpd.conf" "$OUT"
 
