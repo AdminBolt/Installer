@@ -371,15 +371,25 @@ eq "failed install after a backup: exit code kept" 3 "$RC"
 run "trap report_on_exit EXIT; PREINSTALL_BACKUP_DIR='$dir'; exit 0"
 hasnt "successful install: the exit does not repeat it" "The configuration from before this install" "$OUT"
 
+# A failed backup stops the install by itself (the runs above are without
+# set -e): one error, nothing after it, nothing reported as backed up.
+stops_at_once() {
+    eq "$1: exactly one error" 1 "$(grep -c 'ERROR:' <<<"$OUT")"
+    hasnt "$1: the install does not go on" PASSED "$OUT"
+    hasnt "$1: nothing reported as backed up" "Current configuration backed up" "$OUT"
+}
+
 new_server backup_no_parent
-run 'BACKUP_PARENT="$S/no/such/dir"; backup_existing_configuration; echo PASSED'
+run 'set +e; BACKUP_PARENT="$S/no/such/dir"; backup_existing_configuration; echo PASSED'
+stops_at_once "backup directory cannot be created"
 eq "backup directory cannot be created: exit 1" 1 "$RC"
 hasnt "backup directory cannot be created: install stops" PASSED "$OUT"
 has "backup directory cannot be created: reported as preinstall_backup" "STEP=preinstall_backup REASON=required_step_failed" "$OUT"
 
 new_server backup_no_space
 echo 10 >"$S/fake/df_avail"
-run 'backup_existing_configuration; echo PASSED'
+run 'set +e; backup_existing_configuration; echo PASSED'
+stops_at_once "not enough space"
 eq "not enough space: exit 1" 1 "$RC"
 has "not enough space: says so" "Not enough free space" "$OUT"
 has "not enough space: reported as preinstall_backup" "STEP=preinstall_backup" "$OUT"
@@ -387,13 +397,15 @@ eq "not enough space: no backup directory left" 0 "$(find "$S/root" -mindepth 1 
 
 new_server backup_no_checksums
 mkdir -p "$S/empty"
-run 'BACKUP_PATHS="$S/empty"; backup_existing_configuration; echo PASSED'
+run 'set +e; BACKUP_PATHS="$S/empty"; backup_existing_configuration; echo PASSED'
+stops_at_once "no checksums"
 eq "no checksums: exit 1" 1 "$RC"
 has "no checksums: says so" "no checksums could be taken" "$OUT"
 eq "no checksums: no backup directory left" 0 "$(find "$S/root" -mindepth 1 -maxdepth 1 -name 'adminbolt-preinstall-backup-*' | wc -l)"
 
 new_server backup_tar_fails
-run 'tar() { return 2; }; backup_existing_configuration; echo PASSED'
+run 'set +e; tar() { return 2; }; backup_existing_configuration; echo PASSED'
+stops_at_once "tar fails"
 eq "tar fails: exit 1" 1 "$RC"
 has "tar fails: says so" "The backup failed (tar exit 2)" "$OUT"
 hasnt "tar fails: install stops" PASSED "$OUT"
