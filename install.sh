@@ -1462,7 +1462,7 @@ stage_configuration() {
     echo -e "${BOLD}${CYAN}--- Signing in later ---${NC}"
     echo -e "${GREEN}Admin username:${NC} ${BOLD}admin${NC} (or the e-mail you enter in the setup wizard)"
     echo -e "${GREEN}Password:${NC} the one you set in the setup wizard that opens with the link above"
-    echo -e "${GREEN}You can also sign in as root with this server's root password (Settings, Admin Management can turn that off).${NC}\n"
+    echo -e "${GREEN}Until the setup wizard is finished, root can also sign in with this server's root password; the wizard offers to turn that off.${NC}\n"
     echo -e "${BOLD}${CYAN}--- If you get locked out ---${NC}"
     echo -e "${GREEN}New one-time sign-in link:${NC} ${BOLD}bolt-cli admin-sso-generate${NC}"
     echo -e "${GREEN}Reset the admin password:${NC}  ${BOLD}bolt-cli reset-admin-account-password${NC}"
