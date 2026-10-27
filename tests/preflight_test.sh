@@ -64,7 +64,7 @@ new_server() {
 run() {
     cat >"$S/child.sh" <<EOF
 ADMINBOLT_INSTALL_SOURCE_ONLY=1
-. "$INSTALL_SH"
+. "${CHILD_INSTALL_SH:-$INSTALL_SH}"
 S="$S"
 F="$S/fake"
 rpm() {
@@ -131,6 +131,28 @@ echo x >"$S/home/linuxuser/.ansible/tmp/run"
 mkdir -p "$S/home/lost+found"
 run 'existing_server_findings'
 eq "cloud user after logins (history, caches), empty lost+found: no findings" "STEP= REASON=" "$OUT"
+
+# A sudo user (rocky, almalinux, ec2-user) downloads or clones the installer
+# into their own home and runs it from there.
+new_server sudo_download
+cp "$INSTALL_SH" "$S/home/linuxuser/install.sh"
+CHILD_INSTALL_SH="$S/home/linuxuser/install.sh" run 'existing_server_findings'
+eq "install.sh downloaded into the cloud user's home: no findings" "STEP= REASON=" "$OUT"
+new_server sudo_clone
+mkdir -p "$S/home/linuxuser/Installer/.git" "$S/home/linuxuser/Installer/tests"
+cp "$INSTALL_SH" "$S/home/linuxuser/Installer/install.sh"
+echo x >"$S/home/linuxuser/Installer/README.md"
+echo x >"$S/home/linuxuser/Installer/.git/HEAD"
+CHILD_INSTALL_SH="$S/home/linuxuser/Installer/install.sh" run 'existing_server_findings'
+eq "repository cloned into the cloud user's home: no findings" "STEP= REASON=" "$OUT"
+echo data >"$S/home/linuxuser/site.sql"
+CHILD_INSTALL_SH="$S/home/linuxuser/Installer/install.sh" run 'existing_server_findings'
+has "a file of the user's own beside the clone still counts" "user linuxuser (uid 1000) has files" "$OUT"
+new_server not_installer
+printf '#!/bin/bash\necho other\n' >"$S/home/linuxuser/install.sh"
+cp "$INSTALL_SH" "$S/installer.sh"
+CHILD_INSTALL_SH="$S/installer.sh" run 'existing_server_findings'
+has "some other install.sh in the home still counts" "user linuxuser (uid 1000) has files" "$OUT"
 
 new_server no_firewalld
 echo 1 >"$S/fake/fw_state"
@@ -269,6 +291,11 @@ for name in $EXISTING_PACKAGES $FIREWALLD_IMAGE_SERVICES; do grep -qF -- "\`$nam
 for name in $EXISTING_PORTS; do grep -qE -- "[ (]$name[,)]" <<<"$section" || missing+=" $name"; done
 for name in $BACKUP_PATHS; do grep -qF -- "${name##*/}" <<<"$section" || missing+=" $name"; done
 eq "README lists every package, port, default firewalld service and backed-up path the code uses" "" "$missing"
+extra=""
+for name in $(grep -F 'server package (' <<<"$section" | grep -oE '`[A-Za-z0-9-]+`' | tr -d '`'); do
+    _report_in_list "$name" "$EXISTING_PACKAGES" || extra+=" $name"
+done
+eq "README lists no package the code does not check" "" "$extra"
 
 # Stage 1 runs the check after the port check and makes the backup only with
 # the flag (stage_prerequisites itself needs root, so its body is read).

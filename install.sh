@@ -1037,8 +1037,8 @@ check_port_8443() {
 # Vultr's: they run firewalld with its default zone (ssh, dhcpv6-client,
 # cockpit) and have a cloud user (uid 1000) whose home holds only the
 # skeleton files, ~/.ssh and a tool cache. None of that counts.
-EXISTING_PACKAGES="httpd nginx lighttpd caddy haproxy postfix sendmail exim dovecot bind pdns mariadb-server MariaDB-server mysql-server community-mysql-server mysql-community-server percona-server-server postgresql-server"
-EXISTING_UNITS="httpd nginx lighttpd caddy haproxy postfix sendmail exim dovecot named pdns mariadb mysqld postgresql"
+EXISTING_PACKAGES="httpd nginx lighttpd caddy haproxy postfix sendmail exim dovecot bind pdns vsftpd redis mariadb-server MariaDB-server mysql-server community-mysql-server mysql-community-server percona-server-server postgresql-server"
+EXISTING_UNITS="httpd nginx lighttpd caddy haproxy postfix sendmail exim dovecot named pdns vsftpd redis mariadb mysqld postgresql"
 EXISTING_PORTS="21 25 53 80 110 143 443 465 587 993 995 3306 5432"
 # Services an image's firewalld allows by itself in its default zone.
 FIREWALLD_IMAGE_SERVICES="ssh dhcpv6-client cockpit"
@@ -1132,18 +1132,35 @@ _existing_firewalld_rules() {
     return 0
 }
 
+# The installer's own copy is not anyone's data: a sudo user downloads
+# install.sh into, or clones the repository under, their own home. Prints
+# the clone's directory, or the file itself. Read from a pipe, there is no
+# such file in a home to leave out.
+_installer_own_path() {
+    local src="${BASH_SOURCE[0]:-}" dir
+    [[ -n "$src" && -f "$src" ]] || return 0
+    src=$(realpath -- "$src" 2>/dev/null) || return 0
+    dir="${src%/*}"
+    if [[ -e "$dir/.git" ]]; then echo "$dir"; else echo "$src"; fi
+}
+
+# A path as a find -path pattern that matches only itself.
+_find_literal() { printf '%s' "$1" | sed 's/[][*?\\]/\\&/g'; }
+
 # Prints the first file under home directory $1 that is its owner's own data
 # (see HOME_IGNORED_FILES / HOME_IGNORED_DIRS); nothing when there is none.
 _home_first_data_file() {
     local dir="$1" pattern name args=()
     # find -path takes a pattern: the directory name is matched literally.
-    pattern=$(printf '%s' "$dir" | sed 's/[][*?\\]/\\&/g')
+    pattern=$(_find_literal "$dir")
     for name in $HOME_IGNORED_DIRS $HOME_IGNORED_FILES; do
         args+=(-path "$pattern/$name" -prune -o)
     done
     for name in "$EXISTING_SKEL_DIR"/* "$EXISTING_SKEL_DIR"/.[!.]*; do
         if [[ -e "$name" ]]; then args+=(-path "$pattern/${name##*/}" -prune -o); fi
     done
+    name=$(_installer_own_path)
+    if [[ -n "$name" ]]; then args+=(-path "$(_find_literal "$name")" -prune -o); fi
     # -H: a home that is a symlink is followed, inside it nothing is.
     find -H "$dir" -mindepth 1 "${args[@]}" -type f -print -quit 2>/dev/null
     return 0
@@ -1337,8 +1354,8 @@ install_report_replaced_files() {
         return 0
     fi
     echo "The install changed or removed ${count} of them (full list: ${dir}/replaced-files.txt):"
-    head -n 40 "$dir/replaced-files.txt" | sed 's/^/  /'
-    ((count <= 40)) || echo "  ... and $((count - 40)) more"
+    head -n 100 "$dir/replaced-files.txt" | sed 's/^/  /'
+    ((count <= 100)) || echo "  ... and $((count - 100)) more"
     return 0
 }
 
@@ -1796,7 +1813,7 @@ print_usage() {
     echo "If --mariadb-version is not provided, MariaDB 10.11 is installed; 11.4 is the newer long-term series (supported until 2029)."
     echo "If --email is provided, a 24h trial licence is requested for that address at the very end of the install (clicking the e-mailed confirmation link extends it to the full trial period); the install completes even if the request is refused."
     echo "Without --email the install proceeds unlicensed; activate on the panel's License page."
-    echo "The installer is meant for a fresh server. It stops when it finds a web, mail, DNS or database server, a firewall with rules of its own, or files in /home or /var/www, and lists what the install would replace. --force-existing-server installs anyway, after backing up /etc, /var/spool/cron and the files the install writes in /var/www/html to /root/adminbolt-preinstall-backup-<date>/."
+    echo "The installer is meant for a fresh server. It stops when it finds a web, mail, DNS or database server, a firewall with rules of its own, or files in /home or /var/www, and lists what the install would replace. --force-existing-server installs anyway, after backing up /etc, /var/spool/cron, /root/.my.cnf, /usr/bin/mlmmj-make-ml.sh and the files the install writes in /var/www/html to /root/adminbolt-preinstall-backup-<date>/."
     echo "--channel names what started the install (${REPORT_CHANNELS// /, }); default direct."
     echo "The installer reports its progress and result (no hostnames, e-mail addresses or passwords) to AdminBolt; --no-telemetry (or ADMINBOLT_NO_TELEMETRY=1) turns this off for the installer and the panel."
 }
