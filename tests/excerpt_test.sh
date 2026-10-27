@@ -148,8 +148,8 @@ eq "a second pass changes nothing" "$out" "$(redact <<<"$out")"
 VECTORS="$HERE/redaction-vectors.tsv"
 : >"$T/nopriv"
 bad=0 nvec=0
-while IFS=$'\t' read -r vin vwant; do
-    [[ "$vin" == \#* || -z "$vin" ]] && continue
+while IFS=$'\t' read -r vin vwant vside; do
+    [[ "$vin" == \#* || -z "$vin" || "$vside" == receiver ]] && continue
     nvec=$((nvec + 1))
     vgot=$(_report_redact "$T/nopriv" <<<"$vin")
     [[ "$vgot" == "$vwant" ]] || { bad=$((bad + 1)); echo "# vector: $vin -> $vgot (want $vwant)"; }

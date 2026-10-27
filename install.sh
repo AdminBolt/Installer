@@ -492,8 +492,9 @@ _report_flush() {
     local id pid i running ticks
     ticks=$(((REPORT_BUDGET_MS - REPORT_SPENT_MS) / 100))
     ((ticks <= REPORT_FINAL_WAIT * 10)) || ticks=$((REPORT_FINAL_WAIT * 10))
-    # The work at exit before the send (the error excerpts) comes out of the
-    # same wait, so a run takes no longer than without the excerpts.
+    # The work at exit before the send (the error excerpts, which stop at
+    # their own deadline inside this wait) comes out of the same wait: the
+    # exit takes no longer than the final wait did without the excerpts.
     if ((REPORT_FINISH_START > 0)); then
         local finish_ticks=$(((REPORT_FINAL_WAIT * 1000 - ($(_report_now_ms) - REPORT_FINISH_START)) / 100))
         ((finish_ticks >= 0)) || finish_ticks=0
@@ -1065,11 +1066,19 @@ _report_capture_init() {
     REPORT_CAPTURE_DIR=$(mktemp -d "${TMPDIR:-/tmp}/adminbolt-install-steps.XXXXXX" 2>/dev/null) || REPORT_CAPTURE_DIR=""
 }
 
+# Stage 1 refuses to install for reasons its step id and reason code already
+# say (not root, the OS, a missing command, port 8443, a server already in
+# use, a bad argument). What it prints there names local users, home
+# directories and arguments, so these steps send no output: their output is
+# not even copied.
+_report_step_sends_output() { [[ "$1" != parse_arguments && "$1" != check_* ]]; }
+
 # Starts copying the output of step $1. Never fails: without a capture the
 # step runs as before and its excerpt is empty.
 _report_capture_begin() {
     local step="$1" file
     [[ -n "$step" && -n "$REPORT_CAPTURE_DIR" && -z "$REPORT_CAPTURE_OUT" ]] || return 0
+    _report_step_sends_output "$step" || return 0
     file="$REPORT_CAPTURE_DIR/$REPORT_STEP_RUN.$step"
     : >"$file" 2>/dev/null || return 0
     exec {REPORT_CAPTURE_OUT}>&1 {REPORT_CAPTURE_ERR}>&2 || { REPORT_CAPTURE_OUT=""; REPORT_CAPTURE_ERR=""; return 0; }
@@ -1258,9 +1267,9 @@ _report_redact() {
         }
         return out s
     }
-    # user:password@ in a URL
+    # user:password@ in a URL, also with no user (redis://:password@host)
     function urlcreds(s,   m) {
-        while (match(s, /([A-Za-z][A-Za-z0-9+.-]*:\/\/)[^\/ \t:@]+:[^\/ \t@]*@/, m))
+        while (match(s, /([A-Za-z][A-Za-z0-9+.-]*:\/\/)[^\/ \t:@]*:[^\/ \t@]*@/, m))
             s = substr(s, 1, RSTART - 1) m[1] "<secret>@" substr(s, RSTART + RLENGTH)
         return s
     }
@@ -1268,7 +1277,7 @@ _report_redact() {
         gsub(/[A-Za-z0-9!#$%&\047*+\/=?^_`{|}~.-]+@[A-Za-z0-9-]+(\.[A-Za-z0-9-]+)*\.[A-Za-z][A-Za-z]+/, "<email>", s)
         return s
     }
-    function redact_line(s,   pre, rest, val, m) {
+    function redact_line(s,   pre, rest, val, m, cid, ncid, k) {
         IGNORECASE = 1
         if (match(s, /(proxy-)?authorization["\047]?[ \t]*[:=][ \t]*/))
             s = substr(s, 1, RSTART + RLENGTH - 1) "<secret>"
@@ -1276,10 +1285,10 @@ _report_redact() {
         # name=value or name: value where the name says it is a secret; "pass"
         # and "key" only end a name, so "passed: 3" stays.
         rest = s; s = ""
-        while (match(rest, /([a-z0-9_.-]*(password|passwd|passphrase|pwd|secret|token|api[_-]?key|apikey|access[_-]?key|private[_-]?key|auth[_-]?key|licen[cs]e[_-]?key|credential)[a-z0-9_.-]*|[a-z0-9_.-]*pass|[a-z0-9_.-]*[_-]key)(["\047]?[ \t]*[=:][ \t]*)("([^"\\]|\\.)*"|\047([^\047\\]|\\.|\047\047)*\047|[^ \t"\047,;]+)/, m)) {
-            val = m[4, "length"] ? substr(rest, m[4, "start"], m[4, "length"]) : ""
+        while (match(rest, /([a-z0-9_.-]*(password|passwd|passphrase|pwd|secret|token|api[_-]?key|apikey|access[_-]?key|private[_-]?key|auth[_-]?key|licen[cs]e[_-]?key|credential)[a-z0-9_.-]*|[a-z0-9_.-]*pass|[a-z0-9_.-]*[_-]key)(["\047\]]?[ \t]*(=>|[=:])[ \t]*)("([^"\\]|\\.)*"|\047([^\047\\]|\\.|\047\047)*\047|[^ \t"\047,;]+)/, m)) {
+            val = m[5, "length"] ? substr(rest, m[5, "start"], m[5, "length"]) : ""
             if (val ~ /^(yes|no)\)?$/) { s = s substr(rest, 1, RSTART + RLENGTH - 1) }
-            else { s = s substr(rest, 1, m[4, "start"] - 1) "<secret>" }
+            else { s = s substr(rest, 1, m[5, "start"] - 1) "<secret>" }
             rest = substr(rest, RSTART + RLENGTH)
         }
         s = s rest
@@ -1288,15 +1297,25 @@ _report_redact() {
         # SQL: IDENTIFIED BY 'x', IDENTIFIED WITH plugin BY|AS 'x'.
         s = gensub(/(\<identified[ \t]+(with[ \t]+[^ \t]+[ \t]+)?(by|as)[ \t]+)("([^"\\]|\\.)*"|\047([^\047\\]|\\.|\047\047)*\047|[^ \t"\047,;]+)/, "\\1<secret>", "g", s)
         if (match(s, /\<sshpass\>/))
-            s = substr(s, 1, RSTART + RLENGTH - 1) gensub(/([ \t]-p[ \t]*)[^ \t]+/, "\\1<secret>", "g", substr(s, RSTART + RLENGTH))
+            s = substr(s, 1, RSTART + RLENGTH - 1) gensub(/([ \t]-p[ \t]*)("([^"\\]|\\.)*"|\047([^\047\\]|\\.|\047\047)*\047|[^ \t]+)/, "\\1<secret>", "g", substr(s, RSTART + RLENGTH))
         # mysql / mariadb -pSECRET: every -p after the client name.
         if (match(s, /\<(mysql|mariadb)[a-z-]*\>/))
-            s = substr(s, 1, RSTART + RLENGTH - 1) gensub(/([ \t]-p)[^ \t]+/, "\\1<secret>", "g", substr(s, RSTART + RLENGTH))
+            s = substr(s, 1, RSTART + RLENGTH - 1) gensub(/([ \t]-p)("([^"\\]|\\.)*"|\047([^\047\\]|\\.|\047\047)*\047|[^ \t]+)/, "\\1<secret>", "g", substr(s, RSTART + RLENGTH))
         IGNORECASE = 0
         s = emails(s)
         s = scan(s, "([0-9A-Fa-f]{0,4}:){2,7}([0-9]{1,3}(\\.[0-9]{1,3}){3}|[0-9A-Fa-f]{1,4})?(%[0-9A-Za-z_.-]+)?", "v6", "<ip>")
         s = scan(s, "[0-9]{1,3}(\\.[0-9]{1,3}){3}", "v4", "<ip>")
+        # "Use correlation ID <uuid>": set aside from the token rule (the UUID
+        # bolt-cli logs a failure under, no secret).
+        ncid = 0
+        IGNORECASE = 1
+        while (match(s, /(correlation[ _-]?id:?[ \t]+)([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})/, m)) {
+            cid[++ncid] = m[2]
+            s = substr(s, 1, RSTART - 1) m[1] "\001" ncid "\001" substr(s, RSTART + RLENGTH)
+        }
+        IGNORECASE = 0
         s = scan(s, "[A-Za-z0-9_-]{32,}|[A-Za-z0-9+\\/]{40,}={0,2}", "tok", "<secret>")
+        for (k = 1; k <= ncid; k++) sub("\001" k "\001", cid[k], s)
         s = gensub(/^([A-Z][a-z][a-z] [ 0-9][0-9] [0-9][0-9]:[0-9][0-9]:[0-9][0-9] |[0-9]{4}-[0-9][0-9]-[0-9][0-9]T[0-9:.+-]+Z? )[^ \t\[]+/, "\\1<host>", 1, s)
         IGNORECASE = 1
         s = gensub(/\<((static |transient |pretty )?host ?name["\047]?[ \t]*[:=][ \t]*)[^ \t"\047,;]+/, "\\1<host>", "g", s)
@@ -1396,6 +1415,12 @@ _report_excerpt_cut() {
 # whose output cannot be redacted (no gawk, an error) is sent without output.
 _report_errors_json() {
     local final_rc="$1" order="" s priv file out rc entry json="" left=$REPORT_EXCERPTS_BYTES n=0 limit LC_ALL=C
+    # All of it within the final wait less 2 s (each bounded call may run
+    # 1 s past its own limit, and the send needs a moment): steps reached
+    # after that go without output. The flush takes the time used off its wait.
+    local started=$REPORT_FINISH_START time_left REPORT_CALL_TIMEOUT=$REPORT_CALL_TIMEOUT
+    ((started > 0)) || started=$(_report_now_ms)
+    local deadline=$((started + REPORT_FINAL_WAIT * 1000 - 2000))
     [[ -n "$REPORT_ERR_ORDER" ]] || return 0
     if [[ -n "$REPORT_FAILED_STEP" ]] && _report_in_list "$REPORT_FAILED_STEP" "$REPORT_ERR_ORDER"; then order="$REPORT_FAILED_STEP"; fi
     for s in $REPORT_ERR_ORDER; do
@@ -1403,6 +1428,7 @@ _report_errors_json() {
     done
     for s in $REPORT_ERR_ORDER; do _report_in_list "$s" "$order" || order+="${order:+ }$s"; done
     priv=""
+    REPORT_CALL_TIMEOUT=1
     if [[ -n "$REPORT_CAPTURE_DIR" ]] && priv=$(mktemp "$REPORT_CAPTURE_DIR/private.XXXXXX" 2>/dev/null); then
         _report_private_values >"$priv" 2>/dev/null || priv=""
     fi
@@ -1413,7 +1439,10 @@ _report_errors_json() {
         ((left < limit)) && limit=$left
         out=""
         file="${REPORT_ERR_FILE[$s]:-}"
-        if [[ -n "$priv" && -n "$file" && -s "$file" ]] && ((limit > 0)); then
+        time_left=$((deadline - $(_report_now_ms)))
+        REPORT_CALL_TIMEOUT=$((time_left / 1000))
+        _report_step_sends_output "$s" || file=""
+        if [[ -n "$priv" && -n "$file" && -s "$file" ]] && ((limit > 0 && REPORT_CALL_TIMEOUT >= 1)); then
             if out=$(_report_excerpt_clean "$file" | _report_redact "$priv"); then
                 out=$(printf '%s\n' "$out" | _report_excerpt_cut "$limit")
             else

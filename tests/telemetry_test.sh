@@ -1500,6 +1500,40 @@ check "limits: a step past the 6 KB budget is listed without output" jq -e '.err
 check "limits: no cut-off line from the budget" jq -e 'all(.errors[]; .output == "" or (.output | test("^(line|final|[a-z_0-9]+ failed)")))' <<<"$fin"
 check "limits: event body fits the receiver's 16 KB" test "$(jq -c . <<<"$fin" | wc -c)" -le 16384
 
+# Stage 1 refusals send no output: their reason code says why, and what
+# they print names local users, home directories and arguments.
+child excerpt_stage1 '
+ADMIN_EMAIL=owner@customer-mail.org
+report_init
+report_step_start parse_arguments
+echo "user jkowalski (uid 1001) has files in /home/shop.example-customer.pl"
+report_fail parse_arguments invalid_argument
+ss() { printf "tcp LISTEN 0 128 0.0.0.0:8443 0.0.0.0:* users:((\"httpd\",pid=1,fd=3))\n"; }
+check_port_8443'
+fin=$(event install_finished)
+eq "Stage 1 refusals: listed, without output" "parse_arguments||check_port_8443|" "$(jq -r '[.errors[] | "\(.step)|\(.output)"] | join("|")' <<<"$fin")"
+check "Stage 1 refusals: still printed on the terminal" grep -q 'jkowalski' "$CHILD_DIR/out"
+
+# One deadline for all the excerpts: slow redaction of 20 failed steps with a
+# hanging receiver still ends within the 5 s final wait; later steps go
+# without output.
+new_child excerpt_deadline '
+_report_redact() { sleep 1; cat >/dev/null; echo redacted; }
+report_init
+report_stage_begin configuration
+for s in greeting rspamd mlmmj vsftpd disk_quota fail2ban ssh_profiles postfix_profiles dovecot_profiles redis_profiles \
+    rspamd_profiles system_email dns_template vsftpd_profile fail2ban_profile cron_jobs hidepid rspamd_restart app_git app_metrics; do
+    run_or_warn "echo $s failed; false" "$s" "$s"
+done
+report_stage_end
+exit 1'
+echo 30 >"$CHILD_DIR/fake/curl_sleep"
+timed_child
+check "slow redaction of 20 steps, receiver hangs: within the final wait (took ${ELAPSED}s)" awk -v e="$ELAPSED" 'BEGIN { exit !(e < 6.2) }'
+fin=$(event install_finished)
+check "slow redaction: the first steps have output, the rest none" jq -e '(.errors | length) == 20 and .errors[0].output == "redacted" and .errors[19].output == ""' <<<"$fin"
+while read -r pid; do kill "$pid" 2>/dev/null; done <"$CHILD_DIR/fake/pids"
+
 child excerpt_scriptlet '
 report_init
 report_stage_begin packages
