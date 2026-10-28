@@ -87,27 +87,6 @@ for component in $OPTIONAL_COMPONENTS; do
     done
 done
 
-# The commands printed for adding a component later are Stage 3's own, word
-# for word (the apps loop with the app filled in), and the README lists the same.
-stage3_expanded=$(sed -e "s#\${WEB_INSTALL_ROOT}#${WEB_INSTALL_ROOT}#g" <<<"$stage3")
-readme="$(dirname "$INSTALL_SH")/README.md"
-for component in $OPTIONAL_COMPONENTS; do
-    n=0
-    while IFS= read -r command; do
-        n=$((n + 1))
-        case "$command" in
-            *--app-name=*) check "$component: '$command' is the apps loop's command" grep -qF -- "${command%--app-name=*}--app-name=\${app}" <<<"$stage3_expanded" ;;
-            *) check "$component: '$command' is in Stage 3" grep -qF -- "\"$command\"" <<<"$stage3_expanded" ;;
-        esac
-        check "$component: '$command' is in the README" grep -qF -- "\`$command\`" "$readme"
-    done < <(component_install_commands "$component")
-    check "$component: has commands for adding it later" test "$n" -gt 0
-done
-# Each step of a component has its command in the list (the list is not short of one).
-eq "mail: one command per step" "$(component_steps mail | wc -w)" "$(component_install_commands mail | wc -l)"
-eq "dns: one command per step" "$(component_steps dns | wc -w)" "$(component_install_commands dns | wc -l)"
-eq "ftp: one command per step" "$(component_steps ftp | wc -w)" "$(component_install_commands ftp | wc -l)"
-
 # ---------------------------------------------------------------------------
 echo "# Stage 3 with everything installed"
 # ---------------------------------------------------------------------------
@@ -141,9 +120,19 @@ check "each skipped step says why" grep -q '^.*Postfix: skipped (--without=mail)
 check "PowerDNS skipped for dns" grep -q 'PowerDNS: skipped (--without=dns)' "$CHILD_DIR/out"
 check "vsftpd skipped for ftp" grep -q 'Vsftpd: skipped (--without=ftp)' "$CHILD_DIR/out"
 check "the end of the install lists what was left out" grep -q 'Left out at your request (--without)' "$CHILD_DIR/out"
-check "and how to add mail later" grep -qx '    bolt-cli manage-postfix-profiles --action=install' "$CHILD_DIR/out"
-check "and DNS" grep -qx '    bolt-cli manage-powerdns --action=install' "$CHILD_DIR/out"
-check "and FTP" grep -qx '    bolt-cli manage-vsftpd-profiles --action=install' "$CHILD_DIR/out"
+# Nothing of a left-out component ran, including a step added to Stage 3
+# later but not to component_steps.
+check "no mail, DNS or FTP command ran" bash -c "! grep -Ei 'postfix|dovecot|rspamd|mlmmj|roundcube|system-email|powerdns|pdns|vsftpd|ftp' '$CHILD_DIR/calls'"
+# The commands printed for adding each component later are the ones skipped,
+# in Stage 3 order, and the README lists the same ones in the same order.
+printed() { sed -n "/^  $1:\$/,/^  [a-z]*:\$\|^\$/p" "$CHILD_DIR/out" | sed -n 's/^    //p'; }
+readme_listed() { grep -E "^- \`$1\`: " "$(dirname "$INSTALL_SH")/README.md" | sed -e "s/^- \`$1\`: //" -e 's/`, `/\n/g' -e 's/`//g'; }
+eq "mail: one printed command per skipped step" 10 "$(printed mail | wc -l)"
+check "mail: printed in Stage 3 order" diff <(printed mail) <(printf '%s\n' "bolt-cli manage-postfix --action=install" "bolt-cli manage-dovecot --action=install" "bolt-cli manage-rspamd --action=install" "bolt-cli manage-mlmmj --action=install" "bolt-php /usr/local/bolt/web/artisan bolt:manage-app --action=install --app-name=roundcube" "bolt-cli manage-postfix-profiles --action=install" "bolt-cli manage-dovecot-profiles --action=install" "bolt-cli manage-rspamd-profiles --action=install" "bolt-cli manage-system-email-account --action=install" "systemctl restart rspamd")
+for component in mail dns ftp; do
+    check "$component: some commands printed" test -n "$(printed $component)"
+    check "$component: the README lists the printed commands" diff <(printed $component) <(readme_listed $component)
+done
 
 child stage-ftp 'LEFT_OUT_COMPONENTS="ftp"; stage_configuration'
 check "without ftp only: Postfix still installed" ran "manage-postfix --action=install"
@@ -168,7 +157,7 @@ child main-twice "$stub"$'\n''main --without=dns --without=mail'
 check "--without can be given twice" grep -qx 'LEFT=\[mail dns\]' "$CHILD_DIR/out"
 child main-none "$stub"$'\n''main'
 check "without the option nothing is left out" grep -qx 'LEFT=\[\]' "$CHILD_DIR/out"
-for bad in "--without=" "--without=bogus" "--without=mail,web" "--without= --without=mail" "--without mail" "--without=mail --without"; do
+for bad in "--without=" "--without=bogus" "--without=mail,web" "--without= --without=mail" "--without mail" "--without=mail --without" "--without-mail" "--Without=mail" "--WITHOUT=dns"; do
     # shellcheck disable=SC2086
     child main-bad "$stub"$'\n'"main $bad"
     eq "refused: $bad (exit 1)" 1 "$CHILD_RC"

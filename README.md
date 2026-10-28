@@ -68,15 +68,15 @@ Everything is installed by default. On a server with little memory, `--without=`
 sudo ./install.sh --without=mail,dns,ftp
 ```
 
-Anything else in the value stops the install before it changes anything. The skipped steps are listed as skipped, the end of the install lists what was left out, and the choice is kept in `/etc/bolt/bolt-config.ini` as `BOLT_INSTALL_WITHOUT` (empty when nothing was left out). The install report does not count a left-out step as failed.
+Anything else in the value stops the install before it changes anything. The skipped steps are listed as skipped, the end of the install lists what was left out, and the choice is kept in `/etc/bolt/bolt-config.ini` as `BOLT_INSTALL_WITHOUT` (empty when nothing was left out). It records what was asked for, not what is installed: run again with `--without=mail` on a server that already has mail, the key says mail although Postfix and Dovecot stay. The install report does not count a left-out step as failed.
 
-The panel shows every left-out service as not installed on Health > Services. Install there sets up the package only, not the profiles that make it serve, so a component is added later with the same commands the installer runs, as root, in this order (the end of the install prints them too):
+The panel shows every left-out service as not installed on Health > Services. Install there sets up the package only, not the profiles that make it serve, so a component is added later with the commands the installer skipped, as root, in this order (the end of the install prints them):
 
 - `mail`: `bolt-cli manage-postfix --action=install`, `bolt-cli manage-dovecot --action=install`, `bolt-cli manage-rspamd --action=install`, `bolt-cli manage-mlmmj --action=install`, `bolt-php /usr/local/bolt/web/artisan bolt:manage-app --action=install --app-name=roundcube`, `bolt-cli manage-postfix-profiles --action=install`, `bolt-cli manage-dovecot-profiles --action=install`, `bolt-cli manage-rspamd-profiles --action=install`, `bolt-cli manage-system-email-account --action=install`, `systemctl restart rspamd`
 - `dns`: `bolt-cli manage-powerdns --action=install`
 - `ftp`: `bolt-cli manage-vsftpd --action=install`, `bolt-cli manage-vsftpd-profiles --action=install`
 
-The panel does not hide left-out components yet: Health shows Postfix, Dovecot, Rspamd and PowerDNS as not installed, with a warning; the default DNS template still adds the mail records (MX, SPF, DMARC, webmail) to new domains; creating a mailbox or an FTP account ends with a message that the server could not do it; a hostname change ends with a warning for the mail steps.
+The panel does not read `BOLT_INSTALL_WITHOUT` yet and does not hide left-out components: Health shows Postfix, Dovecot, Rspamd and PowerDNS as not installed, with a warning; the default DNS template still adds the mail records (MX, SPF, DMARC, webmail) to new domains; creating a mailbox or an FTP account ends with a message that the server could not do it; a hostname change ends with a warning for the mail steps. The firewall still opens the mail, DNS and FTP ports, with nothing listening on them.
 
 PHP 8.4, Apache, MariaDB, Redis, nftables and SSH are always installed: the panel and the hosting accounts need them. So is Fail2Ban, which protects SSH and the panel login. Antivirus (ImunifyAV, Imunify360, cPGuard) is never installed by the installer; it is a module added in the panel.
 

@@ -32,6 +32,8 @@ WITHOUT_ARG=""
 WITHOUT_GIVEN=0
 # Components left out, in the order of OPTIONAL_COMPONENTS (set by set_left_out_components).
 LEFT_OUT_COMPONENTS=""
+# "<component> <command>" for every step skipped for them, in the order Stage 3 reached it.
+SKIPPED_COMMANDS=()
 readonly WEB_INSTALL_ROOT="/usr/local/bolt/web"
 readonly POST_INSTALL_DB_PATH="/var/lib/adminbolt/db.sqlite3"
 
@@ -1181,7 +1183,8 @@ install_packages() {
 # panel computes each service's Installed state on the server, so every
 # skipped service shows as not installed on Health > Services. Install there
 # sets up the package only, not its profiles, so the end of the install
-# prints the commands that add a component later (component_install_commands).
+# prints the skipped commands themselves: run in that order, they add the
+# component later.
 # ---------------------------------------------------------------------------
 readonly OPTIONAL_COMPONENTS="mail dns ftp"
 
@@ -1200,23 +1203,6 @@ component_description() {
         mail) echo "mail: Postfix, Dovecot, Rspamd (spam filter), MLMMJ (mailing lists), Roundcube webmail and the system e-mail account - no mailboxes or webmail, and the panel's own e-mail (alerts, password resets) is not sent" ;;
         dns) echo "dns: PowerDNS - the server answers no DNS queries, so domains need DNS hosted elsewhere" ;;
         ftp) echo "ftp: vsftpd - no FTP accounts; files can still be managed in the panel's file manager" ;;
-    esac
-}
-
-# The Stage 3 commands that add a left-out component later, in the order
-# Stage 3 runs them. tests/components_test.sh checks that each one is in
-# stage_configuration word for word, so the two cannot drift apart.
-component_install_commands() {
-    case "$1" in
-        mail)
-            printf '%s\n' "bolt-cli manage-postfix --action=install" "bolt-cli manage-dovecot --action=install" \
-                "bolt-cli manage-rspamd --action=install" "bolt-cli manage-mlmmj --action=install" \
-                "bolt-php ${WEB_INSTALL_ROOT}/artisan bolt:manage-app --action=install --app-name=roundcube" \
-                "bolt-cli manage-postfix-profiles --action=install" "bolt-cli manage-dovecot-profiles --action=install" \
-                "bolt-cli manage-rspamd-profiles --action=install" "bolt-cli manage-system-email-account --action=install" \
-                "systemctl restart rspamd" ;;
-        dns) printf '%s\n' "bolt-cli manage-powerdns --action=install" ;;
-        ftp) printf '%s\n' "bolt-cli manage-vsftpd --action=install" "bolt-cli manage-vsftpd-profiles --action=install" ;;
     esac
 }
 
@@ -1247,7 +1233,6 @@ set_left_out_components() {
 # step is to run.
 left_out_component_of_step() {
     local step="$1" component
-    [[ -n "$step" ]] || return 1
     for component in $LEFT_OUT_COMPONENTS; do
         if _report_in_list "$step" "$(component_steps "$component")"; then
             printf '%s' "$component"
@@ -1257,10 +1242,12 @@ left_out_component_of_step() {
     return 1
 }
 
-# Returns 0 (after saying so) when the step belongs to a left-out component.
+# Returns 0 (after saying so, and keeping the command for the end of the
+# install) when the step belongs to a left-out component.
 skip_left_out_step() {
-    local step="$1" desc="$2" component
+    local step="$1" desc="$2" cmd="$3" component
     component=$(left_out_component_of_step "$step") || return 1
+    SKIPPED_COMMANDS+=("$component $cmd")
     print_info "${desc}: skipped (--without=${component})"
     echo -e ""
     return 0
@@ -1283,10 +1270,13 @@ print_left_out_components() {
     for component in $LEFT_OUT_COMPONENTS; do
         echo "  - $(component_description "$component")"
     done
-    echo "To add one later, run its commands as root, in this order:"
+    echo "To add one later, run the commands skipped for it as root, in this order:"
+    local entry
     for component in $LEFT_OUT_COMPONENTS; do
         echo "  ${component}:"
-        component_install_commands "$component" | sed 's/^/    /'
+        for entry in "${SKIPPED_COMMANDS[@]}"; do
+            [[ "${entry%% *}" == "$component" ]] && echo "    ${entry#* }"
+        done
     done
     echo -e ""
 }
@@ -1294,7 +1284,7 @@ print_left_out_components() {
 # $3 (optional) = step id for the install report.
 run_or_warn() {
     local cmd="$1" desc="${2:-Command}" step="${3:-}"
-    skip_left_out_step "$step" "$desc" && return 0
+    skip_left_out_step "$step" "$desc" "$cmd" && return 0
     print_info "$desc"
     report_step_start "$step"
     if eval "$cmd"; then print_success "$desc completed"; report_step_result "$step" ok; else echo -e "${YELLOW}WARNING:${NC} $desc failed (continuing)"; report_step_result "$step" failed; fi
@@ -1302,7 +1292,7 @@ run_or_warn() {
 }
 run_or_fail() {
     local cmd="$1" desc="${2:-Command}" step="${3:-}"
-    skip_left_out_step "$step" "$desc" && return 0
+    skip_left_out_step "$step" "$desc" "$cmd" && return 0
     report_step_start "$step"
     if ! eval "$cmd"; then print_error "${desc} failed"; report_fail "$step"; exit 1; fi
     report_step_result "$step" ok
@@ -1607,7 +1597,7 @@ print_usage() {
     for component in $OPTIONAL_COMPONENTS; do
         echo "  $(component_description "$component")"
     done
-    echo "  The end of the install prints the commands that add a left-out component later."
+    echo "  The end of the install prints the skipped commands, which add a left-out component later."
     echo "--channel names what started the install (${REPORT_CHANNELS// /, }); default direct."
     echo "The installer reports its progress and result (no hostnames, e-mail addresses or passwords) to AdminBolt; --no-telemetry (or ADMINBOLT_NO_TELEMETRY=1) turns this off for the installer and the panel."
 }
@@ -1637,9 +1627,10 @@ main() {
                 WITHOUT_ARG+="${arg#--without=}"
                 WITHOUT_GIVEN=1
                 ;;
-            --without)
-                # "--without mail" would otherwise install everything without
-                # a word: the value goes in the same argument, after "=".
+            --[Ww][Ii][Tt][Hh][Oo][Uu][Tt]*)
+                # "--without mail", "--without-mail" or "--Without=mail" would
+                # otherwise install everything without a word: the value goes
+                # in the same argument, after "--without=".
                 ((WITHOUT_GIVEN)) && WITHOUT_ARG+=","
                 WITHOUT_GIVEN=1
                 ;;
