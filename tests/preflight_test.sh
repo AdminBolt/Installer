@@ -411,6 +411,50 @@ has "tar fails: says so" "The backup failed (tar exit 2)" "$OUT"
 hasnt "tar fails: install stops" PASSED "$OUT"
 eq "tar fails: no partial backup left" 0 "$(find "$S/root" -mindepth 1 -maxdepth 1 -name 'adminbolt-preinstall-backup-*' | wc -l)"
 
+# Stock Hetzner AlmaLinux/Rocky 9 images have no tar: the backup installs
+# what it lacks first. $T/notar is a PATH with every command but tar; the fake
+# dnf logs its arguments and, unless told to fail, "installs" tar into it.
+mkdir -p "$T/notar"
+real_tar=$(type -P tar)
+for f in /usr/bin/* /bin/*; do
+    [[ -x "$f" && "${f##*/}" != tar && ! -e "$T/notar/${f##*/}" ]] && ln -s "$f" "$T/notar/${f##*/}"
+done
+notar() { # $1 = fake dnf exit code; then the rest of the script
+    local dnf_rc=$1
+    shift
+    rm -f "$T/notar/tar"
+    run "PATH='$T/notar'; dnf() { echo \"dnf \$*\" >>\"\$F/dnf.log\"; [[ $dnf_rc == 0 ]] && ln -s '$real_tar' '$T/notar/tar'; return $dnf_rc; }; $*"
+}
+
+in_use backup_no_tar
+notar 0 'backup_existing_configuration; echo "DIR=$PREINSTALL_BACKUP_DIR"; echo PASSED'
+eq "no tar: backup goes on" 0 "$RC"
+eq "no tar: installs only tar, with dnf" "install -y tar" "$(sed 's/^dnf //' "$S/fake/dnf.log" 2>/dev/null)"
+has "no tar: says what it installs" "Installing tar for the backup" "$OUT"
+dir=$(sed -n 's/^DIR=//p' <<<"$OUT")
+mkdir -p "$S/restore"
+tar -xzpf "$dir/files.tar.gz" -C "$S/restore" 2>/dev/null
+eq "no tar: the site file is in the backup" "<h1>my site</h1>" "$(cat "$S/restore$S/var/www/html/index.html" 2>/dev/null)"
+has "no tar: install goes on" PASSED "$OUT"
+
+new_server backup_no_tar_dnf_fails
+notar 1 'set +e; backup_existing_configuration; echo PASSED'
+stops_at_once "no tar, dnf fails"
+eq "no tar, dnf fails: exit 1" 1 "$RC"
+has "no tar, dnf fails: says what is missing and what to do" "The backup needs tar, and installing it with dnf failed" "$OUT"
+has "no tar, dnf fails: reported as preinstall_backup" "STEP=preinstall_backup" "$OUT"
+eq "no tar, dnf fails: no backup directory left" 0 "$(find "$S/root" -mindepth 1 -maxdepth 1 -name 'adminbolt-preinstall-backup-*' | wc -l)"
+
+new_server backup_no_tar_not_installed
+notar 0 'set +e; dnf() { echo "dnf $*" >>"$F/dnf.log"; return 0; }; backup_existing_configuration; echo PASSED'
+stops_at_once "no tar, dnf succeeds without it"
+has "no tar, dnf succeeds without it: says tar is still missing" "The backup needs tar, which is still not there" "$OUT"
+
+new_server backup_has_tar
+run 'dnf() { echo "dnf $*" >>"$F/dnf.log"; return 1; }; backup_existing_configuration; echo PASSED'
+has "tar present: backup goes on" PASSED "$OUT"
+eq "tar present: dnf is not run" 0 "$(cat "$S/fake/dnf.log" 2>/dev/null | wc -l)"
+
 echo
 echo "# passed: $PASS, failed: $FAIL"
 ((FAIL == 0))

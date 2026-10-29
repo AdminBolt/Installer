@@ -1274,6 +1274,27 @@ _backup_abort() {
     exit 1
 }
 
+# The backup runs before Stage 2 installs the base packages, and some stock
+# AlmaLinux/Rocky 9 images (Hetzner's) have no tar. Only what is missing is
+# installed, so a server that has both is left as it was.
+_backup_install_archivers() {
+    local tool missing=() pm
+    for tool in tar gzip; do
+        command -v "$tool" >/dev/null 2>&1 || missing+=("$tool")
+    done
+    ((${#missing[@]} == 0)) && return 0
+    if command -v dnf >/dev/null 2>&1; then pm=dnf
+    elif command -v yum >/dev/null 2>&1; then pm=yum
+    else _backup_abort "" "The backup needs ${missing[*]}, which is not installed, and there is no dnf or yum to install it"
+    fi
+    print_info "Installing ${missing[*]} for the backup"
+    "$pm" install -y "${missing[@]}" \
+        || _backup_abort "" "The backup needs ${missing[*]}, and installing it with ${pm} failed (see ${pm}'s output above). Install it and run the installer again."
+    for tool in "${missing[@]}"; do
+        command -v "$tool" >/dev/null 2>&1 || _backup_abort "" "The backup needs ${tool}, which is still not there after ${pm} install"
+    done
+}
+
 # --force-existing-server: copies BACKUP_PATHS, the firewall's live ruleset
 # and the SELinux mode into a new root-only directory before anything is
 # installed, with a checksum list that install_report_replaced_files compares
@@ -1281,6 +1302,7 @@ _backup_abort() {
 backup_existing_configuration() {
     local dir list path need avail rc umask_before
     report_step_start preinstall_backup
+    _backup_install_archivers
     dir="${BACKUP_PARENT}/adminbolt-preinstall-backup-$(date +%Y%m%d-%H%M%S)"
     # Everything in it is root-only: /etc holds password hashes and keys.
     umask_before=$(umask)
