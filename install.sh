@@ -25,6 +25,8 @@ BOLT_SOURCE=""
 # E-mail for the trial license; empty = skip the trial request (activate manually on the License page).
 ADMIN_EMAIL=""
 MARIADB_SERIES=""
+# --force-existing-server: install on a server that is already in use (see check_existing_server).
+FORCE_EXISTING_SERVER=0
 readonly WEB_INSTALL_ROOT="/usr/local/bolt/web"
 readonly POST_INSTALL_DB_PATH="/var/lib/adminbolt/db.sqlite3"
 
@@ -147,12 +149,12 @@ REPORT_REPO_UNREACHABLE=0
 INSTALL_MARKER_CREATED=0
 
 REPORT_CHANNELS="direct get-script web-installer vultr akamai node image-build test hostinger digitalocean aws azure"
-REPORT_REASONS="not_root unsupported_os invalid_argument missing_command port_in_use repo_download_failed package_install_failed agent_install_failed panel_scriptlet_failed agent_panel_connect_failed required_step_failed readiness_check_failed interrupted unclassified"
+REPORT_REASONS="not_root unsupported_os invalid_argument missing_command port_in_use existing_server repo_download_failed package_install_failed agent_install_failed panel_scriptlet_failed agent_panel_connect_failed required_step_failed readiness_check_failed interrupted unclassified"
 
 # required | optional | unknown
 report_step_class() {
     case "$1" in
-        check_root|check_os|check_commands|check_port_8443|parse_arguments) echo required ;;
+        check_root|check_os|check_commands|check_port_8443|check_existing_server|preinstall_backup|parse_arguments) echo required ;;
         repo_setup|prerequisite_packages|agent_install|agent_scriptlet|panel_install|panel_scriptlet|web_services_enable) echo required ;;
         agent_panel_connect|nftables|ssh_server|powerdns|mariadb|postfix|dovecot|redis|php84|myapache) echo required ;;
         firewall_setup|mariadb_profile|myapache_profile|php84_profile|postinstall_queue|readiness) echo required ;;
@@ -171,6 +173,7 @@ report_reason_for_step() {
         check_os) echo unsupported_os ;;
         check_commands) echo missing_command ;;
         check_port_8443) echo port_in_use ;;
+        check_existing_server) echo existing_server ;;
         parse_arguments) echo invalid_argument ;;
         repo_setup) echo repo_download_failed ;;
         prerequisite_packages|panel_install) echo package_install_failed ;;
@@ -692,6 +695,11 @@ report_on_exit() {
     trap '' PIPE INT TERM HUP
     set +e
     if ((INSTALL_MARKER_CREATED)); then rm -f "$REPORT_MARKER"; fi
+    # A failed install with --force-existing-server: the backup path again,
+    # since the install never reaches the summary that names it.
+    if ((rc != 0)) && [[ -n "$PREINSTALL_BACKUP_DIR" ]]; then
+        echo "The configuration from before this install is in ${PREINSTALL_BACKUP_DIR} (see README.txt there)." >&2
+    fi
     REPORT_FINISH_START=$(_report_now_ms)
     [[ "$REPORT_MODE" == off ]] || _report_finish "$rc" </dev/null >/dev/null 2>&1
     if [[ -n "$REPORT_SIGNAL" ]]; then
@@ -1016,6 +1024,365 @@ check_port_8443() {
     exit 1
 }
 
+# ---------- Existing server check (Stage 1) ----------
+#
+# The install sets up its own web, mail, DNS, database and firewall stack:
+# whole configuration files are written over, SELinux is switched off and the
+# firewall is replaced. On a server that already runs something of the kind
+# that breaks it without a warning, so the install stops there, lists what
+# it found and what it would replace, and goes on only with
+# --force-existing-server, after backup_existing_configuration.
+#
+# A fresh AlmaLinux 9 / Rocky Linux 9 cloud image must pass. Checked on
+# Vultr's: they run firewalld with its default zone (ssh, dhcpv6-client,
+# cockpit) and have a cloud user (uid 1000) whose home holds only the
+# skeleton files, ~/.ssh and a tool cache. None of that counts.
+EXISTING_PACKAGES="httpd nginx lighttpd caddy haproxy postfix sendmail exim dovecot bind pdns vsftpd redis mariadb-server MariaDB-server mysql-server community-mysql-server mysql-community-server percona-server-server postgresql-server"
+EXISTING_UNITS="httpd nginx lighttpd caddy haproxy postfix sendmail exim dovecot named pdns vsftpd redis mariadb mysqld postgresql"
+EXISTING_PORTS="21 25 53 80 110 143 443 465 587 993 995 3306 5432"
+# Services an image's firewalld allows by itself in its default zone.
+FIREWALLD_IMAGE_SERVICES="ssh dhcpv6-client cockpit"
+# What in a home is not its owner's data: the skeleton and these files at
+# the top level, and these directories (keys and tool caches) as a whole.
+HOME_IGNORED_FILES=".bash_history .lesshst .viminfo .python_history .wget-hsts .sudo_as_admin_successful .cloud-locale-test.skip"
+HOME_IGNORED_DIRS=".ssh .cache .ansible"
+EXISTING_HOME_DIR="/home"
+EXISTING_WWW_DIR="/var/www"
+EXISTING_DATABASE_DIRS="/var/lib/mysql /var/lib/pgsql/data"
+EXISTING_SKEL_DIR="/etc/skel"
+EXISTING_PASSWD="/etc/passwd"
+SELINUX_CONFIG="/etc/selinux/config"
+# --force-existing-server: what is copied before the install, and where to.
+# /etc holds every configuration file the install writes over, the rest are
+# the few it writes elsewhere. Site files and databases are not copied.
+BACKUP_PATHS="/etc /var/spool/cron /root/.my.cnf /usr/bin/mlmmj-make-ml.sh /var/www/html/index.html /var/www/html/index.php"
+BACKUP_PARENT="/root"
+PREINSTALL_BACKUP_DIR=""
+# Set by check_existing_server when bolt-agent or bolt-panel is installed.
+ADMINBOLT_ALREADY_INSTALLED=0
+
+# Names of the packages in EXISTING_PACKAGES that are installed.
+_existing_packages() {
+    local name
+    # A missing package is a "package X is not installed" line, never a name.
+    rpm -q --qf '%{NAME}\n' $EXISTING_PACKAGES 2>/dev/null | while read -r name; do
+        if _report_in_list "$name" "$EXISTING_PACKAGES"; then echo "$name"; fi
+    done
+    return 0
+}
+
+# Running units of EXISTING_UNITS, each once: mysqld is an alias of mariadb.
+_existing_running_units() {
+    local unit id seen=" "
+    command -v systemctl >/dev/null 2>&1 || return 0
+    for unit in $EXISTING_UNITS; do
+        systemctl is-active --quiet "$unit" 2>/dev/null || continue
+        id=$(systemctl show -p Id --value "$unit" 2>/dev/null)
+        id="${id:-$unit.service}"
+        [[ "$seen" != *" $id "* ]] || continue
+        seen+="$id "
+        echo "$unit"
+    done
+    return 0
+}
+
+# "<port> <process>" for each port in EXISTING_PORTS something listens on.
+# TCP only: a DNS server on UDP 53 is found by its package or unit.
+_existing_listeners() {
+    command -v ss >/dev/null 2>&1 || return 0
+    ss -Htlnp 2>/dev/null | awk -v ports=" $EXISTING_PORTS " '{
+        port = $4; sub(/.*:/, "", port)
+        if (index(ports, " " port " ") == 0) next
+        proc = "an unknown process"
+        if (match($0, /\(\("[^"]+"/)) proc = substr($0, RSTART + 3, RLENGTH - 4)
+        print port " " proc
+    }' | sort -n -u -k1,1
+    return 0
+}
+
+# nftables tables firewalld did not create ("<family> <name>").
+_existing_nft_tables() {
+    command -v nft >/dev/null 2>&1 || return 0
+    nft list tables 2>/dev/null | awk '$1 == "table" && $3 != "firewalld" { print $2 " " $3 }'
+    return 0
+}
+
+# What a running firewalld allows beyond an image's default zone.
+_existing_firewalld_rules() {
+    local zone service extra list opt
+    command -v firewall-cmd >/dev/null 2>&1 || return 0
+    firewall-cmd --state >/dev/null 2>&1 || return 0
+    # The default zone too: with no interface bound to it, it is not "active".
+    for zone in $( { firewall-cmd --get-default-zone; firewall-cmd --get-active-zones; } 2>/dev/null | awk '/^[A-Za-z0-9_-]+$/ && !seen[$0]++'); do
+        extra=""
+        for service in $(firewall-cmd --zone="$zone" --list-services 2>/dev/null); do
+            _report_in_list "$service" "$FIREWALLD_IMAGE_SERVICES" || extra+=" $service"
+        done
+        [[ -z "$extra" ]] || echo "zone ${zone} allows the services${extra}"
+        for opt in ports source-ports forward-ports protocols sources; do
+            list=$(firewall-cmd --zone="$zone" --list-"$opt" 2>/dev/null | tr '\n' ' ')
+            list="${list% }"
+            [[ -z "$list" ]] || echo "zone ${zone} ${opt}: ${list}"
+        done
+        list=$(firewall-cmd --zone="$zone" --list-rich-rules 2>/dev/null | grep -c . || true)
+        ((list == 0)) || echo "zone ${zone} has ${list} rich rule(s)"
+    done
+    list=$(firewall-cmd --direct --get-all-rules 2>/dev/null | grep -c . || true)
+    ((list == 0)) || echo "${list} direct rule(s)"
+    return 0
+}
+
+# The installer's own copy is not anyone's data: a sudo user downloads
+# install.sh into, or clones the repository under, their own home. Prints
+# the clone's directory, or the file itself. Read from a pipe, there is no
+# such file in a home to leave out.
+_installer_own_path() {
+    local src="${BASH_SOURCE[0]:-}" dir
+    [[ -n "$src" && -f "$src" ]] || return 0
+    src=$(realpath -- "$src" 2>/dev/null) || return 0
+    dir="${src%/*}"
+    if [[ -e "$dir/.git" ]]; then echo "$dir"; else echo "$src"; fi
+}
+
+# A path as a find -path pattern that matches only itself.
+_find_literal() { printf '%s' "$1" | sed 's/[][*?\\]/\\&/g'; }
+
+# Prints the first file under home directory $1 that is its owner's own data
+# (see HOME_IGNORED_FILES / HOME_IGNORED_DIRS); nothing when there is none.
+_home_first_data_file() {
+    local dir="$1" pattern name args=()
+    # find -path takes a pattern: the directory name is matched literally.
+    pattern=$(_find_literal "$dir")
+    for name in $HOME_IGNORED_DIRS $HOME_IGNORED_FILES; do
+        args+=(-path "$pattern/$name" -prune -o)
+    done
+    for name in "$EXISTING_SKEL_DIR"/* "$EXISTING_SKEL_DIR"/.[!.]*; do
+        if [[ -e "$name" ]]; then args+=(-path "$pattern/${name##*/}" -prune -o); fi
+    done
+    name=$(_installer_own_path)
+    if [[ -n "$name" ]]; then args+=(-path "$(_find_literal "$name")" -prune -o); fi
+    # -H: a home that is a symlink is followed, inside it nothing is.
+    find -H "$dir" -mindepth 1 "${args[@]}" -type f -print -quit 2>/dev/null
+    return 0
+}
+
+# Users with uid >= 1000 whose home holds their own files, then anything else
+# in /home that does.
+_existing_user_data() {
+    local user uid home homes=" " entry file
+    while IFS=: read -r user _ uid _ _ home _; do
+        [[ "$uid" =~ ^[0-9]+$ ]] && ((uid >= 1000 && uid != 65534)) || continue
+        [[ -n "$home" && "$home" != / && -d "$home" ]] || continue
+        homes+="$home "
+        file=$(_home_first_data_file "$home")
+        [[ -z "$file" ]] || echo "user ${user} (uid ${uid}) has files in ${home}"
+    done <"$EXISTING_PASSWD"
+    [[ -d "$EXISTING_HOME_DIR" ]] || return 0
+    for entry in "$EXISTING_HOME_DIR"/* "$EXISTING_HOME_DIR"/.[!.]*; do
+        [[ -e "$entry" || -L "$entry" ]] || continue
+        [[ "$homes" != *" $entry "* ]] || continue
+        if [[ -d "$entry" && ! -L "$entry" ]]; then
+            file=$(_home_first_data_file "$entry")
+            [[ -n "$file" ]] || continue
+        fi
+        echo "${entry} holds files"
+    done
+    return 0
+}
+
+# One line per sign that the server is already in use; nothing on a fresh one.
+existing_server_findings() {
+    local name port proc count
+    for name in $(_existing_packages); do echo "package ${name} is installed"; done
+    for name in $(_existing_running_units); do echo "service ${name} is running"; done
+    while read -r port proc; do
+        if [[ -n "$port" ]]; then echo "port ${port} is in use by ${proc}"; fi
+    done < <(_existing_listeners)
+    while read -r name; do
+        if [[ -n "$name" ]]; then echo "nftables table ${name} is set up (not by firewalld)"; fi
+    done < <(_existing_nft_tables)
+    while read -r name; do
+        if [[ -n "$name" ]]; then echo "firewalld: ${name}"; fi
+    done < <(_existing_firewalld_rules)
+    _existing_user_data
+    if [[ -d "$EXISTING_WWW_DIR" ]]; then
+        count=$(find -H "$EXISTING_WWW_DIR" -type f 2>/dev/null | head -n 1000 | wc -l)
+        ((count < 1000)) || count="1000 or more"
+        [[ "$count" == 0 ]] || echo "${EXISTING_WWW_DIR} holds ${count} file(s)"
+    fi
+    for name in $EXISTING_DATABASE_DIRS; do
+        if [[ -d "$name" && -n "$(find -H "$name" -type f -print -quit 2>/dev/null)" ]]; then
+            echo "${name} holds database files"
+        fi
+    done
+    return 0
+}
+
+# What the install changes on any server, as shown with the findings.
+existing_server_changes() {
+    if ! selinux_not_enforcing || grep -Eqs '^SELINUX=(enforcing|permissive)' "$SELINUX_CONFIG"; then
+        echo "SELinux: enforcement is switched off now and SELinux is disabled from the next boot (${SELINUX_CONFIG})"
+    fi
+    echo "firewall: firewalld is stopped and disabled, and the nftables tables \"ip filter\" and \"ip6 filter\" are replaced by AdminBolt's, whose INPUT and forward chains have policy drop: only the panel's own ports stay open (other nftables tables are kept)"
+    echo "configuration files written over with AdminBolt's own, among them /etc/httpd/conf/httpd.conf, /etc/postfix/main.cf and master.cf, /etc/dovecot/dovecot.conf, /etc/pdns/pdns.conf, /etc/redis/redis.conf, /etc/vsftpd/vsftpd.conf, /etc/fail2ban/jail.local, /etc/ssh/sshd_config.d/00-adminbolt.conf and 99-adminbolt.conf, /etc/sysconfig/nftables.conf, /var/www/html/index.html and index.php"
+    echo "MariaDB: a distribution mariadb-server is replaced by MariaDB from mariadb.org, the database root password is reset (/root/.my.cnf), root logins from other hosts, anonymous users and the test database are removed"
+}
+
+# Stops the install on a server that is already in use, unless
+# --force-existing-server was given. A server that already has AdminBolt is
+# a reinstall or a rerun after a failed install: its web, mail and database
+# services are the install's own, so it is not checked.
+check_existing_server() {
+    local findings line
+    report_step_start check_existing_server
+    if rpm -q bolt-agent >/dev/null 2>&1 || rpm -q bolt-panel >/dev/null 2>&1; then
+        print_info "AdminBolt is already installed on this server; not checking it for an existing web, mail, DNS or database setup"
+        ADMINBOLT_ALREADY_INSTALLED=1
+        report_step_result check_existing_server ok
+        return 0
+    fi
+    findings=$(existing_server_findings)
+    if [[ -z "$findings" ]]; then
+        print_success "No existing web, mail, DNS or database server, firewall rules or user data found"
+        report_step_result check_existing_server ok
+        return 0
+    fi
+    if ((FORCE_EXISTING_SERVER)); then
+        echo -e "${YELLOW}WARNING:${NC} This server is already in use:"
+    else
+        print_error "This server is already in use. The installer is meant for a fresh AlmaLinux 9 or Rocky Linux 9 server. Found:"
+    fi
+    while IFS= read -r line; do echo "  - ${line}"; done <<<"$findings"
+    echo "The install would replace or change:"
+    while IFS= read -r line; do echo "  - ${line}"; done < <(existing_server_changes)
+    if ((FORCE_EXISTING_SERVER)); then
+        print_info "--force-existing-server given: installing anyway, after a backup of the current configuration"
+        report_step_result check_existing_server ok
+        return 0
+    fi
+    echo "Install on a fresh server, or rerun with --force-existing-server to install here anyway: /etc and the other files the install writes over are backed up first (site files and databases are not)."
+    report_fail check_existing_server existing_server
+    exit 1
+}
+
+# A failed backup stops the install before anything is installed. $1 is the
+# backup directory to remove (it may hold a partial copy of /etc), or empty.
+_backup_abort() {
+    print_error "$2"
+    if [[ -n "$1" && -d "$1" ]]; then rm -rf "$1"; fi
+    report_fail preinstall_backup
+    exit 1
+}
+
+# The backup runs before Stage 2 installs the base packages, and some stock
+# AlmaLinux/Rocky 9 images (Hetzner's) have no tar. Only what is missing is
+# installed, so a server that has both is left as it was.
+_backup_install_archivers() {
+    local tool missing=() pm
+    for tool in tar gzip; do
+        command -v "$tool" >/dev/null 2>&1 || missing+=("$tool")
+    done
+    ((${#missing[@]} == 0)) && return 0
+    if command -v dnf >/dev/null 2>&1; then pm=dnf
+    elif command -v yum >/dev/null 2>&1; then pm=yum
+    else _backup_abort "" "The backup needs ${missing[*]}, which is not installed, and there is no dnf or yum to install it"
+    fi
+    print_info "Installing ${missing[*]} for the backup"
+    "$pm" install -y "${missing[@]}" \
+        || _backup_abort "" "The backup needs ${missing[*]}, and installing it with ${pm} failed (see ${pm}'s output above). Install it and run the installer again."
+    for tool in "${missing[@]}"; do
+        command -v "$tool" >/dev/null 2>&1 || _backup_abort "" "The backup needs ${tool}, which is still not there after ${pm} install"
+    done
+}
+
+# --force-existing-server: copies BACKUP_PATHS, the firewall's live ruleset
+# and the SELinux mode into a new root-only directory before anything is
+# installed, with a checksum list that install_report_replaced_files compares
+# against at the end. The install does not start when the copy fails.
+backup_existing_configuration() {
+    local dir list path need avail rc umask_before
+    report_step_start preinstall_backup
+    _backup_install_archivers
+    dir="${BACKUP_PARENT}/adminbolt-preinstall-backup-$(date +%Y%m%d-%H%M%S)"
+    # Everything in it is root-only: /etc holds password hashes and keys.
+    umask_before=$(umask)
+    umask 077
+    if ! mkdir "$dir"; then
+        _backup_abort "" "Cannot create ${dir} for the backup"
+    fi
+    list=()
+    for path in $BACKUP_PATHS; do
+        if [[ -e "$path" ]]; then list+=("$path"); fi
+    done
+    need=$(du -sk "${list[@]}" 2>/dev/null | awk '{ s += $1 } END { print s + 0 }')
+    avail=$(df -Pk "$dir" 2>/dev/null | awk 'NR == 2 { print $4 + 0 }')
+    if [[ -z "$avail" ]] || ((avail < need + 102400)); then
+        _backup_abort "$dir" "Not enough free space in ${BACKUP_PARENT} for the backup (${need} KB needed, ${avail:-0} KB free, plus 100 MB to spare)"
+    fi
+    rc=0
+    tar --create --gzip --file "$dir/files.tar.gz" --preserve-permissions --numeric-owner \
+        --xattrs --acls --selinux "${list[@]}" 2>"$dir/tar-warnings.log" || rc=$?
+    # 1: a file changed while it was read; the archive is still complete.
+    if ((rc > 1)); then
+        _backup_abort "$dir" "The backup failed (tar exit ${rc}): $(tail -n 3 "$dir/tar-warnings.log" 2>/dev/null | tr '\n' ' ')"
+    fi
+    find "${list[@]}" -type f -print0 2>/dev/null | xargs -0 -r sha256sum >"$dir/manifest.sha256" 2>/dev/null || true
+    # Without the checksums the end of the install could not tell what it replaced.
+    if [[ ! -s "$dir/manifest.sha256" ]]; then
+        _backup_abort "$dir" "The backup failed: no checksums could be taken of ${list[*]}"
+    fi
+    if command -v nft >/dev/null 2>&1; then nft list ruleset >"$dir/nft-ruleset.nft" 2>/dev/null || true; fi
+    if command -v getenforce >/dev/null 2>&1; then getenforce >"$dir/selinux-mode.txt" 2>/dev/null || true; fi
+    cat >"$dir/README.txt" <<NOTE
+Backup made by the AdminBolt installer before installing on a server that was already in use.
+
+files.tar.gz        ${list[*]}
+manifest.sha256     sha256 of every file in files.tar.gz, as it was
+replaced-files.txt  files the install changed or removed (written at the end of the install)
+nft-ruleset.nft     the firewall's live ruleset (restore: nft -f nft-ruleset.nft)
+selinux-mode.txt    SELinux mode before the install
+
+Restore one file:  tar -xzpf files.tar.gz -C / etc/postfix/main.cf
+Do not unpack the whole archive over an installed panel: it would undo the panel's own configuration.
+Site files and databases are not in this backup.
+NOTE
+    umask "$umask_before"
+    PREINSTALL_BACKUP_DIR="$dir"
+    report_step_result preinstall_backup ok
+    print_success "Current configuration backed up to ${dir} (root only; it holds password hashes and keys)"
+}
+
+# End of an install with a backup: lists the backed-up files the install
+# changed or removed, and where the originals are.
+install_report_replaced_files() {
+    local dir="$PREINSTALL_BACKUP_DIR" count check_rc
+    [[ -n "$dir" ]] || return 0
+    echo -e "\n${BOLD}${CYAN}--- Backup of the previous configuration ---${NC}"
+    echo "${dir}/files.tar.gz holds the files as they were before the install (see ${dir}/README.txt)."
+    check_rc=2
+    if [[ -s "$dir/manifest.sha256" ]]; then
+        # Root-only like the rest of the backup (the umask is the install's again here).
+        install -m 600 /dev/null "$dir/replaced-files.txt"
+        sha256sum --check --quiet "$dir/manifest.sha256" 2>/dev/null | sed -n 's/: FAILED.*$//p' | sort >>"$dir/replaced-files.txt"
+        check_rc=${PIPESTATUS[0]}
+    fi
+    # 0: every file as it was, 1: some changed or gone; anything else (or no
+    # checksum list) says nothing about the files, and must not read as "none".
+    if ((check_rc == 0)); then
+        echo "None of them was changed by the install."
+        return 0
+    fi
+    count=$(grep -c . "$dir/replaced-files.txt" 2>/dev/null || true)
+    if ((check_rc > 1)) || [[ "${count:-0}" == 0 ]]; then
+        echo -e "${YELLOW}WARNING:${NC} could not compare the files with the backup; compare them by hand with ${dir}/manifest.sha256"
+        return 0
+    fi
+    echo "The install changed or removed ${count} of them (full list: ${dir}/replaced-files.txt):"
+    head -n 100 "$dir/replaced-files.txt" | sed 's/^/  /'
+    ((count <= 100)) || echo "  ... and $((count - 100)) more"
+    return 0
+}
+
 # ---------- Stage 1: Check ready for installation ----------
 stage_prerequisites() {
     print_info "Stage 1: Checking that everything is in place and ready for installation"
@@ -1045,6 +1412,9 @@ stage_prerequisites() {
         fi
     done
     check_port_8443
+    check_existing_server
+    # A reinstall is the panel's own configuration: nothing to back up.
+    if ((FORCE_EXISTING_SERVER && !ADMINBOLT_ALREADY_INSTALLED)); then backup_existing_configuration; fi
     print_success "Stage 1 completed: ready for installation"
     print_progress "33% — prerequisites"
 }
@@ -1453,19 +1823,21 @@ stage_configuration() {
     [ -n "${ADMIN_EMAIL}" ] && [ "${TRIAL_LICENCE_OK}" -eq 0 ] && echo -e "${YELLOW}NOTE:${NC} Trial licence not issued (request refused or licence server unreachable). The installation itself succeeded and the panel is usable; activate a licence on its License page.\n"
     [ -n "${SSO_URL:-}" ] && echo -e "${BOLD}${CYAN}--- Access ---${NC}\n${GREEN}Admin Panel:${NC}\n${BOLD}${SSO_URL}${NC}\n"
     echo -e "${GREEN}New SSO URL:${NC}\n${BOLD}bolt-cli admin-sso-generate${NC}"
+    install_report_replaced_files
     print_progress "100% — post-install"
     print_success "Stage 3 completed: all post-install actions done"
 }
 
 # ---------- Main ----------
 print_usage() {
-    echo "Usage: sudo $0 [--help] [--version=<PANEL_VERSION>] [--source=<stable|staging|testing>] [--email=<address>] [--mariadb-version=<10.11|11.4>] [--channel=<name>] [--no-telemetry]"
+    echo "Usage: sudo $0 [--help] [--version=<PANEL_VERSION>] [--source=<stable|staging|testing>] [--email=<address>] [--mariadb-version=<10.11|11.4>] [--force-existing-server] [--channel=<name>] [--no-telemetry]"
     echo "AlmaLinux 9 / Rocky Linux 9. Stages: 1=ready check, 2=(2.1 settings, 2.2 prereq packages, 2.3 bolt packages), 3=post-install."
     echo "If --version is not provided, latest bolt-panel from repo is installed."
     echo "If --source is not provided, the bolt-repo RPM from adminbolt is used (default). Otherwise repos point at pulp content stable/staging/testing."
     echo "If --mariadb-version is not provided, MariaDB 10.11 is installed; 11.4 is the newer long-term series (supported until 2029)."
     echo "If --email is provided, a 24h trial licence is requested for that address at the very end of the install (clicking the e-mailed confirmation link extends it to the full trial period); the install completes even if the request is refused."
     echo "Without --email the install proceeds unlicensed; activate on the panel's License page."
+    echo "The installer is meant for a fresh server. It stops when it finds a web, mail, DNS or database server, a firewall with rules of its own, or files in /home or /var/www, and lists what the install would replace. --force-existing-server installs anyway, after backing up /etc, /var/spool/cron, /root/.my.cnf, /usr/bin/mlmmj-make-ml.sh and the files the install writes in /var/www/html to /root/adminbolt-preinstall-backup-<date>/."
     echo "--channel names what started the install (${REPORT_CHANNELS// /, }); default direct."
     echo "The installer reports its progress and result (no hostnames, e-mail addresses or passwords) to AdminBolt; --no-telemetry (or ADMINBOLT_NO_TELEMETRY=1) turns this off for the installer and the panel."
 }
@@ -1496,6 +1868,9 @@ main() {
             --channel)
                 REPORT_CHANNEL_ARG=""
                 REPORT_CHANNEL_GIVEN=1
+                ;;
+            --force-existing-server)
+                FORCE_EXISTING_SERVER=1
                 ;;
             --no-telemetry)
                 REPORT_NO_TELEMETRY=1
