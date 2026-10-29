@@ -25,6 +25,21 @@ BOLT_SOURCE=""
 # E-mail for the trial license; empty = skip the trial request (activate manually on the License page).
 ADMIN_EMAIL=""
 MARIADB_SERIES=""
+# AB-2106: --ssh-key= value (a public key, or an https:// URL serving keys); empty = no SSH changes.
+SSH_KEY_ARG=""
+# Validated key lines and their SHA256 fingerprints, filled in Stage 1.
+SSH_KEYS=""
+SSH_KEY_FPS=""
+ROOT_AUTHORIZED_KEYS="/root/.ssh/authorized_keys"
+# Sorts before every other drop-in, so its first values win over 50-cloud-init.conf and the panel's files.
+SSHD_KEY_ONLY_DROP_IN="/etc/ssh/sshd_config.d/00-adminbolt-ssh-key-only.conf"
+# Seconds the installer waits, at a terminal, for a sign-in with the key before it gives up and keeps password login.
+SSH_KEY_LOGIN_WAIT=600
+SSH_KEY_TTY="/dev/tty"
+SSH_KEY_LOGIN_ADDR=""
+SSH_KEY_PROOF_SINCE=0
+# Outcome line for the end of the install.
+SSH_PASSWORD_NOTE=""
 readonly WEB_INSTALL_ROOT="/usr/local/bolt/web"
 readonly POST_INSTALL_DB_PATH="/var/lib/adminbolt/db.sqlite3"
 
@@ -1045,6 +1060,14 @@ stage_prerequisites() {
         fi
     done
     check_port_8443
+    # AB-2106: a bad key stops the install here, before anything is changed.
+    if [[ -n "$SSH_KEY_ARG" ]]; then
+        # Reported as a bad argument, not as the port check that ran before it.
+        report_step_start parse_arguments
+        ssh_key_load || { report_fail parse_arguments invalid_argument; exit 1; }
+        report_step_result parse_arguments ok
+        print_success "SSH key checked ($(grep -c . <<<"$SSH_KEYS") key(s))"
+    fi
     print_success "Stage 1 completed: ready for installation"
     print_progress "33% — prerequisites"
 }
@@ -1062,6 +1085,305 @@ detect_distribution() {
     [[ "$VERSION_ID" =~ ^9(\.[0-9]*)?$ ]] || return 1
     echo "${ID}|${VERSION_ID}"
     return 0
+}
+
+# ---------- SSH key and password login (AB-2106) ----------
+# --ssh-key= adds root's key in Stage 2.1 and turns SSH password login for
+# root off at the very end, but only once sshd has logged a root sign-in with
+# that key after every install step that configures sshd, and its effective
+# settings for that client still let root in with the key. Anything short of
+# that keeps password login on and says why: the customer must never be
+# locked out of their own server. Other users (hosting accounts) keep their
+# password login, and root login itself stays under the panel's SSH settings.
+
+# Read --ssh-key= into SSH_KEYS / SSH_KEY_FPS. Every non-comment line must be
+# a plain public key: no authorized_keys options (command=, from=, ...).
+ssh_key_load() {
+    local raw line tmp fp keys="" fps=""
+    local key_re='^(ssh-ed25519|ssh-rsa|ecdsa-sha2-nistp256|ecdsa-sha2-nistp384|ecdsa-sha2-nistp521|sk-ssh-ed25519@openssh\.com|sk-ecdsa-sha2-nistp256@openssh\.com) [A-Za-z0-9+/]+=*( [^[:cntrl:]]*)?$'
+    if ! command -v ssh-keygen >/dev/null 2>&1; then
+        print_error "ssh-keygen not found; cannot check --ssh-key"
+        return 1
+    fi
+    if [[ "$SSH_KEY_ARG" == https://* ]]; then
+        if ! raw=$(curl -fsSL --proto =https --proto-redir =https --max-time 30 "$SSH_KEY_ARG"); then
+            print_error "Could not download the SSH key from ${SSH_KEY_ARG}"
+            return 1
+        fi
+    elif [[ "$SSH_KEY_ARG" == *://* ]]; then
+        print_error "--ssh-key takes a public key or an https:// URL"
+        return 1
+    else
+        raw="$SSH_KEY_ARG"
+    fi
+    tmp=$(mktemp)
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        line="${line%$'\r'}"
+        line="${line#"${line%%[![:space:]]*}"}"
+        line="${line%"${line##*[![:space:]]}"}"
+        [[ -z "$line" || "$line" == \#* ]] && continue
+        printf '%s\n' "$line" >"$tmp"
+        if [[ ! "$line" =~ $key_re ]] || ! fp=$(ssh-keygen -l -E sha256 -f "$tmp" 2>/dev/null | awk '{print $2}') || [[ -z "$fp" ]]; then
+            rm -f "$tmp"
+            print_error "--ssh-key: not an SSH public key: ${line:0:60} (put the whole key in quotes: --ssh-key=\"ssh-ed25519 AAAA... comment\")"
+            return 1
+        fi
+        keys+="${line}"$'\n'
+        fps+="${fp}"$'\n'
+    done <<<"$raw"
+    rm -f "$tmp"
+    if [[ -z "$keys" ]]; then
+        print_error "--ssh-key: no SSH public key found"
+        return 1
+    fi
+    SSH_KEYS="$keys"
+    SSH_KEY_FPS="$fps"
+}
+
+# 0 when key line $1 is in authorized_keys file $2 as a plain line (type and key first; the comment is ignored).
+ssh_key_present() {
+    local type b64
+    read -r type b64 _ <<<"$1"
+    [[ -f "$2" ]] && awk -v t="$type" -v k="$b64" '$1 == t && $2 == k { f = 1 } END { exit !f }' "$2"
+}
+
+# 0 when key line $1 also appears in file $2 behind options (command=, from=, restrict, ...):
+# a sign-in with it can succeed and still give no shell, so it proves nothing.
+ssh_key_restricted() {
+    local type b64
+    read -r type b64 _ <<<"$1"
+    [[ -f "$2" ]] && awk -v t="$type" -v k="$b64" '$1 !~ /^#/ { for (i = 2; i < NF; i++) if ($i == t && $(i + 1) == k) f = 1 } END { exit !f }' "$2"
+}
+
+# Root's AuthorizedKeysFile paths from `sshd -T` output $1, one per line, with %h, %u, %U and %%
+# expanded as sshd does and relative paths under root's home. 1 when the list cannot be worked out.
+ssh_root_key_files() {
+    local v f home
+    local -a files
+    home=$(getent passwd root 2>/dev/null | cut -d: -f6)
+    v=$(sshd_value authorizedkeysfile "$1")
+    [[ -n "$home" && -n "$v" ]] || return 1
+    read -ra files <<<"$v"
+    for f in "${files[@]}"; do
+        [[ "$f" == none ]] && continue
+        f=${f//"%%"/$'\001'}
+        f=${f//"%h"/$home}
+        f=${f//"%u"/root}
+        f=${f//"%U"/0}
+        [[ "$f" != *%* ]] || return 1
+        f=${f//$'\001'/%}
+        [[ "$f" == /* ]] || f="$home/$f"
+        printf '%s\n' "$f"
+    done
+}
+
+# Why a sign-in with the key may give no shell under `sshd -T` output $1; empty when it cannot.
+# sshd takes the first file that lists the key, so the key behind options (command=, restrict,
+# no-pty, ...) in any of root's key files, or keys from a command, means the log proves nothing.
+ssh_key_restriction_blocker() {
+    local v files f line
+    v=$(sshd_value authorizedkeyscommand "$1")
+    [[ -z "$v" || "$v" == none ]] || { echo "sshd also takes root's keys from AuthorizedKeysCommand ${v}"; return; }
+    files=$(ssh_root_key_files "$1") || { echo "could not work out root's AuthorizedKeysFile list"; return; }
+    while IFS= read -r f; do
+        [[ -n "$f" ]] || continue
+        while IFS= read -r line; do
+            [[ -n "$line" ]] || continue
+            if ssh_key_restricted "$line" "$f"; then
+                echo "${f} also lists the key with restrictions (command=, restrict, no-pty, ...)"
+                return
+            fi
+        done <<<"$SSH_KEYS"
+    done <<<"$ROOT_AUTHORIZED_KEYS"$'\n'"$files"
+}
+
+ssh_keys_in_place() {
+    local line
+    while IFS= read -r line; do
+        [[ -n "$line" ]] || continue
+        ssh_key_present "$line" "$ROOT_AUTHORIZED_KEYS" || return 1
+    done <<<"$SSH_KEYS"
+}
+
+# Stage 2.1: add the keys to root's authorized_keys; keys already there are kept as they are.
+ssh_key_install() {
+    [[ -n "$SSH_KEYS" ]] || return 0
+    local dir line added=0
+    dir=$(dirname "$ROOT_AUTHORIZED_KEYS")
+    if ! { mkdir -p "$dir" && chmod 700 "$dir" && touch "$ROOT_AUTHORIZED_KEYS" && chmod 600 "$ROOT_AUTHORIZED_KEYS"; }; then
+        print_error "Could not prepare ${ROOT_AUTHORIZED_KEYS}"
+        exit 1
+    fi
+    while IFS= read -r line; do
+        [[ -n "$line" ]] || continue
+        ssh_key_present "$line" "$ROOT_AUTHORIZED_KEYS" && continue
+        # A file without a final newline would glue the new key onto its last line.
+        [[ -s "$ROOT_AUTHORIZED_KEYS" && -n "$(tail -c1 "$ROOT_AUTHORIZED_KEYS")" ]] && echo >>"$ROOT_AUTHORIZED_KEYS"
+        printf '%s\n' "$line" >>"$ROOT_AUTHORIZED_KEYS"
+        added=$((added + 1))
+    done <<<"$SSH_KEYS"
+    chown root:root "$dir" "$ROOT_AUTHORIZED_KEYS" 2>/dev/null || true
+    command -v restorecon >/dev/null 2>&1 && { restorecon -R "$dir" >/dev/null 2>&1 || true; }
+    if ! ssh_keys_in_place; then
+        print_error "The SSH key is not in ${ROOT_AUTHORIZED_KEYS} after writing it"
+        exit 1
+    fi
+    print_success "SSH key in ${ROOT_AUTHORIZED_KEYS} (${added} added)"
+}
+
+# Effective sshd settings for root connecting from address $1.
+sshd_effective_for_root() {
+    sshd -T -C "user=root,host=$1,addr=$1" 2>/dev/null
+}
+
+# Value of setting $1 in `sshd -T` output $2 (first line only; empty when absent).
+sshd_value() {
+    awk -v k="$1" 'tolower($1) == k { $1 = ""; sub(/^ /, ""); print; exit }' <<<"$2"
+}
+
+# Why root cannot sign in with a key under `sshd -T` output $1; empty when it can.
+ssh_root_key_login_blocker() {
+    local cfg="$1" v
+    [[ -n "$cfg" ]] || { echo "sshd -T did not run"; return; }
+    v=$(sshd_value permitrootlogin "$cfg")
+    case "$v" in yes|prohibit-password|without-password) ;; *) echo "root login over SSH is not allowed (PermitRootLogin ${v:-unset})"; return ;; esac
+    v=$(sshd_value pubkeyauthentication "$cfg")
+    [[ "$v" == yes ]] || { echo "key login is off (PubkeyAuthentication ${v:-unset})"; return; }
+    v=$(sshd_value authorizedkeysfile "$cfg")
+    [[ " $v " == *.ssh/authorized_keys\ * ]] || { echo "sshd does not read .ssh/authorized_keys (AuthorizedKeysFile ${v:-unset})"; return; }
+    v=$(sshd_value authenticationmethods "$cfg")
+    [[ -z "$v" || "$v" == any || "$v" == publickey ]] || { echo "sshd requires more than a key (AuthenticationMethods ${v})"; return; }
+    v=$(sshd_value forcecommand "$cfg")
+    [[ -z "$v" || "$v" == none ]] || { echo "root's SSH sessions are forced to run ${v}"; return; }
+    ssh_key_restriction_blocker "$cfg"
+}
+
+# Set SSH_KEY_LOGIN_ADDR to the client address of the latest root sign-in with one of the keys
+# that sshd logged since epoch second $1. The whole message must match: a login name is logged
+# as typed in failed attempts, so a partial match could be forged from the network.
+ssh_key_login_seen() {
+    local addr
+    addr=$(journalctl -q --no-pager -o cat -u sshd --since "@$1" 2>/dev/null | awk -v fps="$SSH_KEY_FPS" '
+        BEGIN { n = split(fps, a, "\n"); for (i = 1; i <= n; i++) if (a[i] != "") want[a[i]] = 1 }
+        /^Accepted publickey for root from [0-9A-Fa-f.:]+ port [0-9]+ ssh2: [A-Z0-9-]+ SHA256:[A-Za-z0-9+\/]+$/ && ($NF in want) { last = $6 }
+        END { print last }')
+    [[ -n "$addr" ]] || return 1
+    SSH_KEY_LOGIN_ADDR="$addr"
+}
+
+# At a terminal, ask for a sign-in with the key and wait for sshd to log it. 1 = skipped, timed out or no terminal.
+ssh_key_login_wait() {
+    { exec 3<"$SSH_KEY_TTY"; } 2>/dev/null || return 1
+    local ip port deadline rc
+    ip=$(hostname -I 2>/dev/null | awk '{print $1}')
+    port=$(sshd_value port "$(sshd_effective_for_root 127.0.0.1)")
+    echo -e "\n${BOLD}${CYAN}--- Check your SSH key before password login for root is turned off ---${NC}"
+    echo -e "Keep this session open. From a new terminal, sign in with your key:"
+    echo -e "  ${BOLD}ssh -p ${port:-22} root@${ip:-<this-server-ip>}${NC}"
+    echo -e "Waiting up to $((SSH_KEY_LOGIN_WAIT / 60)) minutes for that sign-in. Press Enter to skip and keep password login on."
+    deadline=$(($(date +%s) + SSH_KEY_LOGIN_WAIT))
+    while (($(date +%s) < deadline)); do
+        if ssh_key_login_seen "$SSH_KEY_PROOF_SINCE"; then
+            exec 3<&-
+            print_success "Sign-in with your key seen from ${SSH_KEY_LOGIN_ADDR}"
+            return 0
+        fi
+        # Enter or a closed terminal ends the wait; only a timeout (status > 128) keeps it going.
+        rc=0
+        read -r -t 5 -u 3 _ || rc=$?
+        ((rc > 128)) || break
+    done
+    exec 3<&-
+    return 1
+}
+
+# Password login was not changed: say why, and what sshd actually does for root now.
+ssh_password_kept() {
+    local now
+    now=$(sshd_value passwordauthentication "$(sshd_effective_for_root 127.0.0.1)")
+    if [[ "$now" == no ]]; then
+        SSH_PASSWORD_NOTE="${YELLOW}NOTE:${NC} The installer did not change SSH password login for root ($1); sshd already has it off. Your key is in ${ROOT_AUTHORIZED_KEYS}.\n"
+        echo -e "${YELLOW}WARNING:${NC} SSH password login for root not changed: $1"
+        return 0
+    fi
+    SSH_PASSWORD_NOTE="${YELLOW}NOTE:${NC} SSH password login for root left ON: $1. Your key is in ${ROOT_AUTHORIZED_KEYS}. After you sign in with it, turn password login for root off with:\n  ${BOLD}printf 'Match User root\\\\n    PasswordAuthentication no\\\\n    KbdInteractiveAuthentication no\\\\n' > ${SSHD_KEY_ONLY_DROP_IN} && sshd -t && systemctl reload sshd${NC}\n"
+    echo -e "${YELLOW}WARNING:${NC} SSH password login for root left on: $1"
+}
+
+# Put the drop-in back as it was ($1 = saved copy, or empty when there was none) and reload when $2 = reload.
+# Never fails: a copy that cannot be put back is removed rather than left half-written.
+ssh_drop_in_restore() {
+    if [[ -n "$1" ]]; then
+        mv -f "$1" "$SSHD_KEY_ONLY_DROP_IN" 2>/dev/null || rm -f "$SSHD_KEY_ONLY_DROP_IN" "$1" 2>/dev/null || true
+    else
+        rm -f "$SSHD_KEY_ONLY_DROP_IN" 2>/dev/null || true
+    fi
+    if [[ "${2:-}" == reload ]]; then systemctl reload sshd >/dev/null 2>&1 || true; fi
+    return 0
+}
+
+# End of Stage 3: turn SSH password login for root off once the key is proven. Never fatal.
+ssh_password_login_off() {
+    [[ -n "$SSH_KEYS" ]] || return 0
+    print_info "SSH: turning password login for root off (--ssh-key)"
+    local blocker saved="" tmp cfg
+    # Only a sign-in from now on counts: it ran under the sshd settings the install left behind.
+    SSH_KEY_PROOF_SINCE=$(date +%s)
+    if ! ssh_keys_in_place; then
+        ssh_password_kept "the key is no longer in ${ROOT_AUTHORIZED_KEYS}"
+        return 0
+    fi
+    # Also checks every file sshd reads root's keys from for the key behind options.
+    blocker=$(ssh_root_key_login_blocker "$(sshd_effective_for_root 127.0.0.1)")
+    if [[ -n "$blocker" ]]; then
+        ssh_password_kept "$blocker"
+        return 0
+    fi
+    if ! ssh_key_login_wait; then
+        ssh_password_kept "no sign-in with the key was seen after the installer set up SSH"
+        return 0
+    fi
+    # The settings for the address the key was used from, not only for localhost.
+    blocker=$(ssh_root_key_login_blocker "$(sshd_effective_for_root "$SSH_KEY_LOGIN_ADDR")")
+    if [[ -n "$blocker" ]]; then
+        ssh_password_kept "$blocker (for ${SSH_KEY_LOGIN_ADDR})"
+        return 0
+    fi
+    if [[ -e "$SSHD_KEY_ONLY_DROP_IN" ]]; then
+        saved="${SSHD_KEY_ONLY_DROP_IN}.saved.$$"
+        if ! cp -p "$SSHD_KEY_ONLY_DROP_IN" "$saved"; then ssh_password_kept "could not back up ${SSHD_KEY_ONLY_DROP_IN}"; return 0; fi
+    fi
+    # Written next to the target under a name sshd does not read (*.conf only), then moved into place.
+    tmp="${SSHD_KEY_ONLY_DROP_IN}.new.$$"
+    if ! {
+        printf '# Written by install.sh --ssh-key (AB-2106). Remove this file and reload sshd to allow SSH password login for root again.\n'
+        printf 'Match User root\n    PasswordAuthentication no\n    KbdInteractiveAuthentication no\n'
+    } >"$tmp" || ! chmod 600 "$tmp" || ! mv -f "$tmp" "$SSHD_KEY_ONLY_DROP_IN"; then
+        rm -f "$tmp"
+        ssh_drop_in_restore "$saved"
+        ssh_password_kept "could not write ${SSHD_KEY_ONLY_DROP_IN}"
+        return 0
+    fi
+    if ! sshd -t >/dev/null 2>&1; then
+        ssh_drop_in_restore "$saved"
+        ssh_password_kept "sshd -t refused the new setting"
+        return 0
+    fi
+    cfg=$(sshd_effective_for_root "$SSH_KEY_LOGIN_ADDR") || cfg=""
+    blocker=$(ssh_root_key_login_blocker "$cfg")
+    if [[ -n "$blocker" || "$(sshd_value passwordauthentication "$cfg")" != no || "$(sshd_value kbdinteractiveauthentication "$cfg")" != no ]]; then
+        ssh_drop_in_restore "$saved"
+        ssh_password_kept "another sshd setting overrides ${SSHD_KEY_ONLY_DROP_IN}${blocker:+ ($blocker)}"
+        return 0
+    fi
+    if ! systemctl reload sshd >/dev/null 2>&1; then
+        ssh_drop_in_restore "$saved" reload
+        ssh_password_kept "sshd did not reload"
+        return 0
+    fi
+    rm -f "$saved"
+    SSH_PASSWORD_NOTE="${GREEN}SSH:${NC} password login for root is off; root signs in with your key. Other users are not changed. To allow passwords again: ${BOLD}rm ${SSHD_KEY_ONLY_DROP_IN} && systemctl reload sshd${NC}\n"
+    print_success "SSH password login for root turned off"
 }
 
 # ---------- Stage 2: Install base packages ----------
@@ -1209,6 +1531,7 @@ stage2_prepare_settings() {
     print_info "Stage 2.1: Preparing settings"
     run_or_warn "selinux_not_enforcing || setenforce 0" "SELinux enforce" selinux_enforce
     run_or_warn "sed -i 's#^SELINUX=.*#SELINUX=disabled#' /etc/selinux/config" "SELinux config" selinux_config
+    ssh_key_install
     print_success "Stage 2.1 completed: settings prepared"
 }
 
@@ -1453,8 +1776,11 @@ stage_configuration() {
         report_trial_licence skipped
         print_info "No --email= provided; skipping trial licence request. Activate a licence later on the panel's License page."
     fi
+    # AB-2106: last, after every step that configures sshd, so they cannot undo it and a failed install keeps password login.
+    ssh_password_login_off || true
     local SSO_URL=$(bolt-cli admin-sso-generate 2>/dev/null || echo "")
     [ -z "${SSO_URL}" ] && echo -e "${YELLOW}WARNING:${NC} SSO URL not generated" || print_success "SSO URL generated"
+    [ -n "${SSH_PASSWORD_NOTE}" ] && echo -e "\n${SSH_PASSWORD_NOTE}"
     echo -e "\n${BOLD}${GREEN}+----------------------------------------------------------+${NC}"
     echo -e "${BOLD}${GREEN}|          Installation Completed Successfully             |${NC}"
     echo -e "${BOLD}${GREEN}+----------------------------------------------------------+${NC}\n"
@@ -1467,7 +1793,7 @@ stage_configuration() {
 
 # ---------- Main ----------
 print_usage() {
-    echo "Usage: sudo $0 [--help] [--version=<PANEL_VERSION>] [--source=<stable|staging|testing>] [--email=<address>] [--mariadb-version=<10.11|11.4>] [--channel=<name>] [--no-telemetry]"
+    echo "Usage: sudo $0 [--help] [--version=<PANEL_VERSION>] [--source=<stable|staging|testing>] [--email=<address>] [--mariadb-version=<10.11|11.4>] [--channel=<name>] [--no-telemetry] [--ssh-key=<public key|https URL>]"
     echo "AlmaLinux 9 / Rocky Linux 9. Stages: 1=ready check, 2=(2.1 settings, 2.2 prereq packages, 2.3 bolt packages), 3=post-install."
     echo "If --version is not provided, latest bolt-panel from repo is installed."
     echo "If --source is not provided, the bolt-repo RPM from adminbolt is used (default). Otherwise repos point at pulp content stable/staging/testing."
@@ -1476,6 +1802,7 @@ print_usage() {
     echo "Without --email the install proceeds unlicensed; activate on the panel's License page."
     echo "--channel names what started the install (${REPORT_CHANNELS// /, }); default direct."
     echo "The installer reports its progress and result (no hostnames, e-mail addresses or passwords) to AdminBolt; --no-telemetry (or ADMINBOLT_NO_TELEMETRY=1) turns this off for the installer and the panel."
+    echo "If --ssh-key is provided (a public key, or an https:// URL serving keys), the key is added to root's authorized_keys; SSH password login for root is turned off at the end only after a root sign-in with that key is seen (at a terminal the installer waits up to 10 minutes for one), otherwise it stays on."
 }
 
 main() {
@@ -1507,6 +1834,14 @@ main() {
                 ;;
             --no-telemetry)
                 REPORT_NO_TELEMETRY=1
+                ;;
+            --ssh-key=*)
+                SSH_KEY_ARG="${arg#--ssh-key=}"
+                if [[ -z "$SSH_KEY_ARG" ]]; then
+                    print_error "--ssh-key= needs a public key or an https:// URL"
+                    print_usage
+                    exit 1
+                fi
                 ;;
         esac
     done
@@ -1608,8 +1943,8 @@ main() {
 }
 
 # ADMINBOLT_INSTALL_SOURCE_ONLY=1 loads the functions without running the
-# install (tests/telemetry_test.sh). An environment switch rather than a
-# BASH_SOURCE check, which cannot tell `curl ... | bash` apart reliably.
+# install (tests/). An environment switch rather than a BASH_SOURCE check,
+# which cannot tell `curl ... | bash` apart reliably.
 if [[ "${ADMINBOLT_INSTALL_SOURCE_ONLY:-}" != 1 ]]; then
     main "$@"
 fi
