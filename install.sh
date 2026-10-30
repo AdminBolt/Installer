@@ -1539,6 +1539,17 @@ stage2_prepare_settings() {
     print_success "Stage 2.1 completed: settings prepared"
 }
 
+# CloudLinux tools (X-Ray, MySQL Governor, lve-utils) call /sbin/service
+# directly; minimal EL9 images ship neither package that provides it.
+ensure_service_command() {
+    if rpm -q initscripts &>/dev/null || rpm -q initscripts-service &>/dev/null; then
+        print_success "service command already provided (initscripts/initscripts-service)"
+        return 0
+    fi
+    print_info "Installing initscripts-service (provides the service command)"
+    install_packages initscripts-service
+}
+
 # Step 2.2: Install all prerequisite packages (EPEL, CRB, libsodium, traceroute, openssl, jq, etc.)
 stage2_install_prerequisite_packages() {
     print_info "Stage 2.2: Installing prerequisite packages"
@@ -1558,6 +1569,7 @@ stage2_install_prerequisite_packages() {
         libsodium traceroute openssl jq rsync ca-certificates wget curl tar gzip unzip zip sudo apg \
         systemd openssl-libs libcurl libzip zlib gmp freetype libjpeg-turbo libpng libwebp libXpm gd \
         gettext-libs libicu sqlite-libs oniguruma libxslt shadow-utils chrony restic rclone git
+    ensure_service_command
     run_or_warn "systemctl enable --now chronyd" "Time synchronization (chronyd)" chronyd
     # pipefail: a failed download feeds sh nothing, which sh reports as success.
     run_or_warn "(set -o pipefail; curl https://get.acme.sh | sh -s email=issue-ssl@adminbolt.com)" "acme.sh" acme_sh
