@@ -106,6 +106,7 @@ echo "$POST_FAILED" >"$D/dnf.reinstall"
 run_case
 eq "%post fails again: exit 1" 1 "$RC"
 has "%post fails again: the %post message" "post-install script (%post) failed" "$OUT"
+has "%post fails again: the advice is a rerun the installer finishes" "rerun this installer; it retries the agent install" "$OUT"
 eq "%post fails again: marker kept" yes "$([[ -e "$D/state/agent-post-failed" ]] && echo yes || echo no)"
 
 # 4. A normal rerun: installed, running, no marker - nothing is reinstalled.
@@ -116,24 +117,52 @@ eq "healthy agent: exit 0" 0 "$RC"
 has "healthy agent: reported as already installed" "bolt-agent already installed" "$OUT"
 eq "healthy agent: no dnf call" "" "$(dnf_calls)"
 
-# 5. The installed version left the repository: upgrade to the newer one.
+# 5. %post failed and the installed version left the repository: upgrade to
+#    the newer one, which runs %post too.
 new_case not-available
-touch "$D/installed"
+touch "$D/installed"; mkdir -p "$D/state"; touch "$D/state/agent-post-failed"
 echo "Installed package bolt-agent-1.32.23-1.x86_64 (from bolt) not available." >"$D/dnf.reinstall"
 echo 1 >"$D/dnf.reinstall.rc"
 run_case
 eq "version gone from the repository: exit 0" 0 "$RC"
 eq "version gone from the repository: reinstall, then upgrade" "reinstall upgrade" "$(dnf_calls)"
 
-# 6. ... and no newer one either: stop with a clear message, not a false ok.
-new_case nothing-newer
+# 5b. Only stopped (no marker) and the version is not in the repository: no
+#     upgrade, a warning, and the install goes on as before AB-2277.
+new_case stopped-not-available
 touch "$D/installed"
+echo "Installed package bolt-agent-1.32.23-1.x86_64 (from bolt) not available." >"$D/dnf.reinstall"
+echo 1 >"$D/dnf.reinstall.rc"
+run_case
+eq "stopped agent, version gone: exit 0 (continues)" 0 "$RC"
+eq "stopped agent, version gone: reinstall only, no upgrade" "reinstall" "$(dnf_calls)"
+has "stopped agent, version gone: warns" "keeping the installed version (continuing)" "$OUT"
+eq "stopped agent, version gone: no marker" no "$([[ -e "$D/state/agent-post-failed" ]] && echo yes || echo no)"
+
+# 5c. Only stopped and the reinstall fails for another reason: same.
+new_case stopped-reinstall-fails
+touch "$D/installed"
+echo "Error: Failed to download metadata for repo 'bolt'" >"$D/dnf.reinstall"
+echo 1 >"$D/dnf.reinstall.rc"
+run_case
+eq "stopped agent, reinstall error: exit 0 (continues)" 0 "$RC"
+eq "stopped agent, reinstall error: reinstall only" "reinstall" "$(dnf_calls)"
+
+# 6. ... and no newer one either (a newer testing or PR build is installed):
+#    stop with advice that ends in a rerun, not a false ok.
+new_case nothing-newer
+touch "$D/installed"; mkdir -p "$D/state"; touch "$D/state/agent-post-failed"
 echo "Installed package bolt-agent-1.32.23-1.x86_64 (from bolt) not available." >"$D/dnf.reinstall"
 echo 1 >"$D/dnf.reinstall.rc"
 echo "Nothing to do." >"$D/dnf.upgrade"
 run_case
 eq "no version to install: exit 1" 1 "$RC"
-has "no version to install: says why" "no longer in the repository" "$OUT"
+has "no version to install: says why" "the installed version is not in the repository" "$OUT"
+has "no version to install: advice is a rerun the installer finishes" "Rerun this installer with the --source" "$OUT"
+has "no version to install: the rerun retries the agent install" "it retries the agent install" "$OUT"
+hasnt "no version to install: no manual dnf reinstall advice" "dnf reinstall" "$OUT"
+hasnt "no version to install: no dnf remove advice (bolt-panel requires bolt-agent)" "dnf remove" "$OUT"
+eq "no version to install: marker kept" yes "$([[ -e "$D/state/agent-post-failed" ]] && echo yes || echo no)"
 
 # 7. First install with a failed %post: the marker is written.
 new_case first-install-fails
