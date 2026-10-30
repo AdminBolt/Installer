@@ -45,7 +45,6 @@ SSH_KEY_PROOF_SINCE=0
 # Outcome line for the end of the install.
 SSH_PASSWORD_NOTE=""
 readonly WEB_INSTALL_ROOT="/usr/local/bolt/web"
-readonly POST_INSTALL_DB_PATH="/var/lib/adminbolt/db.sqlite3"
 
 # Colors
 RED='\033[0;31m'
@@ -168,7 +167,9 @@ INSTALL_MARKER_CREATED=0
 REPORT_CHANNELS="direct get-script web-installer vultr akamai node image-build test hostinger digitalocean aws azure"
 REPORT_REASONS="not_root unsupported_os invalid_argument missing_command port_in_use repo_download_failed package_install_failed agent_install_failed panel_scriptlet_failed agent_panel_connect_failed required_step_failed readiness_check_failed interrupted unclassified"
 
-# required | optional | unknown
+# Prints the class of one install step id for the report: required (its failure
+# is the install's failure), optional (its failure only adds a warning) or
+# unknown (not a step id).
 report_step_class() {
     case "$1" in
         check_root|check_os|check_commands|check_port_8443|parse_arguments) echo required ;;
@@ -1056,13 +1057,11 @@ stage_prerequisites() {
     print_success "Detected: $distro_info"
     # Required commands
     report_step_start check_commands
-    for cmd in curl; do
-        if ! command -v "$cmd" >/dev/null 2>&1; then
-            print_error "Required command not found: $cmd"
-            report_fail check_commands missing_command
-            exit 1
-        fi
-    done
+    if ! command -v curl >/dev/null 2>&1; then
+        print_error "Required command not found: curl"
+        report_fail check_commands missing_command
+        exit 1
+    fi
     check_port_8443
     # AB-2106: a bad key stops the install here, before anything is changed.
     if [[ -n "$SSH_KEY_ARG" ]]; then
@@ -1081,6 +1080,7 @@ detect_distribution() {
     if [ ! -f /etc/os-release ]; then
         return 1
     fi
+    # shellcheck source=/dev/null
     . /etc/os-release
     case "$ID" in
         almalinux|rocky) ;;
@@ -1786,8 +1786,13 @@ stage_configuration() {
     fi
     # AB-2106: last, after every step that configures sshd, so they cannot undo it and a failed install keeps password login.
     ssh_password_login_off || true
-    local SSO_URL=$(bolt-cli admin-sso-generate 2>/dev/null || echo "")
-    [ -z "${SSO_URL}" ] && echo -e "${YELLOW}WARNING:${NC} SSO URL not generated" || print_success "SSO URL generated"
+    local SSO_URL
+    SSO_URL=$(bolt-cli admin-sso-generate 2>/dev/null || echo "")
+    if [ -z "${SSO_URL}" ]; then
+        echo -e "${YELLOW}WARNING:${NC} SSO URL not generated"
+    else
+        print_success "SSO URL generated"
+    fi
     [ -n "${SSH_PASSWORD_NOTE}" ] && echo -e "\n${SSH_PASSWORD_NOTE}"
     echo -e "\n${BOLD}${GREEN}+----------------------------------------------------------+${NC}"
     echo -e "${BOLD}${GREEN}|          Installation Completed Successfully             |${NC}"
@@ -1930,7 +1935,7 @@ main() {
     # in the middle of a later stage of this whole panel-plus-agent install -
     # Stage 3 included - and break it. Always removed on exit, success or
     # failure, so a box never gets stuck with a marker nothing will ever
-    # clear. Lives under /var/lib/adminbolt (POST_INSTALL_DB_PATH's own
+    # clear. Lives under /var/lib/adminbolt (the panel's own data
     # directory) since it marks this install.sh run as a whole, not
     # anything specific to the agent package. The EXIT trap set by
     # report_init removes it (only once this run has created it).
