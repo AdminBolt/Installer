@@ -48,6 +48,7 @@ sudo ./install.sh --mariadb-version=10.11
 | `sudo ./install.sh` | Install latest bolt-panel from repo |
 | `sudo ./install.sh --source=<stable\|staging\|testing>` | Install from a specific repository source |
 | `sudo ./install.sh --mariadb-version=<10.11\|11.4>` | MariaDB series to install: `11.4` (default, supported until 2029-05) or `10.11` (supported until 2028-02). Without the option, a server that already runs MariaDB keeps its series |
+| `sudo ./install.sh --without=<mail,dns,ftp>` | Leave optional components out, for servers with little memory (see [Optional components](#optional-components)) |
 | `sudo ./install.sh --channel=<name>` | Name what started the install (`direct` by default; `get-script`, `web-installer`, `vultr`, `akamai`, `node`, `image-build`, `test`, `hostinger`, `digitalocean`, `aws`, `azure`); any other value prints a warning and the install is reported as `direct` |
 | `sudo ./install.sh --no-telemetry` | Do not send the install report (same as `ADMINBOLT_NO_TELEMETRY=1`) |
 | `sudo ./install.sh --ssh-key="<public key>"` | Add an SSH key for root and turn SSH password login for root off once a sign-in with that key is seen (also `--ssh-key=https://...` for a URL that serves keys) |
@@ -75,6 +76,32 @@ The installer runs in 3 stages:
 1. Check prerequisites (root, supported OS, required commands, port 8443 availability)
 2. Prepare system and install prerequisite/Bolt packages
 3. Run `bolt-cli` post-install actions and print access details
+
+## Optional components
+
+Everything is installed by default. On a server with little memory, `--without=` leaves whole components out (comma-separated, or the option given more than once):
+
+| Component | Left out | What stops working |
+|-----------|----------|--------------------|
+| `mail` | Postfix, Dovecot, Rspamd, MLMMJ, Roundcube webmail, the system e-mail account and their profiles | Mailboxes, webmail, mailing lists, and the panel's own e-mail (alerts, password resets), which goes through the server's mail service. The spam filter is part of mail: Postfix refuses mail on its submission ports while Rspamd is missing, so it cannot be left out alone. |
+| `dns` | PowerDNS | The server answers no DNS queries; domains need their DNS hosted elsewhere. The DNS record template is still set up, for when PowerDNS is installed later. |
+| `ftp` | vsftpd and its profile | FTP accounts. Files can still be managed in the panel's file manager. |
+
+```bash
+sudo ./install.sh --without=mail,dns,ftp
+```
+
+Anything else in the value stops the install before it changes anything. The skipped steps are listed as skipped, the end of the install lists what was left out, and the choice is kept in `/etc/bolt/bolt-config.ini` as `BOLT_INSTALL_WITHOUT` (empty when nothing was left out). It records what was asked for, not what is installed: run again with `--without=mail` on a server that already has mail, the key says mail although Postfix and Dovecot stay. The install report does not count a left-out step as failed.
+
+The panel shows every left-out service as not installed on Health > Services. Install there sets up the package only, not the profiles that make it serve, so a component is added later with the commands the installer skipped, as root, in this order (the end of the install prints them):
+
+- `mail`: `bolt-cli manage-postfix --action=install`, `bolt-cli manage-dovecot --action=install`, `bolt-cli manage-rspamd --action=install`, `bolt-cli manage-mlmmj --action=install`, `bolt-php /usr/local/bolt/web/artisan bolt:manage-app --action=install --app-name=roundcube`, `bolt-cli manage-postfix-profiles --action=install`, `bolt-cli manage-dovecot-profiles --action=install`, `bolt-cli manage-rspamd-profiles --action=install`, `bolt-cli manage-system-email-account --action=install`, `systemctl restart rspamd`
+- `dns`: `bolt-cli manage-powerdns --action=install`
+- `ftp`: `bolt-cli manage-vsftpd --action=install`, `bolt-cli manage-vsftpd-profiles --action=install`
+
+The panel does not read `BOLT_INSTALL_WITHOUT` yet and does not hide left-out components: Health shows Postfix, Dovecot, Rspamd and PowerDNS as not installed, with a warning; the default DNS template still adds the mail records (MX, SPF, DMARC, webmail) to new domains; creating a mailbox or an FTP account ends with a message that the server could not do it; a hostname change ends with a warning for the mail steps. The firewall still opens the mail, DNS and FTP ports, with nothing listening on them.
+
+PHP 8.4, Apache, MariaDB, Redis, nftables and SSH are always installed: the panel and the hosting accounts need them. So is Fail2Ban, which protects SSH and the panel login. Antivirus (ImunifyAV, Imunify360, cPGuard) is never installed by the installer; it is a module added in the panel. Backup and the AI agent are not optional either, because leaving them out would save no memory: restic and rclone are two programs that run only while a backup runs, and the AI agent is part of the panel itself, with no service of its own on the server.
 
 ## Install report
 

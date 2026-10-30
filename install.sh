@@ -14,6 +14,7 @@
 #   sudo ./install.sh --source=staging         # use staging pulp repos (stable|staging|testing); default unchanged
 #   sudo ./install.sh --email=user@example.com # activate a 24h trial license for this e-mail (confirmation link extends it to 30 days)
 #   sudo ./install.sh --mariadb-version=10.11  # MariaDB 10.11 instead of the default 11.4 (10.11 or 11.4)
+#   sudo ./install.sh --without=mail,dns,ftp   # leave optional components out (small servers); the end of the install says how to add them later
 #
 set -e
 
@@ -44,6 +45,14 @@ SSH_KEY_LOGIN_ADDR=""
 SSH_KEY_PROOF_SINCE=0
 # Outcome line for the end of the install.
 SSH_PASSWORD_NOTE=""
+# Raw --without= values as given (comma-separated, every occurrence joined),
+# and whether the option was given at all, so an empty value is refused.
+WITHOUT_ARG=""
+WITHOUT_GIVEN=0
+# Components left out, in the order of OPTIONAL_COMPONENTS (set by set_left_out_components).
+LEFT_OUT_COMPONENTS=""
+# "<component> <command>" for every step skipped for them, in the order Stage 3 reached it.
+SKIPPED_COMMANDS=()
 readonly WEB_INSTALL_ROOT="/usr/local/bolt/web"
 readonly POST_INSTALL_DB_PATH="/var/lib/adminbolt/db.sqlite3"
 
@@ -969,8 +978,11 @@ _report_write_panel_settings() {
 _report_ready() {
     local states code
     # One bounded call; it prints one state per unit, all must be "active".
-    states=$(_report_bounded systemctl is-active bolt-agent bolt-nginx bolt-php mariadb postfix dovecot </dev/null 2>/dev/null)
-    [[ "$(printf '%s\n' "$states" | grep -cx active)" -eq 6 ]] || return 1
+    # Without mail (--without=mail) Postfix and Dovecot are not expected.
+    local -a units=(bolt-agent bolt-nginx bolt-php mariadb)
+    _report_in_list mail "$LEFT_OUT_COMPONENTS" || units+=(postfix dovecot)
+    states=$(_report_bounded systemctl is-active "${units[@]}" </dev/null 2>/dev/null)
+    [[ "$(printf '%s\n' "$states" | grep -cx active)" -eq "${#units[@]}" ]] || return 1
     code=$(curl -k -s -o /dev/null -w '%{http_code}' --connect-timeout 2 --max-time 3 "$REPORT_PANEL_URL" </dev/null 2>/dev/null) || true
     [[ "$code" =~ ^[1-4][0-9][0-9]$ ]]
 }
@@ -1485,9 +1497,120 @@ install_packages() {
     print_success "Packages installed"
 }
 
+# ---------------------------------------------------------------------------
+# Optional components (--without=)
+#
+# A small server can leave out whole components. Each one is a set of Stage 3
+# steps, skipped together, because their parts only work together: Postfix
+# hands mail to Dovecot, its submission ports refuse mail while Rspamd is
+# missing (milter_default_action=tempfail), webmail (Roundcube) and the
+# system e-mail account need both. A skipped step is not run and not reported
+# as a result, so the install report does not count it as a failure. The
+# panel computes each service's Installed state on the server, so every
+# skipped service shows as not installed on Health > Services. Install there
+# sets up the package only, not its profiles, so the end of the install
+# prints the skipped commands themselves: run in that order, they add the
+# component later.
+# ---------------------------------------------------------------------------
+readonly OPTIONAL_COMPONENTS="mail dns ftp"
+
+# Stage 3 step ids of an optional component.
+component_steps() {
+    case "$1" in
+        mail) echo "postfix dovecot rspamd mlmmj postfix_profiles dovecot_profiles rspamd_profiles rspamd_restart system_email app_roundcube" ;;
+        dns) echo "powerdns" ;;
+        ftp) echo "vsftpd vsftpd_profile" ;;
+    esac
+}
+
+# What leaving a component out takes away, for --help and the end of the install.
+component_description() {
+    case "$1" in
+        mail) echo "mail: Postfix, Dovecot, Rspamd (spam filter), MLMMJ (mailing lists), Roundcube webmail and the system e-mail account - no mailboxes or webmail, and the panel's own e-mail (alerts, password resets) is not sent" ;;
+        dns) echo "dns: PowerDNS - the server answers no DNS queries, so domains need DNS hosted elsewhere" ;;
+        ftp) echo "ftp: vsftpd - no FTP accounts; files can still be managed in the panel's file manager" ;;
+    esac
+}
+
+# Sets LEFT_OUT_COMPONENTS from a comma-separated list. Every item must be a
+# known component; an empty list or item, or an unknown one, is refused
+# (returns 1, LEFT_OUT_COMPONENTS unchanged) rather than installing more or
+# less than was asked for.
+set_left_out_components() {
+    local list="$1" item component chosen=" " result=""
+    # Lower-case names and commas only: nothing else can name a component,
+    # and a newline would end the split below early.
+    [[ "$list" =~ ^[a-z,]+$ ]] || return 1
+    # A trailing comma would otherwise vanish in the split below.
+    [[ "$list" != *, ]] || return 1
+    local -a items
+    IFS=',' read -r -a items <<<"$list"
+    for item in "${items[@]}"; do
+        _report_in_list "$item" "$OPTIONAL_COMPONENTS" || return 1
+        chosen+="$item "
+    done
+    for component in $OPTIONAL_COMPONENTS; do
+        [[ "$chosen" == *" $component "* ]] && result+="${result:+ }$component"
+    done
+    LEFT_OUT_COMPONENTS="$result"
+}
+
+# Prints the left-out component a Stage 3 step belongs to; returns 1 when the
+# step is to run.
+left_out_component_of_step() {
+    local step="$1" component
+    for component in $LEFT_OUT_COMPONENTS; do
+        if _report_in_list "$step" "$(component_steps "$component")"; then
+            printf '%s' "$component"
+            return 0
+        fi
+    done
+    return 1
+}
+
+# Returns 0 (after saying so, and keeping the command for the end of the
+# install) when the step belongs to a left-out component.
+skip_left_out_step() {
+    local step="$1" desc="$2" cmd="$3" component
+    component=$(left_out_component_of_step "$step") || return 1
+    SKIPPED_COMMANDS+=("$component $cmd")
+    print_info "${desc}: skipped (--without=${component})"
+    echo -e ""
+    return 0
+}
+
+# The choice is kept for the panel in bolt-config.ini, next to the install
+# ID: only the installer knows that a service is missing because it was
+# left out. Written on every install, empty when nothing was left out, so a
+# reinstall that puts everything back leaves no old list behind.
+write_left_out_components() {
+    local value="${LEFT_OUT_COMPONENTS// /,}"
+    _report_ini_set "$REPORT_BOLT_CONFIG" BOLT_INSTALL_WITHOUT "$value" \
+        || echo -e "${YELLOW}WARNING:${NC} could not write BOLT_INSTALL_WITHOUT=${value} to ${REPORT_BOLT_CONFIG}; set it with: bolt-cli set-ini-settings BOLT_INSTALL_WITHOUT ${value:-\"\"}"
+}
+
+print_left_out_components() {
+    local component
+    [[ -n "$LEFT_OUT_COMPONENTS" ]] || return 0
+    echo -e "${YELLOW}NOTE:${NC} Left out at your request (--without):"
+    for component in $LEFT_OUT_COMPONENTS; do
+        echo "  - $(component_description "$component")"
+    done
+    echo "To add one later, run the commands skipped for it as root, in this order:"
+    local entry
+    for component in $LEFT_OUT_COMPONENTS; do
+        echo "  ${component}:"
+        for entry in "${SKIPPED_COMMANDS[@]}"; do
+            [[ "${entry%% *}" == "$component" ]] && echo "    ${entry#* }"
+        done
+    done
+    echo -e ""
+}
+
 # $3 (optional) = step id for the install report.
 run_or_warn() {
     local cmd="$1" desc="${2:-Command}" step="${3:-}"
+    skip_left_out_step "$step" "$desc" "$cmd" && return 0
     print_info "$desc"
     report_step_start "$step"
     if eval "$cmd"; then print_success "$desc completed"; report_step_result "$step" ok; else echo -e "${YELLOW}WARNING:${NC} $desc failed (continuing)"; report_step_result "$step" failed; fi
@@ -1495,6 +1618,7 @@ run_or_warn() {
 }
 run_or_fail() {
     local cmd="$1" desc="${2:-Command}" step="${3:-}"
+    skip_left_out_step "$step" "$desc" "$cmd" && return 0
     report_step_start "$step"
     if ! eval "$cmd"; then print_error "${desc} failed"; report_fail "$step"; exit 1; fi
     report_step_result "$step" ok
@@ -1674,6 +1798,7 @@ stage2_install_bolt_packages() {
     install_bolt_agent_and_check_post
     install_bolt_panel_and_check_post "$panel_pkg"
     report_write_panel_settings
+    write_left_out_components
     report_step_start web_services_enable
     systemctl enable --now bolt-nginx bolt-php
     report_step_result web_services_enable ok
@@ -1793,6 +1918,7 @@ stage_configuration() {
     echo -e "${BOLD}${GREEN}|          Installation Completed Successfully             |${NC}"
     echo -e "${BOLD}${GREEN}+----------------------------------------------------------+${NC}\n"
     [ -n "${ADMIN_EMAIL}" ] && [ "${TRIAL_LICENCE_OK}" -eq 0 ] && echo -e "${YELLOW}NOTE:${NC} Trial licence not issued (request refused or licence server unreachable). The installation itself succeeded and the panel is usable; activate a licence on its License page.\n"
+    print_left_out_components
     [ -n "${SSO_URL:-}" ] && echo -e "${BOLD}${CYAN}--- Access ---${NC}\n${GREEN}Admin Panel:${NC}\n${BOLD}${SSO_URL}${NC}\n"
     echo -e "${GREEN}New SSO URL:${NC}\n${BOLD}bolt-cli admin-sso-generate${NC}"
     print_progress "100% — post-install"
@@ -1813,13 +1939,19 @@ mariadb_series_to_install() {
 
 # ---------- Main ----------
 print_usage() {
-    echo "Usage: sudo $0 [--help] [--version=<PANEL_VERSION>] [--source=<stable|staging|testing>] [--email=<address>] [--mariadb-version=<10.11|11.4>] [--channel=<name>] [--no-telemetry] [--ssh-key=<public key|https URL>]"
+    echo "Usage: sudo $0 [--help] [--version=<PANEL_VERSION>] [--source=<stable|staging|testing>] [--email=<address>] [--mariadb-version=<10.11|11.4>] [--without=<mail,dns,ftp>] [--channel=<name>] [--no-telemetry] [--ssh-key=<public key|https URL>]"
     echo "AlmaLinux 9 / Rocky Linux 9. Stages: 1=ready check, 2=(2.1 settings, 2.2 prereq packages, 2.3 bolt packages), 3=post-install."
     echo "If --version is not provided, latest bolt-panel from repo is installed."
     echo "If --source is not provided, the bolt-repo RPM from adminbolt is used (default). Otherwise repos point at pulp content stable/staging/testing."
     echo "If --mariadb-version is not provided, MariaDB ${DEFAULT_MARIADB_SERIES} is installed (long-term series, supported until 2029); --mariadb-version=10.11 installs the previous long-term series (supported until 2028). Without the option, a server that already runs MariaDB keeps its series."
     echo "If --email is provided, a 24h trial licence is requested for that address at the very end of the install (clicking the e-mailed confirmation link extends it to the full trial period); the install completes even if the request is refused."
     echo "Without --email the install proceeds unlicensed; activate on the panel's License page."
+    echo "--without leaves optional components out, for servers with little memory (comma-separated; everything is installed by default):"
+    local component
+    for component in $OPTIONAL_COMPONENTS; do
+        echo "  $(component_description "$component")"
+    done
+    echo "  The end of the install prints the skipped commands, which add a left-out component later."
     echo "--channel names what started the install (${REPORT_CHANNELS// /, }); default direct."
     echo "The installer reports its progress and result (no hostnames, e-mail addresses or passwords) to AdminBolt; --no-telemetry (or ADMINBOLT_NO_TELEMETRY=1) turns this off for the installer and the panel."
     echo "If --ssh-key is provided (a public key, or an https:// URL serving keys), the key is added to root's authorized_keys; SSH password login for root is turned off at the end only after a root sign-in with that key is seen (at a terminal the installer waits up to 10 minutes for one), otherwise it stays on."
@@ -1843,6 +1975,19 @@ main() {
                 ;;
             --mariadb-version=*)
                 MARIADB_SERIES="${arg#--mariadb-version=}"
+                ;;
+            --without=*)
+                # Joined with a comma, so an empty occurrence stays visible and is refused.
+                ((WITHOUT_GIVEN)) && WITHOUT_ARG+=","
+                WITHOUT_ARG+="${arg#--without=}"
+                WITHOUT_GIVEN=1
+                ;;
+            --[Ww][Ii][Tt][Hh][Oo][Uu][Tt]*)
+                # "--without mail", "--without-mail" or "--Without=mail" would
+                # otherwise install everything without a word: the value goes
+                # in the same argument, after "--without=".
+                ((WITHOUT_GIVEN)) && WITHOUT_ARG+=","
+                WITHOUT_GIVEN=1
                 ;;
             --channel=*)
                 REPORT_CHANNEL_ARG="${arg#--channel=}"
@@ -1891,6 +2036,15 @@ main() {
                 exit 1
                 ;;
         esac
+    fi
+
+    if ((WITHOUT_GIVEN)) && ! set_left_out_components "$WITHOUT_ARG"; then
+        local shown="${WITHOUT_ARG:0:40}"
+        shown="${shown//[^[:print:]]/?}"
+        printf '%bERROR:%b Invalid --without=%s (give --without=<list>, comma-separated, of: %s)\n' "$RED" "$NC" "$shown" "${OPTIONAL_COMPONENTS// /, }" >&2
+        print_usage
+        report_fail parse_arguments invalid_argument
+        exit 1
     fi
 
     # Before the @: letters, digits and most other characters RFC 5322 allows
