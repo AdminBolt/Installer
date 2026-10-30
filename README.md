@@ -35,16 +35,39 @@ Use a specific repository source:
 sudo ./install.sh --source=staging
 ```
 
+Install MariaDB 10.11 instead of the default 11.4:
+
+```bash
+sudo ./install.sh --mariadb-version=10.11
+```
+
 ### Command reference
 
 | Command | Description |
 |---------|-------------|
 | `sudo ./install.sh` | Install latest bolt-panel from repo |
 | `sudo ./install.sh --source=<stable\|staging\|testing>` | Install from a specific repository source |
+| `sudo ./install.sh --mariadb-version=<10.11\|11.4>` | MariaDB series to install: `11.4` (default, supported until 2029-05) or `10.11` (supported until 2028-02). Without the option, a server that already runs MariaDB keeps its series |
 | `sudo ./install.sh --without=<mail,dns,ftp>` | Leave optional components out, for servers with little memory (see [Optional components](#optional-components)) |
 | `sudo ./install.sh --channel=<name>` | Name what started the install (`direct` by default; `get-script`, `web-installer`, `vultr`, `akamai`, `node`, `image-build`, `test`, `hostinger`, `digitalocean`, `aws`, `azure`); any other value prints a warning and the install is reported as `direct` |
 | `sudo ./install.sh --no-telemetry` | Do not send the install report (same as `ADMINBOLT_NO_TELEMETRY=1`) |
+| `sudo ./install.sh --ssh-key="<public key>"` | Add an SSH key for root and turn SSH password login for root off once a sign-in with that key is seen (also `--ssh-key=https://...` for a URL that serves keys) |
 | `sudo ./install.sh --help` | Show usage information |
+
+### SSH key and password login
+
+`--ssh-key` takes one public key (`ssh-ed25519 AAAA... comment`) or an `https://` URL that returns one key per line.
+The key is checked before anything is installed and added to `/root/.ssh/authorized_keys`; keys already there stay.
+
+At the end of the install, SSH password login for root is turned off only when all of these hold (other users, such as hosting accounts, keep theirs):
+
+- the key is still in root's `authorized_keys`;
+- sshd lets root sign in with a key, for the address the key was used from;
+- none of the files sshd reads root's keys from (its `AuthorizedKeysFile` list) holds the key with options such as `command=`, `restrict` or `no-pty`, and sshd does not take root's keys from an `AuthorizedKeysCommand`;
+- sshd logs a root sign-in with that key after the installer has set up SSH. The installer asks you to sign in with the key from a new terminal and waits up to 10 minutes (Enter skips). Without a terminal (for example cloud-init) there is no such sign-in, so password login stays on.
+
+Otherwise password login stays on and the installer prints the reason and the command to turn it off later.
+Password login for root is turned off by `/etc/ssh/sshd_config.d/00-adminbolt-ssh-key-only.conf`; remove that file and run `systemctl reload sshd` to allow it again.
 
 ## Install flow
 
