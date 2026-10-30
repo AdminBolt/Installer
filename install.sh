@@ -45,7 +45,6 @@ SSH_KEY_PROOF_SINCE=0
 # Outcome line for the end of the install.
 SSH_PASSWORD_NOTE=""
 readonly WEB_INSTALL_ROOT="/usr/local/bolt/web"
-AB2236_CI_DEMO=1
 
 # Colors
 RED='\033[0;31m'
