@@ -62,7 +62,10 @@ print_error() { echo -e "${RED}ERROR:${NC} $1" >&2; }
 # A value the user typed, made safe to show in a message: cut to 40
 # characters, anything unprintable as "?". Print the result with %s, never
 # through print_error or echo -e, so escape sequences are not interpreted.
+# Filtered under LC_ALL=C, so every non-ASCII byte is "?" too, whatever the
+# box's locale (a UTF-8 locale would let through e.g. U+202E).
 shown_arg() {
+    local LC_ALL=C
     local v="${1:0:40}"
     printf '%s' "${v//[^[:print:]]/?}"
 }
