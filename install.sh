@@ -1566,35 +1566,63 @@ stage2_install_prerequisite_packages() {
 
 # dnf reports a failed %post scriptlet as a warning but the package
 # transaction still exits 0, so install_packages()'s exit-code check cannot
-# see it - bolt-agent's %post ends with `systemctl enable/restart/start
-# bolt-agent`, and a failure earlier in the script (permissions, disk space,
-# a real certificate issuance failure the self-signed fallback did not
-# catch) aborts before reaching that. Left undetected here, the only symptom
-# shows up later in Stage 3 as a bare agent connection error, which does not
-# name the actual cause. Kept separate from install_packages() (used by
-# every other package install in this script) so this check only ever
-# applies to bolt-agent, and every other install keeps its existing
-# behavior unchanged.
+# see it - a failure in bolt-agent's %post (permissions, disk space, a real
+# certificate issuance failure the self-signed fallback did not catch) stops
+# the rest of the agent's setup. Left undetected here, the only symptom shows
+# up later in Stage 3 as a bare agent connection error, which does not name
+# the actual cause. Kept separate from install_packages() (used by every
+# other package install in this script) so this check only ever applies to
+# bolt-agent, and every other install keeps its existing behavior unchanged.
+#
+# AB-2277: the failed %post does not undo the package install, so on the
+# rerun the error message asks for, rpm -q alone would report bolt-agent as
+# installed and skip it. Nor is the service state enough: the package's
+# %posttrans enables and restarts bolt-agent whatever %post did, so an agent
+# whose setup stopped halfway is often running. A failed %post therefore
+# leaves AGENT_POST_FAILED_MARKER behind, and an installed bolt-agent is
+# installed again (its %post with it) while that marker exists or the
+# service is not running. A clean %post removes the marker.
+AGENT_POST_FAILED_MARKER="/var/lib/adminbolt/agent-post-failed"
 install_bolt_agent_and_check_post() {
     report_step_start agent_install
+    local again=0
     if rpm -q bolt-agent &>/dev/null; then
-        print_success "bolt-agent already installed"
-        return 0
+        if [[ ! -e "$AGENT_POST_FAILED_MARKER" ]] && systemctl is-active --quiet bolt-agent 2>/dev/null; then
+            print_success "bolt-agent already installed"
+            return 0
+        fi
+        again=1
+        print_info "bolt-agent is installed but its setup did not finish; installing it again"
     fi
 
-    local log dnf_status
-    log=$(mktemp)
-    if command -v dnf >/dev/null 2>&1; then
-        dnf install -y --enablerepo=bolt bolt-agent 2>&1 | tee "$log"
-        dnf_status=${PIPESTATUS[0]}
-    elif command -v yum >/dev/null 2>&1; then
-        yum install -y --enablerepo=bolt bolt-agent 2>&1 | tee "$log"
-        dnf_status=${PIPESTATUS[0]}
+    local pm log dnf_status
+    if command -v dnf >/dev/null 2>&1; then pm=dnf
+    elif command -v yum >/dev/null 2>&1; then pm=yum
     else
-        rm -f "$log"
         print_error "dnf/yum not found"
         report_fail agent_install agent_install_failed
         exit 1
+    fi
+    log=$(mktemp)
+    if ((again)); then
+        "$pm" reinstall -y --enablerepo=bolt bolt-agent 2>&1 | tee "$log"
+        dnf_status=${PIPESTATUS[0]}
+        # A newer bolt-agent replaced the installed version in the repository,
+        # so there is nothing to reinstall from: upgrade to it instead, which
+        # runs %post as well.
+        if [[ "$dnf_status" -ne 0 ]] && grep -q 'not available' "$log"; then
+            "$pm" upgrade -y --enablerepo=bolt bolt-agent 2>&1 | tee "$log"
+            dnf_status=${PIPESTATUS[0]}
+            if [[ "$dnf_status" -eq 0 ]] && grep -q '^Nothing to do' "$log"; then
+                rm -f "$log"
+                print_error "bolt-agent could not be installed again: the installed version is no longer in the repository and there is no newer one. Run 'dnf reinstall bolt-agent' once it is available, then rerun this installer."
+                report_fail agent_install agent_install_failed
+                exit 1
+            fi
+        fi
+    else
+        "$pm" install -y --enablerepo=bolt bolt-agent 2>&1 | tee "$log"
+        dnf_status=${PIPESTATUS[0]}
     fi
 
     if [[ "$dnf_status" -ne 0 ]]; then
@@ -1605,11 +1633,15 @@ install_bolt_agent_and_check_post() {
     fi
     if grep -Eq '%post\(bolt-agent[^)]*\) scriptlet failed' "$log"; then
         rm -f "$log"
+        # Best effort: a marker that cannot be written leaves the rerun to the
+        # service check alone, never a different error or exit code here.
+        { mkdir -p "$(dirname "$AGENT_POST_FAILED_MARKER")" &&
+            date -u '+%Y-%m-%dT%H:%M:%SZ' >"$AGENT_POST_FAILED_MARKER"; } 2>/dev/null || true
         print_error "bolt-agent's post-install script (%post) failed. Check the output above (or 'journalctl -u bolt-agent') for the cause, fix it, then rerun this installer."
         report_fail agent_scriptlet agent_install_failed
         exit 1
     fi
-    rm -f "$log"
+    rm -f "$log" "$AGENT_POST_FAILED_MARKER"
     report_step_result agent_install ok
     print_success "bolt-agent installed"
 }
