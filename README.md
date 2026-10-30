@@ -101,7 +101,7 @@ The panel shows every left-out service as not installed on Health > Services. In
 
 The panel does not read `BOLT_INSTALL_WITHOUT` yet and does not hide left-out components: Health shows Postfix, Dovecot, Rspamd and PowerDNS as not installed, with a warning; the default DNS template still adds the mail records (MX, SPF, DMARC, webmail) to new domains; creating a mailbox or an FTP account ends with a message that the server could not do it; a hostname change ends with a warning for the mail steps. The firewall still opens the mail, DNS and FTP ports, with nothing listening on them.
 
-PHP 8.4, Apache, MariaDB, Redis, nftables and SSH are always installed: the panel and the hosting accounts need them. So is Fail2Ban, which protects SSH and the panel login. Antivirus (ImunifyAV, Imunify360, cPGuard) is never installed by the installer; it is a module added in the panel.
+PHP 8.4, Apache, MariaDB, Redis, nftables and SSH are always installed: the panel and the hosting accounts need them. So is Fail2Ban, which protects SSH and the panel login. Antivirus (ImunifyAV, Imunify360, cPGuard) is never installed by the installer; it is a module added in the panel. Backup and the AI agent are not optional either, because leaving them out would save no memory: restic and rclone are two programs that run only while a backup runs, and the AI agent is part of the panel itself, with no service of its own on the server.
 
 ## Install report
 

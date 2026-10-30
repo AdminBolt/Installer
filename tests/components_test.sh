@@ -184,6 +184,10 @@ eq "and leaves one line for it" 1 "$(grep -c '^BOLT_INSTALL_WITHOUT' "$CHILD_DIR
 child ini-fail 'REPORT_BOLT_CONFIG=/proc/no-such-dir/bolt-config.ini; LEFT_OUT_COMPONENTS="ftp"; write_left_out_components; echo "RC=$?"'
 check "a config that cannot be written only warns" grep -q 'WARNING:.*could not write BOLT_INSTALL_WITHOUT=ftp' "$CHILD_DIR/out"
 check "and the install goes on" grep -qx 'RC=0' "$CHILD_DIR/out"
+# Stage 2.3 writes the choice right after the panel package is installed:
+# the key is the only way the panel learns what was left out on purpose.
+child ini-stage2 'install_repo_rhel() { :; }; install_bolt_agent_and_check_post() { :; }; install_bolt_panel_and_check_post() { :; }; LEFT_OUT_COMPONENTS="mail ftp"; stage2_install_bolt_packages'
+check "Stage 2.3 writes the choice to bolt-config.ini" grep -qx 'BOLT_INSTALL_WITHOUT=mail,ftp' "$CHILD_DIR/etc/bolt-config.ini"
 
 # ---------------------------------------------------------------------------
 echo "# readiness (install report)"
