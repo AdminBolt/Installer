@@ -1,0 +1,24 @@
+name: Repository security checks
+
+# AB-2280: every AdminBolt repository the installer writes checks package
+# signatures and the mirror certificate, the downloaded bolt-repo package is
+# verified before it is installed, and nothing in install.sh turns a check off.
+# Runs on every pull request and every push; uses no secret.
+
+on:
+  pull_request:
+  push:
+    branches: [dev, staging, main]
+
+permissions:
+  contents: read
+
+jobs:
+  repo-signature:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Package signature and certificate checks
+        run: bash tests/repo_signature_test.sh

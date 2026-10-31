@@ -129,9 +129,16 @@ case "$1" in
 esac
 exit 0
 EOF
+cat >"$T/bin/rpmkeys" <<'EOF'
+#!/usr/bin/env bash
+# AB-2280: the downloaded bolt-repo package counts as signed.
+exit 0
+EOF
 cat >"$T/bin/rpm" <<'EOF'
 #!/usr/bin/env bash
 if [[ -f "$FAKE_DIR/slow" ]]; then echo "$$" >>"$FAKE_DIR/pids"; s=$(cat "$FAKE_DIR/slow"); exec sleep "${s:-6}"; fi
+# AB-2280: the installer imports the AdminBolt package key before any repository.
+[[ "${1:-}" == --import ]] && exit 0
 fmt=""
 names=()
 while [[ $# -gt 0 ]]; do
@@ -189,6 +196,10 @@ REPORT_SHUTDOWN_MARKERS="$CHILD_DIR/run/shutdown-scheduled $CHILD_DIR/run/nologi
 REPORT_UUID_FILE="$CHILD_DIR/no-such-uuid"
 REPORT_MACHINE_ID_FILE="$CHILD_DIR/machine-id"
 BOLT_REPO_FILE="$CHILD_DIR/etc/yum.repos.d/bolt.repo"
+# AB-2280: a stand-in public key, so repo_setup gets past the key check.
+ADMINBOLT_RPM_KEY_DIR="$CHILD_DIR/etc/pki/rpm-gpg"
+adminbolt_release_key() { printf '%s\n' '-----BEGIN PGP PUBLIC KEY BLOCK-----' '' 'telemetry test key' '-----END PGP PUBLIC KEY BLOCK-----'; }
+adminbolt_testing_key() { adminbolt_release_key; }
 REPORT_EUID=\${TEST_EUID:-0}
 $2
 EOF
