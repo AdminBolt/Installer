@@ -113,7 +113,12 @@ check "--source=stable: no testing key" test ! -e "$d/rpm-gpg/RPM-GPG-KEY-adminb
 echo "# default path: the bolt-repo package is verified before it is installed"
 d=$(WITH_KEYS=1 run 'BOLT_SOURCE=""; install_repo_rhel 9')
 check "certificate checked on download (no -k)" bash -c "grep '^curl' '$d/calls' | grep -q 'bolt-repo-' && ! grep '^curl' '$d/calls' | grep -qE ' -[A-Za-z]*k( |$)'"
-check "signature checked with _pkgverify_level all" grep -q "^rpmkeys --checksig --define _pkgverify_level all /tmp/bolt-repo-9.rpm" "$d/calls"
+check "signature checked with _pkgverify_level all" grep -qE "^rpmkeys --dbpath [^ ]+ --checksig --define _pkgverify_level all /tmp/bolt-repo-9.rpm" "$d/calls"
+db=$(sed -nE 's#^rpmkeys --dbpath ([^ ]+) --checksig .*#\1#p' "$d/calls" | head -1)
+check "checked in its own rpm database, not the system keyring" bash -c "[[ -n '$db' ]] && grep -q '^rpm --dbpath $db --initdb' '$d/calls'"
+check "that database holds the release key only" bash -c "[[ \$(grep -c '^rpmkeys --dbpath $db --import' '$d/calls') -eq 1 ]] && grep -q '^rpmkeys --dbpath $db --import $d/rpm-gpg/RPM-GPG-KEY-adminbolt\$' '$d/calls'"
+check "no signature check against the system keyring" bash -c "! grep -qE '^rpmkeys --checksig' '$d/calls'"
+check "the throwaway database is removed" bash -c "[[ -n '$db' && ! -e '$db' ]]"
 check "signed package installed" grep -q '^dnf install -y /tmp/bolt-repo-9.rpm' "$d/calls"
 key_line=$(grep -n '^rpm --import' "$d/calls" | head -1 | cut -d: -f1)
 dl_line=$(grep -n '^curl' "$d/calls" | head -1 | cut -d: -f1)

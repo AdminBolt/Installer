@@ -1453,6 +1453,22 @@ install_adminbolt_rpm_keys() {
     print_success "AdminBolt package key installed"
 }
 
+# Exit 0 when the file carries a valid signature of the AdminBolt release key,
+# checked in a temporary rpm database that holds that one key.
+adminbolt_checksig_release() {
+    local file="$1" db rc
+    db=$(mktemp -d /tmp/adminbolt-rpmdb.XXXXXX) || return 1
+    if rpm --dbpath "$db" --initdb >/dev/null 2>&1 \
+        && rpmkeys --dbpath "$db" --import "${ADMINBOLT_RPM_KEY_DIR}/${ADMINBOLT_RPM_KEY}" >/dev/null 2>&1 \
+        && rpmkeys --dbpath "$db" --checksig --define '_pkgverify_level all' "$file" >/dev/null 2>&1; then
+        rc=0
+    else
+        rc=1
+    fi
+    rm -rf "$db"
+    return "$rc"
+}
+
 # Write bolt / bolt-noarch repos for a pulp content tier (stable, staging, testing).
 # Every section checks the package signature and the mirror certificate (AB-2280).
 install_bolt_repos_from_source() {
@@ -1523,9 +1539,12 @@ install_repo_rhel() {
     local temp_rpm="/tmp/bolt-repo-${el_version}.rpm"
     print_info "Downloading repository package..."
     curl -f -L -o "$temp_rpm" "$rpm_url" || { print_error "Failed to download repo"; report_fail repo_setup repo_download_failed; exit 1; }
-    # dnf does not check the signature of a local file, so it is checked here:
-    # a missing signature or one by another key stops the install.
-    if ! rpmkeys --checksig --define '_pkgverify_level all' "$temp_rpm" >/dev/null 2>&1; then
+    # dnf does not check the signature of a local file, so it is checked here,
+    # against a throwaway rpm database that holds the release key only: the
+    # system keyring may also trust the testing key (a box once installed with
+    # --source=testing), and a missing signature or one by any other key stops
+    # the install.
+    if ! adminbolt_checksig_release "$temp_rpm"; then
         rm -f "$temp_rpm"
         print_error "The downloaded repository package is not signed with the AdminBolt key; nothing was installed from it"
         report_fail repo_setup repo_download_failed

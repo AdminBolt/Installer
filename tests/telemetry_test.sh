@@ -137,8 +137,9 @@ EOF
 cat >"$T/bin/rpm" <<'EOF'
 #!/usr/bin/env bash
 if [[ -f "$FAKE_DIR/slow" ]]; then echo "$$" >>"$FAKE_DIR/pids"; s=$(cat "$FAKE_DIR/slow"); exec sleep "${s:-6}"; fi
-# AB-2280: the installer imports the AdminBolt package key before any repository.
-[[ "${1:-}" == --import ]] && exit 0
+# AB-2280: the installer imports the AdminBolt package key before any repository,
+# and checks bolt-repo in a throwaway rpm database (rpm --dbpath ... --initdb).
+[[ "${1:-}" == --import || "${1:-}" == --dbpath ]] && exit 0
 fmt=""
 names=()
 while [[ $# -gt 0 ]]; do
