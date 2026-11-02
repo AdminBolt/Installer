@@ -76,6 +76,14 @@ The installer runs in 3 stages:
 2. Prepare system and install prerequisite/Bolt packages
 3. Run `bolt-cli` post-install actions and print access details
 
+### When the bolt-agent setup did not finish
+
+The installer stops with an error when the bolt-agent package's setup did not finish (for example on a full disk), and again at the end of the install if the agent is no longer fully set up. Fix the cause it names, then run the installer again: it installs the agent again and connects the panel to it anew, which also updates the agent address the panel has saved.
+
+A damaged `/etc/bolt-agent/agent.conf` that the agent's setup cannot repair is moved to `/var/lib/adminbolt/agent-conf-backup/<date>/` with a `MANIFEST` file, and a new one is written.
+
+If you know the agent's setup failed but the installer says "bolt-agent already installed", run `mkdir -p /var/lib/adminbolt && touch /var/lib/adminbolt/agent-post-failed` and run the installer again. Reinstalling the agent by hand (`dnf reinstall bolt-agent`) does not update the address the panel has saved; run `bolt-cli connect-bolt-agent-with-panel` after it.
+
 ## Install report
 
 Every run reports its progress and result to `https://ai-hub.adminbolt.com/install-events`, so failed installs can be counted and fixed:
