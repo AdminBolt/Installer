@@ -1,0 +1,35 @@
+name: CI
+
+# install.sh is downloaded and run as it is (bolt-migrate takes it from the
+# `latest` branch), so a syntax error reaches every server that installs.
+# bash -n catches that class; the test scripts run the installer's functions
+# against fakes (no network, no root, nothing installed on the runner).
+on:
+  push:
+    branches: [main, latest]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: [self-hosted, adminbolt-ci]
+    # The runner host is shared; the container decides the tools: the bash,
+    # coreutils and util-linux the installer meets on a server.
+    container:
+      image: almalinux:9
+    steps:
+      - uses: actions/checkout@v4
+      - name: Syntax (bash -n)
+        run: bash -n install.sh
+      - name: Test tools
+        run: dnf install -y jq procps-ng
+      - name: Skip flags, CloudLinux and pinned versions (AB-2331)
+        run: bash tests/skip_and_pin_test.sh
+      - name: MariaDB series (AB-2228)
+        run: bash tests/mariadb_default_test.sh
+      - name: E-mail argument (AB-2211)
+        run: bash tests/email_test.sh
+      - name: Install report (AB-2067)
+        run: bash tests/telemetry_test.sh
