@@ -27,6 +27,8 @@ jobs:
         run: dnf install -y jq procps-ng
       - name: Skip flags, CloudLinux and pinned versions (AB-2331)
         run: bash tests/skip_and_pin_test.sh
+      - name: Contract with bolt-migrate
+        run: bash tests/bolt_migrate_contract_test.sh
       - name: MariaDB series (AB-2228)
         run: bash tests/mariadb_default_test.sh
       - name: E-mail argument (AB-2211)
