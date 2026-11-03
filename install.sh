@@ -54,7 +54,6 @@ LEFT_OUT_COMPONENTS=""
 # "<component> <command>" for every step skipped for them, in the order Stage 3 reached it.
 SKIPPED_COMMANDS=()
 readonly WEB_INSTALL_ROOT="/usr/local/bolt/web"
-readonly POST_INSTALL_DB_PATH="/var/lib/adminbolt/db.sqlite3"
 
 # Colors
 RED='\033[0;31m'
@@ -68,6 +67,16 @@ REPO_BASE_URL="https://mirror.adminbolt.com/pulp/content/adminbolt"
 REPO_PACKAGE="bolt-repo-1.0.7-1"
 
 print_error() { echo -e "${RED}ERROR:${NC} $1" >&2; }
+# A value the user typed, made safe to show in a message: cut to 40
+# characters, anything unprintable as "?". Print the result with %s, never
+# through print_error or echo -e, so escape sequences are not interpreted.
+# Filtered under LC_ALL=C, so every non-ASCII byte is "?" too, whatever the
+# box's locale (a UTF-8 locale would let through e.g. U+202E).
+shown_arg() {
+    local LC_ALL=C
+    local v="${1:0:40}"
+    printf '%s' "${v//[^[:print:]]/?}"
+}
 print_success() { echo -e "${GREEN}SUCCESS:${NC} $1"; }
 print_info() { echo -e "${YELLOW}INFO:${NC} $1"; }
 print_progress() { echo -e "${CYAN}PROGRESS:${NC} $1"; }
@@ -177,7 +186,9 @@ INSTALL_MARKER_CREATED=0
 REPORT_CHANNELS="direct get-script web-installer vultr akamai node image-build test hostinger digitalocean aws azure"
 REPORT_REASONS="not_root unsupported_os invalid_argument missing_command port_in_use repo_download_failed package_install_failed agent_install_failed panel_scriptlet_failed agent_panel_connect_failed required_step_failed readiness_check_failed interrupted unclassified"
 
-# required | optional | unknown
+# Prints the class of one install step id for the report: required (its failure
+# is the install's failure), optional (its failure only adds a warning) or
+# unknown (not a step id).
 report_step_class() {
     case "$1" in
         check_root|check_os|check_commands|check_port_8443|parse_arguments) echo required ;;
@@ -1068,13 +1079,11 @@ stage_prerequisites() {
     print_success "Detected: $distro_info"
     # Required commands
     report_step_start check_commands
-    for cmd in curl; do
-        if ! command -v "$cmd" >/dev/null 2>&1; then
-            print_error "Required command not found: $cmd"
-            report_fail check_commands missing_command
-            exit 1
-        fi
-    done
+    if ! command -v curl >/dev/null 2>&1; then
+        print_error "Required command not found: curl"
+        report_fail check_commands missing_command
+        exit 1
+    fi
     check_port_8443
     # AB-2106: a bad key stops the install here, before anything is changed.
     if [[ -n "$SSH_KEY_ARG" ]]; then
@@ -1093,6 +1102,7 @@ detect_distribution() {
     if [ ! -f /etc/os-release ]; then
         return 1
     fi
+    # shellcheck source=/dev/null
     . /etc/os-release
     case "$ID" in
         almalinux|rocky) ;;
@@ -1690,35 +1700,235 @@ stage2_install_prerequisite_packages() {
 
 # dnf reports a failed %post scriptlet as a warning but the package
 # transaction still exits 0, so install_packages()'s exit-code check cannot
-# see it - bolt-agent's %post ends with `systemctl enable/restart/start
-# bolt-agent`, and a failure earlier in the script (permissions, disk space,
-# a real certificate issuance failure the self-signed fallback did not
-# catch) aborts before reaching that. Left undetected here, the only symptom
-# shows up later in Stage 3 as a bare agent connection error, which does not
-# name the actual cause. Kept separate from install_packages() (used by
-# every other package install in this script) so this check only ever
-# applies to bolt-agent, and every other install keeps its existing
-# behavior unchanged.
-install_bolt_agent_and_check_post() {
-    report_step_start agent_install
-    if rpm -q bolt-agent &>/dev/null; then
-        print_success "bolt-agent already installed"
+# see it - a failure in bolt-agent's %post (permissions, disk space, a real
+# certificate issuance failure the self-signed fallback did not catch) stops
+# the rest of the agent's setup. Left undetected here, the only symptom shows
+# up later in Stage 3 as a bare agent connection error, which does not name
+# the actual cause. Kept separate from install_packages() (used by every
+# other package install in this script) so this check only ever applies to
+# bolt-agent, and every other install keeps its existing behavior unchanged.
+#
+# The failed %post does not undo the package install, so on the rerun the
+# error message asks for, rpm -q alone would report bolt-agent as installed
+# and skip it. Nor is the service state enough: %post does not start the
+# agent, the package's %posttrans enables and restarts it whatever %post did,
+# so an agent whose setup stopped halfway is often running. And a clean
+# looking %post proves nothing either: the package records nothing when its
+# %post finishes, much of it ignores its own errors (a full disk turns the
+# certificate step into a warning and leaves HTTPS off), and the copy of
+# dnf's output the failure message is looked for in can itself be lost to a
+# full disk. So the setup counts as done only on positive proof: dnf
+# succeeded, its complete output names no failed %post, and the end state a
+# finished %post and %posttrans leave behind is there (agent_setup_problems).
+# Anything short of that stops the install and leaves AGENT_POST_FAILED_MARKER
+# behind; while it exists an installed bolt-agent is installed again (its
+# %post with it), and only that positive proof removes it. Without the marker
+# an installed agent is installed again too when its end state is
+# incomplete, or - only as a best effort, carrying on as before if that
+# cannot be done - when it is not running.
+AGENT_POST_FAILED_MARKER="/var/lib/adminbolt/agent-post-failed"
+AGENT_CONF="/etc/bolt-agent/agent.conf"
+AGENT_CONF_BACKUP_DIR="/var/lib/adminbolt/agent-conf-backup"
+AGENT_ACTIVE_WAIT_SECONDS=30
+
+# Value of KEY in [SECTION] of agent.conf, read the way bolt-agent's own
+# scripts read it.
+agent_conf_value() {
+    awk -F= -v section="[$1]" -v key="$2" '
+        index($0, section) == 1 { in_s = 1; next }
+        /^\[/ { in_s = 0 }
+        in_s && $1 == key { sub(/^[^=]*=/, "", $0); print $0; exit }
+    ' "$AGENT_CONF" 2>/dev/null
+}
+
+# What is wrong with an existing agent.conf that bolt-agent's %post cannot put
+# right: it keeps an existing file and only appends a few sections to it, so
+# a file cut short (a full disk while %post wrote it) stays broken on every
+# rerun - without the certificate paths %post stops each time, without the
+# [security] section or with an empty token the agent has no token. Prints
+# the first such problem; returns 0 when there is one.
+agent_conf_damage() {
+    [[ -e "$AGENT_CONF" ]] || return 1
+    if [[ ! -s "$AGENT_CONF" ]]; then echo "$AGENT_CONF is empty"; return 0; fi
+    if ! grep -q '^\[server\]' "$AGENT_CONF"; then echo "$AGENT_CONF has no [server] section"; return 0; fi
+    local key
+    for key in https_cert_path https_key_path https_ca_path; do
+        if [[ -z "$(agent_conf_value server "$key")" ]]; then echo "$AGENT_CONF has no $key"; return 0; fi
+    done
+    if ! grep -q '^\[security\]' "$AGENT_CONF"; then echo "$AGENT_CONF has no [security] section"; return 0; fi
+    if grep -q '^token=' "$AGENT_CONF" && [[ -z "$(agent_conf_value security token)" ]]; then
+        echo "$AGENT_CONF has an empty token"
         return 0
     fi
+    return 1
+}
 
-    local log dnf_status
-    log=$(mktemp)
-    if command -v dnf >/dev/null 2>&1; then
-        dnf install -y --enablerepo=bolt bolt-agent 2>&1 | tee "$log"
-        dnf_status=${PIPESTATUS[0]}
-    elif command -v yum >/dev/null 2>&1; then
-        yum install -y --enablerepo=bolt bolt-agent 2>&1 | tee "$log"
-        dnf_status=${PIPESTATUS[0]}
+# The files a finished %post leaves behind, in every bolt-agent version this
+# installer can install: agent.conf with a token, HTTPS on (%post turns it on
+# once a certificate is in place, or stops) and the certificate files it
+# names. Prints each thing missing, one per line; returns 1 if anything is.
+agent_setup_problems() {
+    local missing=() damage key file
+    if [[ ! -e "$AGENT_CONF" ]]; then
+        missing+=("$AGENT_CONF is missing")
+    elif damage=$(agent_conf_damage); then
+        missing+=("$damage")
     else
-        rm -f "$log"
+        [[ -n "$(agent_conf_value security token)" ]] || missing+=("$AGENT_CONF has no token")
+        grep -Eq '^[[:space:]]*https_enabled=true[[:space:]]*$' "$AGENT_CONF" ||
+            missing+=("HTTPS is off in $AGENT_CONF")
+        for key in https_cert_path https_key_path https_ca_path; do
+            file=$(agent_conf_value server "$key")
+            [[ -s "$file" ]] || missing+=("the certificate file $file is missing or empty")
+        done
+    fi
+    ((${#missing[@]} == 0)) && return 0
+    printf '%s\n' "${missing[@]}"
+    return 1
+}
+
+# The agent service is up: %posttrans restarts it, a crash on start shows as
+# activating or failed for a moment, so it is given AGENT_ACTIVE_WAIT_SECONDS.
+agent_service_active() {
+    local waited=0
+    until systemctl is-active --quiet bolt-agent 2>/dev/null; do
+        ((waited >= AGENT_ACTIVE_WAIT_SECONDS)) && return 1
+        sleep 1
+        waited=$((waited + 1))
+    done
+    return 0
+}
+
+# A likely reason worth naming: a full disk, from dnf's output (when there is
+# a copy, $1) or from what df reports for the directories the setup writes to.
+agent_disk_hint() {
+    local dir avail
+    if [[ -n "${1:-}" && -s "$1" ]] && grep -q 'No space left on device' "$1"; then
+        echo "the disk is full (No space left on device)"
+        return 0
+    fi
+    for dir in /etc /var/lib "${TMPDIR:-/tmp}"; do
+        avail=$(df -Pk "$dir" 2>/dev/null | awk 'NR == 2 { print $4 }') || avail=""
+        if [[ "$avail" =~ ^[0-9]+$ ]] && ((avail < 20480)); then
+            echo "the disk holding $dir is (almost) full, ${avail} KB free"
+            return 0
+        fi
+    done
+    return 0
+}
+
+# Stops the install because bolt-agent's setup is not done. $1 says what went
+# wrong, $2 (optional) what to do. The marker is left behind so the rerun
+# installs the agent again; if it cannot be written (and is not there), the
+# message says so and how to make the rerun do it anyway.
+agent_setup_failed() {
+    local next="${2:-Fix the cause, then rerun this installer; it retries the agent install.}"
+    { mkdir -p "$(dirname "$AGENT_POST_FAILED_MARKER")" &&
+        date -u '+%Y-%m-%dT%H:%M:%SZ' >"$AGENT_POST_FAILED_MARKER"; } 2>/dev/null || true
+    if [[ ! -e "$AGENT_POST_FAILED_MARKER" ]]; then
+        next="The installer could not record this failure in $AGENT_POST_FAILED_MARKER, so a rerun may not install the agent again by itself. Fix the cause, run 'mkdir -p $(dirname "$AGENT_POST_FAILED_MARKER") && touch $AGENT_POST_FAILED_MARKER', then rerun this installer."
+    fi
+    print_error "$1 $next"
+    report_fail agent_scriptlet agent_install_failed
+    exit 1
+}
+
+# Moves a damaged agent.conf (agent_conf_damage, $1) into a dated copy under
+# AGENT_CONF_BACKUP_DIR, next to a MANIFEST saying what it was and why it was
+# moved, so the agent's %post writes a new one. The manifest is written
+# first; when either step fails nothing is moved and the install stops.
+set_aside_agent_conf() {
+    local reason="$1" dir sum size
+    dir="$AGENT_CONF_BACKUP_DIR/$(date -u '+%Y%m%dT%H%M%SZ')"
+    sum=$(sha256sum "$AGENT_CONF" 2>/dev/null | awk '{ print $1 }') || sum=""
+    size=$(wc -c <"$AGENT_CONF" 2>/dev/null | tr -d ' ') || size=""
+    if ! { mkdir -p "$dir" && chmod 700 "$dir" &&
+        printf 'original=%s\nmoved_at=%s\nreason=%s\nsize_bytes=%s\nsha256=%s\nmoved_by=AdminBolt installer (install.sh), before installing bolt-agent again\n' \
+            "$AGENT_CONF" "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" "$reason" "${size:-unknown}" "${sum:-unknown}" >"$dir/MANIFEST" &&
+        mv "$AGENT_CONF" "$dir/agent.conf"; } 2>/dev/null; then
+        agent_setup_failed "bolt-agent's configuration is damaged ($reason) and could not be moved aside to $dir, so its setup cannot write a new one." \
+            "Make room on the disk (or move $AGENT_CONF away yourself), then rerun this installer; it retries the agent install."
+    fi
+    print_info "Moved the damaged $AGENT_CONF to $dir (MANIFEST there says why); bolt-agent's setup writes a new one"
+}
+
+# Runs one package command for bolt-agent ($@: dnf/yum subcommand), on screen
+# and, when there is a temporary file, copied to $log. Sets the caller's
+# dnf_status, and log_ok=0 when the copy is incomplete (writing it failed).
+agent_package_command() {
+    local statuses errexit=0
+    if [[ -z "$log" ]]; then
+        if "$pm" "$@" -y --enablerepo=bolt bolt-agent; then dnf_status=0; else dnf_status=$?; fi
+        return 0
+    fi
+    # Without set -e for the pipeline: a tee that cannot write the copy (a
+    # full disk) must not end the installer without a word.
+    [[ $- == *e* ]] && errexit=1
+    set +e
+    "$pm" "$@" -y --enablerepo=bolt bolt-agent 2>&1 | tee "$log"
+    statuses=("${PIPESTATUS[@]}")
+    ((errexit)) && set -e
+    dnf_status=${statuses[0]}
+    [[ "${statuses[1]}" -eq 0 ]] || log_ok=0
+    return 0
+}
+
+install_bolt_agent_and_check_post() {
+    report_step_start agent_install
+    local again="" problems="" damage="" hint=""
+    if rpm -q bolt-agent &>/dev/null; then
+        if [[ -e "$AGENT_POST_FAILED_MARKER" ]]; then
+            again=marker
+            print_info "bolt-agent is installed but its setup did not finish; installing it again"
+        elif ! problems=$(agent_setup_problems); then
+            again=incomplete
+            print_info "bolt-agent is installed but its setup is incomplete (${problems//$'\n'/; }); installing it again"
+        elif ! systemctl is-active --quiet bolt-agent 2>/dev/null; then
+            again=stopped
+            print_info "bolt-agent is installed but not running; reinstalling it to rerun its setup"
+        else
+            print_success "bolt-agent already installed"
+            return 0
+        fi
+    fi
+    if damage=$(agent_conf_damage); then
+        set_aside_agent_conf "$damage"
+    fi
+
+    local pm log dnf_status=0 log_ok=1
+    if command -v dnf >/dev/null 2>&1; then pm=dnf
+    elif command -v yum >/dev/null 2>&1; then pm=yum
+    else
         print_error "dnf/yum not found"
         report_fail agent_install agent_install_failed
         exit 1
+    fi
+    # No temporary file (a full disk): dnf runs as usual, but nothing can show
+    # its %post was clean, so the setup cannot count as done below.
+    log=$(mktemp 2>/dev/null) || log=""
+    [[ -n "$log" ]] || log_ok=0
+    if [[ -n "$again" ]]; then
+        agent_package_command reinstall
+        if [[ "$dnf_status" -ne 0 && "$again" == stopped ]]; then
+            # Nothing says this agent's setup failed: keep the installed
+            # version and go on, as the installer did before.
+            rm -f "$log"
+            echo -e "${YELLOW}WARNING:${NC} reinstalling bolt-agent failed; keeping the installed version (continuing)"
+            report_step_result agent_install ok
+            return 0
+        fi
+        # The setup did fail. If the installed version is gone from the
+        # repository, upgrade to the newer one there, which runs %post too.
+        if [[ "$dnf_status" -ne 0 && -n "$log" ]] && grep -q 'not available' "$log"; then
+            agent_package_command upgrade
+            if [[ "$dnf_status" -eq 0 && -n "$log" ]] && grep -q '^Nothing to do' "$log"; then
+                rm -f "$log"
+                agent_setup_failed "bolt-agent's setup has to run again, but the installed version is not in the repository and there is no newer one to install." \
+                    "Rerun this installer with the --source (stable, staging or testing) whose repository has this version or a newer one; it retries the agent install."
+            fi
+        fi
+    else
+        agent_package_command install
     fi
 
     if [[ "$dnf_status" -ne 0 ]]; then
@@ -1727,15 +1937,42 @@ install_bolt_agent_and_check_post() {
         report_fail agent_install agent_install_failed
         exit 1
     fi
-    if grep -Eq '%post\(bolt-agent[^)]*\) scriptlet failed' "$log"; then
+    if [[ -n "$log" ]] && grep -Eq '%post\(bolt-agent[^)]*\) scriptlet failed|Error in POSTIN scriptlet in rpm package bolt-agent' "$log"; then
+        hint=$(agent_disk_hint "$log")
         rm -f "$log"
-        print_error "bolt-agent's post-install script (%post) failed. Check the output above (or 'journalctl -u bolt-agent') for the cause, fix it, then rerun this installer."
-        report_fail agent_scriptlet agent_install_failed
-        exit 1
+        agent_setup_failed "bolt-agent's post-install script (%post) failed${hint:+ ($hint)}. Check the output above (or 'journalctl -u bolt-agent') for the cause."
     fi
-    rm -f "$log"
+    if ((log_ok == 0)); then
+        hint=$(agent_disk_hint "")
+        rm -f "$log"
+        agent_setup_failed "The installer could not keep a complete copy of bolt-agent's install output${hint:+ ($hint)}, so nothing shows that the agent's post-install script (%post) finished."
+    fi
+    problems=$(agent_setup_problems) || true
+    agent_service_active || problems+="${problems:+$'\n'}the bolt-agent service is not running"
+    if [[ -n "$problems" ]]; then
+        hint=$(agent_disk_hint "$log")
+        rm -f "$log"
+        agent_setup_failed "bolt-agent's setup did not finish: ${problems//$'\n'/; }${hint:+ (likely cause: $hint)}. Check the output above (or 'journalctl -u bolt-agent')."
+    fi
+    rm -f "$log" "$AGENT_POST_FAILED_MARKER"
     report_step_result agent_install ok
     print_success "bolt-agent installed"
+}
+
+# Stage 3 end: the agent's end state is checked once more before the install
+# is reported complete, so a failure after Stage 2 (a disk that filled up
+# meanwhile, HTTPS turned off) stops the install rather than end in
+# "Installation Completed Successfully".
+check_agent_setup_at_end() {
+    local problems="" hint=""
+    report_step_start agent_scriptlet
+    problems=$(agent_setup_problems) || true
+    agent_service_active || problems+="${problems:+$'\n'}the bolt-agent service is not running"
+    if [[ -n "$problems" ]]; then
+        hint=$(agent_disk_hint "")
+        agent_setup_failed "bolt-agent's setup is not complete at the end of the install: ${problems//$'\n'/; }${hint:+ (likely cause: $hint)}. Check 'journalctl -u bolt-agent'."
+    fi
+    report_step_result agent_scriptlet ok
 }
 
 # bolt-panel's %post (database install, base setup, marking the panel as
@@ -1898,6 +2135,9 @@ stage_configuration() {
     # QA F2: a bare restart under set -e aborted the whole run (no trial
     # licence, no SSO URL, no banner) whenever rspamd was not installed.
     run_or_warn "systemctl restart rspamd" "Rspamd restart" rspamd_restart
+    # Before the trial licence and the SSH password change: a failed install
+    # keeps password login and does not use up the trial request.
+    check_agent_setup_at_end
     # Trial licence last: nothing in the install depends on it, and the licence server refuses repeats
     # per e-mail and per IP, which must never abort an otherwise complete installation.
     local TRIAL_LICENCE_OK=0
@@ -1911,8 +2151,13 @@ stage_configuration() {
     fi
     # AB-2106: last, after every step that configures sshd, so they cannot undo it and a failed install keeps password login.
     ssh_password_login_off || true
-    local SSO_URL=$(bolt-cli admin-sso-generate 2>/dev/null || echo "")
-    [ -z "${SSO_URL}" ] && echo -e "${YELLOW}WARNING:${NC} SSO URL not generated" || print_success "SSO URL generated"
+    local SSO_URL
+    SSO_URL=$(bolt-cli admin-sso-generate 2>/dev/null || echo "")
+    if [ -z "${SSO_URL}" ]; then
+        echo -e "${YELLOW}WARNING:${NC} SSO URL not generated"
+    else
+        print_success "SSO URL generated"
+    fi
     [ -n "${SSH_PASSWORD_NOTE}" ] && echo -e "\n${SSH_PASSWORD_NOTE}"
     echo -e "\n${BOLD}${GREEN}+----------------------------------------------------------+${NC}"
     echo -e "${BOLD}${GREEN}|          Installation Completed Successfully             |${NC}"
@@ -2020,17 +2265,16 @@ main() {
     # reported as direct. The value is shown cut to 40 characters, with
     # anything unprintable as "?", and printed with %s, never interpreted.
     if ((REPORT_CHANNEL_GIVEN)) && ! _report_in_list "$REPORT_CHANNEL_ARG" "$REPORT_CHANNELS"; then
-        local shown="${REPORT_CHANNEL_ARG:0:40}"
-        shown="${shown//[^[:print:]]/?}"
         printf '%bWARNING:%b unknown --channel=%s, reporting this install as direct (known: %s)\n' \
-            "$YELLOW" "$NC" "$shown" "${REPORT_CHANNELS// /, }"
+            "$YELLOW" "$NC" "$(shown_arg "$REPORT_CHANNEL_ARG")" "${REPORT_CHANNELS// /, }"
     fi
 
     if [[ -n "$MARIADB_SERIES" ]]; then
         case "$MARIADB_SERIES" in
             10.11|11.4) ;;
             *)
-                print_error "Invalid --mariadb-version=${MARIADB_SERIES} (supported: 10.11, 11.4)"
+                printf '%bERROR:%b Invalid --mariadb-version=%s (supported: 10.11, 11.4)\n' \
+                    "$RED" "$NC" "$(shown_arg "$MARIADB_SERIES")" >&2
                 print_usage
                 report_fail parse_arguments invalid_argument
                 exit 1
@@ -2055,10 +2299,8 @@ main() {
     # address still only ever reaches bolt-cli as one argument.
     local email_re="^[A-Za-z0-9!#%&'*+/=?^_{|}~.-]+@[A-Za-z0-9-]+(\.[A-Za-z0-9-]+)+\$"
     if [[ -n "$ADMIN_EMAIL" && ! "$ADMIN_EMAIL" =~ $email_re ]]; then
-        local shown="${ADMIN_EMAIL:0:80}"
-        shown="${shown//[^[:print:]]/?}"
         printf '%bERROR:%b Invalid --email=%s (expected name@domain.tld; no spaces, ", $, `, ; or control characters)\n' \
-            "$RED" "$NC" "$shown" >&2
+            "$RED" "$NC" "$(shown_arg "$ADMIN_EMAIL")" >&2
         print_usage
         report_fail parse_arguments invalid_argument
         exit 1
@@ -2068,7 +2310,8 @@ main() {
         case "$BOLT_SOURCE" in
             stable|staging|testing) ;;
             *)
-                print_error "Invalid --source=${BOLT_SOURCE} (allowed: stable, staging, testing)"
+                printf '%bERROR:%b Invalid --source=%s (allowed: stable, staging, testing)\n' \
+                    "$RED" "$NC" "$(shown_arg "$BOLT_SOURCE")" >&2
                 print_usage
                 report_fail parse_arguments invalid_argument
                 exit 1
@@ -2084,7 +2327,7 @@ main() {
     # in the middle of a later stage of this whole panel-plus-agent install -
     # Stage 3 included - and break it. Always removed on exit, success or
     # failure, so a box never gets stuck with a marker nothing will ever
-    # clear. Lives under /var/lib/adminbolt (POST_INSTALL_DB_PATH's own
+    # clear. Lives under /var/lib/adminbolt (the panel's own data
     # directory) since it marks this install.sh run as a whole, not
     # anything specific to the agent package. The EXIT trap set by
     # report_init removes it (only once this run has created it).

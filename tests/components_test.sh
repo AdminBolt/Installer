@@ -46,6 +46,9 @@ bolt-cli() {
 bolt-php() { echo "bolt-php \$*" >>"$CHILD_DIR/calls"; }
 systemctl() { echo "systemctl \$*" >>"$CHILD_DIR/calls"; }
 sleep() { :; }
+# The agent is not installed here; its end-of-install check is tested in
+# agent_post_rerun_test.sh.
+check_agent_setup_at_end() { :; }
 $2
 EOF
     (cd "$CHILD_DIR" && "$BASH" child.sh >"$CHILD_DIR/out" 2>&1)
@@ -125,8 +128,9 @@ check "the end of the install lists what was left out" grep -q 'Left out at your
 check "no mail, DNS or FTP command ran" bash -c "! grep -Ei 'postfix|dovecot|rspamd|mlmmj|roundcube|system-email|powerdns|pdns|vsftpd|ftp' '$CHILD_DIR/calls'"
 # The commands printed for adding each component later are the ones skipped,
 # in Stage 3 order, and the README lists the same ones in the same order.
-printed() { sed -n "/^  $1:\$/,/^  [a-z]*:\$\|^\$/p" "$CHILD_DIR/out" | sed -n 's/^    //p'; }
-readme_listed() { grep -E "^- \`$1\`: " "$(dirname "$INSTALL_SH")/README.md" | sed -e "s/^- \`$1\`: //" -e 's/`, `/\n/g' -e 's/`//g'; }
+# Plain POSIX sed (no \| or \n in a replacement), so BSD sed gives the same lists.
+printed() { sed -En "/^  $1:\$/,/^  [a-z]*:\$|^\$/p" "$CHILD_DIR/out" | sed -n 's/^    //p'; }
+readme_listed() { grep -E "^- \`$1\`: " "$(dirname "$INSTALL_SH")/README.md" | sed -e "s/^- \`$1\`: //" -e 's/`, `/|/g' -e 's/`//g' | tr '|' '\n'; }
 eq "mail: one printed command per skipped step" 10 "$(printed mail | wc -l)"
 check "mail: printed in Stage 3 order" diff <(printed mail) <(printf '%s\n' "bolt-cli manage-postfix --action=install" "bolt-cli manage-dovecot --action=install" "bolt-cli manage-rspamd --action=install" "bolt-cli manage-mlmmj --action=install" "bolt-php /usr/local/bolt/web/artisan bolt:manage-app --action=install --app-name=roundcube" "bolt-cli manage-postfix-profiles --action=install" "bolt-cli manage-dovecot-profiles --action=install" "bolt-cli manage-rspamd-profiles --action=install" "bolt-cli manage-system-email-account --action=install" "systemctl restart rspamd")
 for component in mail dns ftp; do

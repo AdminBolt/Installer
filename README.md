@@ -77,6 +77,14 @@ The installer runs in 3 stages:
 2. Prepare system and install prerequisite/Bolt packages
 3. Run `bolt-cli` post-install actions and print access details
 
+### When the bolt-agent setup did not finish
+
+The installer stops with an error when the bolt-agent package's setup did not finish (for example on a full disk), and again at the end of the install if the agent is no longer fully set up. Fix the cause it names, then run the installer again: it installs the agent again and connects the panel to it anew, which also updates the agent address the panel has saved.
+
+A damaged `/etc/bolt-agent/agent.conf` that the agent's setup cannot repair is moved to `/var/lib/adminbolt/agent-conf-backup/<date>/` with a `MANIFEST` file, and a new one is written.
+
+If you know the agent's setup failed but the installer says "bolt-agent already installed", run `mkdir -p /var/lib/adminbolt && touch /var/lib/adminbolt/agent-post-failed` and run the installer again. Reinstalling the agent by hand (`dnf reinstall bolt-agent`) does not update the address the panel has saved; run `bolt-cli connect-bolt-agent-with-panel` after it.
+
 ## Optional components
 
 Everything is installed by default. On a server with little memory, `--without=` leaves whole components out (comma-separated, or the option given more than once):
@@ -99,7 +107,7 @@ The panel shows every left-out service as not installed on Health > Services. In
 - `dns`: `bolt-cli manage-powerdns --action=install`
 - `ftp`: `bolt-cli manage-vsftpd --action=install`, `bolt-cli manage-vsftpd-profiles --action=install`
 
-The panel does not read `BOLT_INSTALL_WITHOUT` yet and does not hide left-out components: Health shows Postfix, Dovecot, Rspamd and PowerDNS as not installed, with a warning; the default DNS template still adds the mail records (MX, SPF, DMARC, webmail) to new domains; creating a mailbox or an FTP account ends with a message that the server could not do it; a hostname change ends with a warning for the mail steps. The firewall still opens the mail, DNS and FTP ports, with nothing listening on them.
+The panel reads `BOLT_INSTALL_WITHOUT` together with what is installed now, so a component counts as left out only until it is installed: Health raises no warning for its services and lists them on Health > Services, in grey, as not installed by choice; the client screens and Client API routes of the component (and its entries on the Feature List) are withheld, and the API answers `This feature is not installed on this server`; creating a mailbox or an FTP account is refused before anything is stored; new domains get no mail records (MX, SPF, DMARC, DKIM, mail service records, `mail`, `webmail`, `autoconfig`, `autodiscover`) while mail is left out, and no `ftp` name while FTP is. Once the commands above have run, all of it comes back on its own; the key needs no editing. Domains created in the meantime get their mail records when the DNS template is applied again in the panel. A hostname change still ends with a warning for the mail steps, and the firewall still opens the mail, DNS and FTP ports, with nothing listening on them.
 
 PHP 8.4, Apache, MariaDB, Redis, nftables and SSH are always installed: the panel and the hosting accounts need them. So is Fail2Ban, which protects SSH and the panel login. Antivirus (ImunifyAV, Imunify360, cPGuard) is never installed by the installer; it is a module added in the panel. Backup and the AI agent are not optional either, because leaving them out would save no memory: restic and rclone are two programs that run only while a backup runs, and the AI agent is part of the panel itself, with no service of its own on the server.
 
