@@ -59,6 +59,16 @@ REPO_BASE_URL="https://mirror.adminbolt.com/pulp/content/adminbolt"
 REPO_PACKAGE="bolt-repo-1.0.7-1"
 
 print_error() { echo -e "${RED}ERROR:${NC} $1" >&2; }
+# A value the user typed, made safe to show in a message: cut to 40
+# characters, anything unprintable as "?". Print the result with %s, never
+# through print_error or echo -e, so escape sequences are not interpreted.
+# Filtered under LC_ALL=C, so every non-ASCII byte is "?" too, whatever the
+# box's locale (a UTF-8 locale would let through e.g. U+202E).
+shown_arg() {
+    local LC_ALL=C
+    local v="${1:0:40}"
+    printf '%s' "${v//[^[:print:]]/?}"
+}
 print_success() { echo -e "${GREEN}SUCCESS:${NC} $1"; }
 print_info() { echo -e "${YELLOW}INFO:${NC} $1"; }
 print_progress() { echo -e "${CYAN}PROGRESS:${NC} $1"; }
@@ -1875,17 +1885,16 @@ main() {
     # reported as direct. The value is shown cut to 40 characters, with
     # anything unprintable as "?", and printed with %s, never interpreted.
     if ((REPORT_CHANNEL_GIVEN)) && ! _report_in_list "$REPORT_CHANNEL_ARG" "$REPORT_CHANNELS"; then
-        local shown="${REPORT_CHANNEL_ARG:0:40}"
-        shown="${shown//[^[:print:]]/?}"
         printf '%bWARNING:%b unknown --channel=%s, reporting this install as direct (known: %s)\n' \
-            "$YELLOW" "$NC" "$shown" "${REPORT_CHANNELS// /, }"
+            "$YELLOW" "$NC" "$(shown_arg "$REPORT_CHANNEL_ARG")" "${REPORT_CHANNELS// /, }"
     fi
 
     if [[ -n "$MARIADB_SERIES" ]]; then
         case "$MARIADB_SERIES" in
             10.11|11.4) ;;
             *)
-                print_error "Invalid --mariadb-version=${MARIADB_SERIES} (supported: 10.11, 11.4)"
+                printf '%bERROR:%b Invalid --mariadb-version=%s (supported: 10.11, 11.4)\n' \
+                    "$RED" "$NC" "$(shown_arg "$MARIADB_SERIES")" >&2
                 print_usage
                 report_fail parse_arguments invalid_argument
                 exit 1
@@ -1901,10 +1910,8 @@ main() {
     # address still only ever reaches bolt-cli as one argument.
     local email_re="^[A-Za-z0-9!#%&'*+/=?^_{|}~.-]+@[A-Za-z0-9-]+(\.[A-Za-z0-9-]+)+\$"
     if [[ -n "$ADMIN_EMAIL" && ! "$ADMIN_EMAIL" =~ $email_re ]]; then
-        local shown="${ADMIN_EMAIL:0:80}"
-        shown="${shown//[^[:print:]]/?}"
         printf '%bERROR:%b Invalid --email=%s (expected name@domain.tld; no spaces, ", $, `, ; or control characters)\n' \
-            "$RED" "$NC" "$shown" >&2
+            "$RED" "$NC" "$(shown_arg "$ADMIN_EMAIL")" >&2
         print_usage
         report_fail parse_arguments invalid_argument
         exit 1
@@ -1914,7 +1921,8 @@ main() {
         case "$BOLT_SOURCE" in
             stable|staging|testing) ;;
             *)
-                print_error "Invalid --source=${BOLT_SOURCE} (allowed: stable, staging, testing)"
+                printf '%bERROR:%b Invalid --source=%s (allowed: stable, staging, testing)\n' \
+                    "$RED" "$NC" "$(shown_arg "$BOLT_SOURCE")" >&2
                 print_usage
                 report_fail parse_arguments invalid_argument
                 exit 1
