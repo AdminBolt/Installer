@@ -22,3 +22,13 @@ jobs:
           persist-credentials: false
       - name: Package signature and certificate checks
         run: bash tests/repo_signature_test.sh
+      - name: Tests for the key fingerprint check
+        run: bash tests/key_fingerprints_test.sh
+      # The keys install.sh writes are the keys CI signs with (review 1,
+      # point 3). The repository variables hold the fingerprints of the
+      # release and the testing key, the same values as in Panel and bolt-agent.
+      - name: The public keys in install.sh are the signing keys
+        env:
+          RPM_SIGNING_FINGERPRINT: ${{ vars.RPM_SIGNING_FINGERPRINT }}
+          RPM_TESTING_SIGNING_FINGERPRINT: ${{ vars.RPM_TESTING_SIGNING_FINGERPRINT }}
+        run: bash tests/key_fingerprints.sh
