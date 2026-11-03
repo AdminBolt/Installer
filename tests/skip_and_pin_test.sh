@@ -235,6 +235,8 @@ stage3() { # $1 SKIP_DATABASE, $2 SKIP_APACHE, rest = installed packages
 set +e
 sleep() { :; }
 ssh_password_login_off() { :; }
+# The agent end-state check (AB-2277) reads the real agent.conf and service.
+check_agent_setup_at_end() { :; }
 SKIP_DATABASE=$db SKIP_APACHE=$ap
 stage_configuration"
     printf '%s\n' "$@" >"$D/fake/rpm"
