@@ -63,6 +63,7 @@ mariadb_calls() {
         report_step_result() { :; }
         report_fail() { :; }
         print_progress() { :; }
+        check_agent_setup_at_end() { :; }
         MARIADB_SERIES="$series"
         stage_configuration >"$dir/out" 2>&1
     )
