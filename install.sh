@@ -55,7 +55,13 @@ BOLD='\033[1m'
 NC='\033[0m'
 
 REPO_BASE_URL="https://mirror.adminbolt.com/pulp/content/adminbolt"
-REPO_PACKAGE="bolt-repo-1.0.7-1"
+REPO_PACKAGE="bolt-repo-1.0.8-1"
+# AB-2280: every AdminBolt package is signed, and dnf checks it. The public keys
+# are written here and named by the gpgkey line of every AdminBolt section; the
+# bolt-repo package ships the release key at the same path.
+ADMINBOLT_RPM_KEY_DIR="/etc/pki/rpm-gpg"
+ADMINBOLT_RPM_KEY="RPM-GPG-KEY-adminbolt"
+ADMINBOLT_RPM_TESTING_KEY="RPM-GPG-KEY-adminbolt-testing"
 
 print_error() { echo -e "${RED}ERROR:${NC} $1" >&2; }
 # A value the user typed, made safe to show in a message: cut to 40
@@ -982,6 +988,10 @@ _report_ready() {
     # One bounded call; it prints one state per unit, all must be "active".
     states=$(_report_bounded systemctl is-active bolt-agent bolt-nginx bolt-php mariadb postfix dovecot </dev/null 2>/dev/null)
     [[ "$(printf '%s\n' "$states" | grep -cx active)" -eq 6 ]] || return 1
+    # Loopback only: is this server's own panel answering on 8443, behind the
+    # self-signed certificate it starts with. Nothing is downloaded or trusted
+    # from the answer, so this is the one curl allowed to skip the certificate
+    # check (tests/repo_signature_test.sh allows it for REPORT_PANEL_URL only).
     code=$(curl -k -s -o /dev/null -w '%{http_code}' --connect-timeout 2 --max-time 3 "$REPORT_PANEL_URL" </dev/null 2>/dev/null) || true
     [[ "$code" =~ ^[1-4][0-9][0-9]$ ]]
 }
@@ -1401,27 +1411,100 @@ ssh_password_login_off() {
 }
 
 # ---------- Stage 2: Install base packages ----------
+# The AdminBolt package keys (AB-2280), ASCII-armored public keys. The release
+# key signs the staging, stable and adminbolt channels; the testing key signs
+# pull-request builds on the testing channel, and only a --source=testing server
+# trusts it. Replace each placeholder with the output of
+# `gpg --armor --export <fingerprint>`; until then the installer stops before it
+# writes any repository, instead of setting up a server that cannot install.
+adminbolt_release_key() {
+    cat <<'ADMINBOLT_RELEASE_KEY'
+AB-2280-PLACEHOLDER: paste the AdminBolt release public key here.
+ADMINBOLT_RELEASE_KEY
+}
+
+adminbolt_testing_key() {
+    cat <<'ADMINBOLT_TESTING_KEY'
+AB-2280-PLACEHOLDER: paste the AdminBolt testing public key here.
+ADMINBOLT_TESTING_KEY
+}
+
+# gpgkey value of an AdminBolt section for a channel: the release key, plus the
+# testing key on the testing channel.
+adminbolt_gpgkey_value() {
+    local value="file://${ADMINBOLT_RPM_KEY_DIR}/${ADMINBOLT_RPM_KEY}"
+    [[ "$1" == testing ]] && value+=" file://${ADMINBOLT_RPM_KEY_DIR}/${ADMINBOLT_RPM_TESTING_KEY}"
+    printf '%s\n' "$value"
+}
+
+# Write the AdminBolt public keys for a channel ("" = the default bolt-repo
+# path) and import them into rpm. Stops the install when this installer was
+# built without the real keys.
+install_adminbolt_rpm_keys() {
+    local tier="$1" name text
+    local -a names=("$ADMINBOLT_RPM_KEY")
+    [[ "$tier" == testing ]] && names+=("$ADMINBOLT_RPM_TESTING_KEY")
+    mkdir -p "$ADMINBOLT_RPM_KEY_DIR"
+    for name in "${names[@]}"; do
+        if [[ "$name" == "$ADMINBOLT_RPM_KEY" ]]; then text=$(adminbolt_release_key); else text=$(adminbolt_testing_key); fi
+        if [[ "$text" == *AB-2280-PLACEHOLDER* || "$text" != *"-----BEGIN PGP PUBLIC KEY BLOCK-----"* ]]; then
+            print_error "This installer carries no AdminBolt package key (${name}), so packages could not be verified. Download the released installer and run it again."
+            report_fail repo_setup required_step_failed
+            exit 1
+        fi
+        printf '%s\n' "$text" >"${ADMINBOLT_RPM_KEY_DIR}/${name}"
+        chmod 0644 "${ADMINBOLT_RPM_KEY_DIR}/${name}"
+        if ! rpm --import "${ADMINBOLT_RPM_KEY_DIR}/${name}"; then
+            print_error "Could not import the AdminBolt package key ${ADMINBOLT_RPM_KEY_DIR}/${name} into rpm"
+            report_fail repo_setup required_step_failed
+            exit 1
+        fi
+    done
+    print_success "AdminBolt package key installed"
+}
+
+# Exit 0 when the file carries a valid signature of the AdminBolt release key,
+# checked in a temporary rpm database that holds that one key.
+adminbolt_checksig_release() {
+    local file="$1" db rc
+    db=$(mktemp -d /tmp/adminbolt-rpmdb.XXXXXX) || return 1
+    if rpm --dbpath "$db" --initdb >/dev/null 2>&1 \
+        && rpmkeys --dbpath "$db" --import "${ADMINBOLT_RPM_KEY_DIR}/${ADMINBOLT_RPM_KEY}" >/dev/null 2>&1 \
+        && rpmkeys --dbpath "$db" --checksig --define '_pkgverify_level all' "$file" >/dev/null 2>&1; then
+        rc=0
+    else
+        rc=1
+    fi
+    rm -rf "$db"
+    return "$rc"
+}
+
 # Write bolt / bolt-noarch repos for a pulp content tier (stable, staging, testing).
+# Every section checks the package signature and the mirror certificate (AB-2280).
 install_bolt_repos_from_source() {
     local tier="$1"
     local repofile="$BOLT_REPO_FILE"
+    local gpgkey
+    gpgkey=$(adminbolt_gpgkey_value "$tier")
     print_info "Configuring Bolt repositories (source=${tier})..."
     cat >"$repofile" <<EOF
 [bolt]
 name = Adminbolt RHEL - \$releasever - \$basearch
 baseurl = https://mirror.adminbolt.com/pulp/content/${tier}/rhel/\$releasever/\$basearch
 enabled = 1
-gpgcheck = 0
 priority = 300
-sslverify = 0
+gpgcheck = 1
+sslverify = 1
+gpgkey = ${gpgkey}
 
 [bolt-noarch]
 name = Adminbolt RHEL - \$releasever - noarch
 baseurl = https://mirror.adminbolt.com/pulp/content/${tier}/rhel/\$releasever/noarch
 enabled = 1
-gpgcheck = 0
 priority = 400
-sslverify = 0
+gpgcheck = 1
+sslverify = 1
+gpgkey = ${gpgkey}
 EOF
     print_success "Repository file written: ${repofile}"
 }
@@ -1444,7 +1527,7 @@ report_probe_source_repos() {
         left=$((REPORT_PROBE_CAP - ($(date +%s) - start)))
         connect=3
         ((left < connect)) && connect=$left
-        if ((left < 1)) || ! curl -f -s -k -o /dev/null --connect-timeout "$connect" --max-time "$left" \
+        if ((left < 1)) || ! curl -f -s -o /dev/null --connect-timeout "$connect" --max-time "$left" \
             "${url%/}/repodata/repomd.xml" </dev/null >/dev/null 2>&1; then
             REPORT_REPO_UNREACHABLE=1
             return 0
@@ -1454,6 +1537,9 @@ report_probe_source_repos() {
 
 install_repo_rhel() {
     local el_version=$1 rc
+    # The keys first: nothing is installed from an AdminBolt repository before
+    # rpm can check its signature (AB-2280).
+    install_adminbolt_rpm_keys "$BOLT_SOURCE"
     if [[ -n "$BOLT_SOURCE" ]]; then
         install_bolt_repos_from_source "$BOLT_SOURCE"
         report_probe_source_repos "$el_version" || true
@@ -1462,7 +1548,18 @@ install_repo_rhel() {
     local rpm_url="${REPO_BASE_URL}/rhel/${el_version}/noarch/Packages/b/${REPO_PACKAGE}.el${el_version}.noarch.rpm"
     local temp_rpm="/tmp/bolt-repo-${el_version}.rpm"
     print_info "Downloading repository package..."
-    curl -f -L -k -o "$temp_rpm" "$rpm_url" || { print_error "Failed to download repo"; report_fail repo_setup repo_download_failed; exit 1; }
+    curl -f -L -o "$temp_rpm" "$rpm_url" || { print_error "Failed to download repo"; report_fail repo_setup repo_download_failed; exit 1; }
+    # dnf does not check the signature of a local file, so it is checked here,
+    # against a throwaway rpm database that holds the release key only: the
+    # system keyring may also trust the testing key (a box once installed with
+    # --source=testing), and a missing signature or one by any other key stops
+    # the install.
+    if ! adminbolt_checksig_release "$temp_rpm"; then
+        rm -f "$temp_rpm"
+        print_error "The downloaded repository package is not signed with the AdminBolt key; nothing was installed from it"
+        report_fail repo_setup repo_download_failed
+        exit 1
+    fi
     # A failed install of the downloaded package stops the script as before
     # (with rpm's exit code), reported as a package failure.
     (command -v dnf >/dev/null 2>&1 && dnf install -y "$temp_rpm") || (command -v yum >/dev/null 2>&1 && yum install -y "$temp_rpm") || rpm -ivh "$temp_rpm" \

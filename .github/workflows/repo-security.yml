@@ -1,0 +1,34 @@
+name: Repository security checks
+
+# AB-2280: every AdminBolt repository the installer writes checks package
+# signatures and the mirror certificate, the downloaded bolt-repo package is
+# verified before it is installed, and nothing in install.sh turns a check off.
+# Runs on every pull request and every push; uses no secret.
+
+on:
+  pull_request:
+  push:
+    branches: [dev, staging, main]
+
+permissions:
+  contents: read
+
+jobs:
+  repo-signature:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Package signature and certificate checks
+        run: bash tests/repo_signature_test.sh
+      - name: Tests for the key fingerprint check
+        run: bash tests/key_fingerprints_test.sh
+      # The keys install.sh writes are the keys CI signs with (review 1,
+      # point 3). The repository variables hold the fingerprints of the
+      # release and the testing key, the same values as in Panel and bolt-agent.
+      - name: The public keys in install.sh are the signing keys
+        env:
+          RPM_SIGNING_FINGERPRINT: ${{ vars.RPM_SIGNING_FINGERPRINT }}
+          RPM_TESTING_SIGNING_FINGERPRINT: ${{ vars.RPM_TESTING_SIGNING_FINGERPRINT }}
+        run: bash tests/key_fingerprints.sh
