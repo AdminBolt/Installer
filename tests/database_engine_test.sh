@@ -95,8 +95,15 @@ EOF
 chmod +x "$T/bin/"*
 cat >"$T/bin/mysql" <<'EOF'
 #!/usr/bin/env bash
-echo "$*" >>"$FAKE_DIR/mysql.log"
-case "$*" in
+# The command line and, for a call without -e, what came on stdin, each on
+# its own ARGS / STDIN line.
+echo "ARGS: $*" >>"$FAKE_DIR/mysql.log"
+stdin=""
+if [[ " $* " != *" -NBe "* && " $* " != *" -e "* ]]; then
+    stdin=$(cat)
+    echo "STDIN: $stdin" >>"$FAKE_DIR/mysql.log"
+fi
+case "$* $stdin" in
     *"SELECT VERSION()"*) cat "$FAKE_DIR/version" 2>/dev/null; exit 0 ;;
     *"ALTER USER"*) [[ -e "$FAKE_DIR/alter_fails" ]] && exit 1; exit 0 ;;
 esac
@@ -176,7 +183,8 @@ has "8.4: mysql-server installed" "-y install mysql-server" "$(cat "$D/fake/dnf.
 has "8.4: mysqld enabled and started" "enable --now mysqld" "$(cat "$D/fake/systemctl.log")"
 pw=$(sed -n 's/^password="\([0-9a-f]*\)"$/\1/p' "$D/my.cnf")
 eq "8.4: a 48-hex root password in my.cnf" "48" "${#pw}"
-has "8.4: root's password set to it" "ALTER USER 'root'@'localhost' IDENTIFIED BY '${pw}'" "$(cat "$D/fake/mysql.log")"
+has "8.4: root's password set to it, on stdin" "STDIN: ALTER USER 'root'@'localhost' IDENTIFIED BY '${pw}'" "$(cat "$D/fake/mysql.log")"
+hasnt "8.4: the password is not on the mysql command line" "$pw" "$(grep '^ARGS: ' "$D/fake/mysql.log")"
 has "8.4: my.cnf names root" "user=root" "$(cat "$D/my.cnf")"
 mode=$(stat -c %a "$D/my.cnf" 2>/dev/null || stat -f %Lp "$D/my.cnf")
 eq "8.4: my.cnf is 0600" "600" "$mode"

@@ -2328,7 +2328,10 @@ install_mysql_engine() {
     # Hex only: nothing in it needs quoting in SQL or in an option file.
     password=$(od -An -N24 -tx1 /dev/urandom 2>/dev/null | tr -d ' \n')
     [[ "$password" =~ ^[0-9a-f]{48}$ ]] || mysql_engine_failed "no random password could be made"
-    if ! mysql -NBe "ALTER USER 'root'@'localhost' IDENTIFIED BY '${password}';" >/dev/null 2>&1; then
+    # The statement goes in on stdin from the printf builtin: on the mysql
+    # command line the new password would show in ps and /proc to every user
+    # while the client runs.
+    if ! printf "ALTER USER 'root'@'localhost' IDENTIFIED BY '%s';\n" "$password" | mysql -NB >/dev/null 2>&1; then
         mysql_engine_failed "root's password could not be set"
     fi
     if [[ -e "$ROOT_MY_CNF" ]]; then
