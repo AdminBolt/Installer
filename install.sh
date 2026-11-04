@@ -1495,7 +1495,8 @@ rank_bolt_repos() {
             if (sec ~ /^\[bolt/) {print "priority = 50"; next}
         }
         {print}' "$repo" >"$tmp" || { rm -f "$tmp"; return 0; }
-    if cmp -s "$repo" "$tmp"; then
+    # Plain bash comparison: a minimal server has no cmp (diffutils).
+    if [[ "$(<"$repo")" == "$(<"$tmp")" ]]; then
         rm -f "$tmp"
     else
         chmod 0644 "$tmp" && mv -f "$tmp" "$repo" && print_success "Bolt repository priorities set below dnf's default"
