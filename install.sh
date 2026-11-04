@@ -43,6 +43,8 @@ readonly DEFAULT_MARIADB_SERIES="11.4"
 # installer run never replaces one.
 SKIP_DATABASE=0
 SKIP_APACHE=0
+# AB-2339: --database=<mariadb|mysql8.0|mysql8.4>; empty = mariadb.
+DATABASE_ENGINE=""
 DATABASE_SKIP_REASON=""
 DATABASE_SKIP_DECIDED=0
 # Packages that mean a database server is installed. The globs go to rpm -qa.
@@ -1110,6 +1112,13 @@ stage_prerequisites() {
     check_port_8443
     # AB-2331: decided before anything is installed, and said once.
     database_skip_decide
+    # AB-2339: --database=mysql* installs a new server; it never goes over
+    # one that is there (that is --skip-database's job, keeping it).
+    if [[ "$DATABASE_ENGINE" == mysql* ]] && ((SKIP_DATABASE)); then
+        print_error "--database=${DATABASE_ENGINE} installs a new MySQL server, but this server already has a database server (${DATABASE_SKIP_REASON}). Run the installer without --database to keep that server."
+        report_fail check_commands invalid_argument
+        exit 1
+    fi
     # AB-2106: a bad key stops the install here, before anything is changed.
     if [[ -n "$SSH_KEY_ARG" ]]; then
         # Reported as a bad argument, not as the port check that ran before it.
@@ -2026,6 +2035,16 @@ stage_configuration() {
     database_skip_decide
     if ((SKIP_DATABASE)); then
         agent_db_credentials_from_my_cnf
+    elif [[ "$DATABASE_ENGINE" == mysql* ]]; then
+        # AB-2339: MySQL instead of MariaDB. From here on it is a server the
+        # panel did not install, as on a converted server: no MariaDB step.
+        install_mysql_engine
+        agent_db_credentials_from_my_cnf
+        # The panel reads which server it runs (flavor, version, unit) now
+        # rather than at the next nightly refresh.
+        if ! bolt-cli refresh-database-server; then
+            echo -e "${YELLOW}WARNING:${NC} the panel could not read the database server yet; it does so on its own later (bolt-cli refresh-database-server)"
+        fi
     else
         stage_configuration_mariadb
     fi
@@ -2271,6 +2290,66 @@ install_pinned_extra_packages() {
 # Governor on CloudLinux, a cPanel server being converted) and start MariaDB
 # on its data directory.
 
+# AB-2339: MySQL instead of MariaDB, from the distribution's AppStream: 8.0
+# is the plain mysql-server package, 8.4 the mysql:8.4 module stream. The
+# server is started, root gets a random password (the package initialises it
+# with none, on the socket), and the login goes to ROOT_MY_CNF, where the
+# agent's database login is taken from as on any server the panel did not
+# install. The steps after it skip MariaDB (SKIP_DATABASE). A failure stops
+# the install: the panel cannot run without its database server.
+MYSQL_READY_WAIT_SECONDS=60
+install_mysql_engine() {
+    local version="${DATABASE_ENGINE#mysql}" password waited=0 running
+    # Reported under the database server's step id (mariadb): the install
+    # report knows a fixed set of steps (AB-2067).
+    report_step_start mariadb
+    print_info "MySQL ${version} (--database=${DATABASE_ENGINE})"
+    if [[ "$version" == "8.4" ]]; then
+        dnf -y -q module reset mysql >/dev/null 2>&1 || true
+        if ! dnf -y -q module enable mysql:8.4; then
+            mysql_engine_failed "the mysql:8.4 module stream could not be enabled"
+        fi
+    fi
+    if ! dnf -y install mysql-server; then
+        mysql_engine_failed "mysql-server could not be installed"
+    fi
+    if ! systemctl enable --now mysqld; then
+        mysql_engine_failed "mysqld could not be started"
+    fi
+    until mysqladmin --connect-timeout=5 ping >/dev/null 2>&1; do
+        ((waited >= MYSQL_READY_WAIT_SECONDS)) && mysql_engine_failed "mysqld did not answer within ${MYSQL_READY_WAIT_SECONDS} seconds"
+        sleep 1
+        waited=$((waited + 1))
+    done
+    running=$(mysql -NBe 'SELECT VERSION();' 2>/dev/null) || running=""
+    if [[ "$running" != "${version}."* ]]; then
+        mysql_engine_failed "the server reports version '${running:-none}', not MySQL ${version}"
+    fi
+    # Hex only: nothing in it needs quoting in SQL or in an option file.
+    password=$(od -An -N24 -tx1 /dev/urandom 2>/dev/null | tr -d ' \n')
+    [[ "$password" =~ ^[0-9a-f]{48}$ ]] || mysql_engine_failed "no random password could be made"
+    if ! mysql -NBe "ALTER USER 'root'@'localhost' IDENTIFIED BY '${password}';" >/dev/null 2>&1; then
+        mysql_engine_failed "root's password could not be set"
+    fi
+    if [[ -e "$ROOT_MY_CNF" ]]; then
+        cp -p "$ROOT_MY_CNF" "${ROOT_MY_CNF}.bak-$(date -u '+%Y%m%dT%H%M%SZ')" 2>/dev/null || true
+    fi
+    if ! (umask 077 && printf '[client]\nuser=root\npassword="%s"\n' "$password" >"$ROOT_MY_CNF"); then
+        mysql_engine_failed "${ROOT_MY_CNF} could not be written"
+    fi
+    chmod 600 "$ROOT_MY_CNF" 2>/dev/null || true
+    SKIP_DATABASE=1
+    DATABASE_SKIP_REASON="MySQL ${version} installed by --database=${DATABASE_ENGINE}"
+    report_step_result mariadb ok
+    print_success "MySQL ${running} installed; root's login is in ${ROOT_MY_CNF}"
+}
+
+mysql_engine_failed() {
+    print_error "MySQL ${DATABASE_ENGINE#mysql} was not installed: $1."
+    report_fail mariadb package_install_failed
+    exit 1
+}
+
 # Prints why the box counts as having a database server; fails when it has
 # none. A server that answers is enough (mysqladmin ping exits 0 even when it
 # refuses the login); so is any server package, running or not.
@@ -2438,12 +2517,13 @@ agent_db_credentials_from_my_cnf() {
 
 # ---------- Main ----------
 print_usage() {
-    echo "Usage: sudo $0 [--help] [--version=<PANEL_VERSION>] [--agent-version=<version-release>] [--package=<bolt-name>=<version-release> ...] [--source=<stable|staging|testing>] [--email=<address>] [--mariadb-version=<10.11|11.4>] [--skip-database] [--skip-apache] [--channel=<name>] [--no-telemetry] [--ssh-key=<public key|https URL>]"
+    echo "Usage: sudo $0 [--help] [--version=<PANEL_VERSION>] [--agent-version=<version-release>] [--package=<bolt-name>=<version-release> ...] [--source=<stable|staging|testing>] [--email=<address>] [--mariadb-version=<10.11|11.4>] [--database=<mariadb|mysql8.0|mysql8.4>] [--skip-database] [--skip-apache] [--channel=<name>] [--no-telemetry] [--ssh-key=<public key|https URL>]"
     echo "AlmaLinux 9 / Rocky Linux 9 / CloudLinux 9. Stages: 1=ready check, 2=(2.1 settings, 2.2 prereq packages, 2.3 bolt packages), 3=post-install."
     echo "If --version is not provided, latest bolt-panel from repo is installed."
     echo "If --source is not provided, the bolt-repo RPM from adminbolt is used (default). Otherwise repos point at pulp content stable/staging/testing."
     echo "--agent-version installs exactly that bolt-agent build (e.g. 1.30.4-1.el9); --package=<bolt-name>=<version-release> does the same for another bolt-* package (repeatable, e.g. --package=bolt-php=8.4.14-1.el9). Both come from the repositories --source selects (PR builds: --source=testing); the install stops before any Bolt package is installed when a version is not there."
     echo "--skip-database runs no database step (no MariaDB package, series, root password reset or my.cnf profile); the panel uses the MySQL/MariaDB server already on this server, with the administrator login from ${ROOT_MY_CNF} ([client] user= and password=) copied into [dbservers.mariadb] of ${AGENT_CONF}. The database steps are skipped by themselves when a database server answers (mysqladmin ping) or a server package is installed (MariaDB-server, mariadb-server, mysql-server, cl-MySQL*, cl-MariaDB*, ...)."
+    echo "--database=mysql8.0 or --database=mysql8.4 installs MySQL from the distribution (AppStream) instead of MariaDB, sets a random root password in ${ROOT_MY_CNF} and points the panel at it; MariaDB (the default, --database=mariadb) is not installed then. It cannot be combined with --skip-database or --mariadb-version, and it refuses a server that already has a database server."
     echo "--skip-apache runs no Apache step (manage-my-apache and its default profile); the web server is then the caller's to set up."
     echo "If --mariadb-version is not provided, MariaDB ${DEFAULT_MARIADB_SERIES} is installed (long-term series, supported until 2029); --mariadb-version=10.11 installs the previous long-term series (supported until 2028). A server that already has a database server keeps it as it is (see --skip-database)."
     echo "If --email is provided, a 24h trial licence is requested for that address at the very end of the install (clicking the e-mailed confirmation link extends it to the full trial period); the install completes even if the request is refused."
@@ -2475,6 +2555,9 @@ main() {
                 ;;
             --skip-database)
                 SKIP_DATABASE=1
+                ;;
+            --database=*)
+                DATABASE_ENGINE="${arg#--database=}"
                 ;;
             --skip-apache)
                 SKIP_APACHE=1
@@ -2532,6 +2615,27 @@ main() {
                 exit 1
                 ;;
         esac
+    fi
+
+    # AB-2339: the database engine of a new server.
+    if [[ -n "$DATABASE_ENGINE" ]]; then
+        case "$DATABASE_ENGINE" in
+            mariadb|mysql8.0|mysql8.4) ;;
+            *)
+                printf '%bERROR:%b Invalid --database=%s (supported: mariadb, mysql8.0, mysql8.4)\n' \
+                    "$RED" "$NC" "$(shown_arg "$DATABASE_ENGINE")" >&2
+                print_usage
+                report_fail parse_arguments invalid_argument
+                exit 1
+                ;;
+        esac
+        if [[ "$DATABASE_ENGINE" == mysql* ]] && { ((SKIP_DATABASE)) || [[ -n "$MARIADB_SERIES" ]]; }; then
+            printf '%bERROR:%b --database=%s installs MySQL; it cannot be combined with --skip-database or --mariadb-version\n' \
+                "$RED" "$NC" "$DATABASE_ENGINE" >&2
+            print_usage
+            report_fail parse_arguments invalid_argument
+            exit 1
+        fi
     fi
 
     # Before the @: letters, digits and most other characters RFC 5322 allows
