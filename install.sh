@@ -1402,6 +1402,11 @@ ssh_password_login_off() {
 
 # ---------- Stage 2: Install base packages ----------
 # Write bolt / bolt-noarch repos for a pulp content tier (stable, staging, testing).
+#
+# Priorities below dnf's default of 99 (lower wins, AB-1407): the AdminBolt
+# repositories carry their own builds of packages the distribution also ships
+# (httpd, httpd-core, ...), and with the previous 300/400 every such name
+# resolved to appstream/baseos instead - hosts ran the distribution Apache.
 install_bolt_repos_from_source() {
     local tier="$1"
     local repofile="$BOLT_REPO_FILE"
@@ -1412,7 +1417,7 @@ name = Adminbolt RHEL - \$releasever - \$basearch
 baseurl = https://mirror.adminbolt.com/pulp/content/${tier}/rhel/\$releasever/\$basearch
 enabled = 1
 gpgcheck = 0
-priority = 300
+priority = 30
 sslverify = 0
 
 [bolt-noarch]
@@ -1420,7 +1425,7 @@ name = Adminbolt RHEL - \$releasever - noarch
 baseurl = https://mirror.adminbolt.com/pulp/content/${tier}/rhel/\$releasever/noarch
 enabled = 1
 gpgcheck = 0
-priority = 400
+priority = 40
 sslverify = 0
 EOF
     print_success "Repository file written: ${repofile}"
@@ -1468,7 +1473,34 @@ install_repo_rhel() {
     (command -v dnf >/dev/null 2>&1 && dnf install -y "$temp_rpm") || (command -v yum >/dev/null 2>&1 && yum install -y "$temp_rpm") || rpm -ivh "$temp_rpm" \
         || { rc=$?; report_fail repo_setup package_install_failed; exit "$rc"; }
     rm -f "$temp_rpm"
+    rank_bolt_repos "$BOLT_REPO_FILE"
     print_success "Repository installed"
+}
+
+# bolt-repo up to 1.0.7 ships priorities 100 to 400, which lose to dnf's
+# default 99, so a fresh server took httpd from appstream instead of the
+# AdminBolt repositories (AB-1407). Same values as bolt-agent's
+# POST /api/system/repos/bolt and the panel upgrade step; a file that already
+# has them (bolt-repo 1.0.8) is left untouched.
+rank_bolt_repos() {
+    local repo=$1 tmp
+    [[ -f "$repo" ]] || return 0
+    tmp=$(mktemp "${repo%/*}/.bolt.repo.XXXXXX") || return 0
+    awk '/^\[/{sec=$0}
+        /^[[:space:]]*priority[[:space:]]*=/{
+            if (sec=="[bolt-cdn]") {print "priority = 10"; next}
+            if (sec=="[bolt-noarch-cdn]") {print "priority = 20"; next}
+            if (sec=="[bolt]") {print "priority = 30"; next}
+            if (sec=="[bolt-noarch]") {print "priority = 40"; next}
+            if (sec ~ /^\[bolt/) {print "priority = 50"; next}
+        }
+        {print}' "$repo" >"$tmp" || { rm -f "$tmp"; return 0; }
+    # Plain bash comparison: a minimal server has no cmp (diffutils).
+    if [[ "$(<"$repo")" == "$(<"$tmp")" ]]; then
+        rm -f "$tmp"
+    else
+        chmod 0644 "$tmp" && mv -f "$tmp" "$repo" && print_success "Bolt repository priorities set below dnf's default"
+    fi
 }
 
 # Single package install helper: dnf or yum only (AlmaLinux). Skips already-installed. Optional leading args: dnf opts (e.g. --enablerepo=bolt, --exclude=bolt-bootstrap).
