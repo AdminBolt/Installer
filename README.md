@@ -2,7 +2,7 @@
 
 ## Requirements
 
-- **AlmaLinux 9** or **Rocky Linux 9**
+- **AlmaLinux 9**, **Rocky Linux 9** or **CloudLinux 9**
 - Root access (run with `sudo`)
 
 ## Installation
@@ -47,12 +47,36 @@ sudo ./install.sh --mariadb-version=10.11
 |---------|-------------|
 | `sudo ./install.sh` | Install latest bolt-panel from repo |
 | `sudo ./install.sh --source=<stable\|staging\|testing>` | Install from a specific repository source |
-| `sudo ./install.sh --mariadb-version=<10.11\|11.4>` | MariaDB series to install: `11.4` (default, supported until 2029-05) or `10.11` (supported until 2028-02). Without the option, a server that already runs MariaDB keeps its series |
+| `sudo ./install.sh --mariadb-version=<10.11\|11.4>` | MariaDB series to install: `11.4` (default, supported until 2029-05) or `10.11` (supported until 2028-02). A server that already has a database server keeps it as it is (see below) |
 | `sudo ./install.sh --without=<mail,dns,ftp>` | Leave optional components out, for servers with little memory (see [Optional components](#optional-components)) |
+| `sudo ./install.sh --skip-database` | Run no database step: no MariaDB package, series, root password reset or MariaDB profile. The panel uses the database server already on this server (see below) |
+| `sudo ./install.sh --skip-apache` | Run no Apache step (`manage-my-apache` and the default Apache profile); the web server is then set up by whoever runs the installer |
+| `sudo ./install.sh --agent-version=<version-release>` | Install exactly this bolt-agent build (for example `1.30.4-1.el9`) instead of the latest |
+| `sudo ./install.sh --package=<bolt-name>=<version-release>` | Install exactly this build of another `bolt-*` package (for example `--package=bolt-php=8.4.14-1.el9`); repeatable, one package per option |
 | `sudo ./install.sh --channel=<name>` | Name what started the install (`direct` by default; `get-script`, `web-installer`, `vultr`, `akamai`, `node`, `image-build`, `test`, `hostinger`, `digitalocean`, `aws`, `azure`); any other value prints a warning and the install is reported as `direct` |
 | `sudo ./install.sh --no-telemetry` | Do not send the install report (same as `ADMINBOLT_NO_TELEMETRY=1`) |
 | `sudo ./install.sh --ssh-key="<public key>"` | Add an SSH key for root and turn SSH password login for root off once a sign-in with that key is seen (also `--ssh-key=https://...` for a URL that serves keys) |
 | `sudo ./install.sh --help` | Show usage information |
+
+### Existing database server
+
+The installer never installs, upgrades or reconfigures a database server that is already there. The database steps are skipped, with a line saying why, when:
+
+- `--skip-database` is given;
+- a server answers `mysqladmin ping` (or `mariadb-admin ping`);
+- a database server package is installed: `MariaDB-server`, `mariadb-server`, `mysql-server`, `mysql-community-server`, `percona-server-server`, `cl-MySQL*`, `cl-MariaDB*` or `Percona-Server-server*` (MySQL under MySQL Governor on CloudLinux included).
+
+The panel then uses that server, which must listen on `localhost:3306`. bolt-agent needs its administrator login: the installer copies `user=` and `password=` from the `[client]` (or `[mysql]`) section of `/root/.my.cnf` into the `[dbservers.mariadb]` section of `/etc/bolt-agent/agent.conf` (`user` is `root` when only a password is there). Without a password in `/root/.my.cnf` the installer warns and leaves `agent.conf` as it is: set `user=` and `password=` in `[dbservers.mariadb]` yourself (bolt-agent reloads the file by itself).
+
+The readiness check at the end accepts the database server under the `mariadb`, `mysqld` or `mysql` unit.
+
+### Pinned builds
+
+`--version`, `--agent-version` and `--package` install exact builds from the repositories `--source` selects (`stable`, `staging`, or `testing`, where PR builds are published; without `--source` the default bolt-repo). Every pinned build is looked up before any Bolt package is installed, and the install stops with the list of builds that are not there. A pinned build also replaces another version of the package already on the server. `bolt-panel` takes `--version` and `bolt-agent` takes `--agent-version`, not `--package`.
+
+```bash
+sudo ./install.sh --source=testing --agent-version=1.30.4-pr230.1.el9 --package=bolt-php=8.4.14-1.el9
+```
 
 ### SSH key and password login
 
@@ -73,7 +97,7 @@ Password login for root is turned off by `/etc/ssh/sshd_config.d/00-adminbolt-ss
 
 The installer runs in 3 stages:
 
-1. Check prerequisites (root, supported OS, required commands, port 8443 availability)
+1. Check prerequisites (root, supported OS, required commands, port 8443 availability, an existing database server)
 2. Prepare system and install prerequisite/Bolt packages
 3. Run `bolt-cli` post-install actions and print access details
 

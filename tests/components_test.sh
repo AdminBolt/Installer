@@ -215,7 +215,10 @@ _report_ready && echo RC=0 || echo \"RC=\$?\""
 eq "everything installed and running: ready" 0 "$(ready all '' '')"
 eq "mail installed but Postfix down: not ready" 1 "$(ready postfix-down 'postfix' '')"
 eq "mail left out, Postfix and Dovecot absent: ready" 0 "$(ready no-mail 'postfix dovecot' 'mail')"
-eq "mail left out, MariaDB down: not ready" 1 "$(ready no-mail-db-down 'postfix dovecot mariadb' 'mail')"
+# The database counts as up under any of its unit names (mariadb, mysqld,
+# mysql), and MariaDB answers to all three, so "down" is all three inactive.
+eq "mail left out, database down: not ready" 1 "$(ready no-mail-db-down 'postfix dovecot mariadb mysqld mysql' 'mail')"
+eq "mail left out, database under mysqld only: ready" 0 "$(ready no-mail-mysqld 'postfix dovecot mariadb mysql' 'mail')"
 eq "dns left out does not drop mail from the check" 1 "$(ready dns-only 'dovecot' 'dns')"
 
 echo

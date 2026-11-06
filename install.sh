@@ -1,13 +1,13 @@
 #!/bin/bash
 #
-# AdminBolt Install Script (AlmaLinux 9, Rocky Linux 9)
+# AdminBolt Install Script (AlmaLinux 9, Rocky Linux 9, CloudLinux 9)
 #
 # Reorganizes the installation into three stages:
 #   Stage 1: Check that everything is in place and ready for installation
 #   Stage 2: (2.1) Prepare settings → (2.2) Install prerequisite packages → (2.3) Install all Bolt packages
 #   Stage 3: Execute bolt-cli / post-install actions (database, agent, services, profiles, etc.)
 #
-# Supported: AlmaLinux 9, Rocky Linux 9. Panel is installed from RPM; %pre/%post skipped.
+# Supported: AlmaLinux 9, Rocky Linux 9, CloudLinux 9. Panel is installed from RPM; %pre/%post skipped.
 # Usage:
 #   sudo ./install.sh                          # install latest bolt-panel from repo
 #   sudo ./install.sh --version=1.0.0.beta3-v46.el9 # install specific bolt-panel version from repo
@@ -15,6 +15,10 @@
 #   sudo ./install.sh --email=user@example.com # activate a 24h trial license for this e-mail (confirmation link extends it to 30 days)
 #   sudo ./install.sh --mariadb-version=10.11  # MariaDB 10.11 instead of the default 11.4 (10.11 or 11.4)
 #   sudo ./install.sh --without=mail,dns,ftp   # leave optional components out (small servers); the end of the install says how to add them later
+#   sudo ./install.sh --skip-database          # keep the database server already on the box (no MariaDB steps)
+#   sudo ./install.sh --skip-apache            # no Apache steps (the caller sets the web server up)
+#   sudo ./install.sh --source=testing --agent-version=1.30.4-pr230.1.el9 --package=bolt-php=8.4.14-1.el9
+#                                              # exact builds of bolt-agent / other bolt-* packages
 #
 set -e
 
@@ -22,6 +26,11 @@ set -e
 # bolt-panel install: from repo (latest by default; --version= selects a specific version)
 # ---------------------------------------------------------------------------
 PANEL_VERSION=""
+# AB-2331 addendum: --agent-version= (bolt-agent version-release) and
+# --package=<bolt-name>=<version-release> (repeatable), installed exactly,
+# from the repositories --source points at. PINNED_PACKAGES: one name=version per line.
+AGENT_VERSION=""
+PINNED_PACKAGES=""
 # Empty = current behavior (bolt-repo RPM from adminbolt). stable|staging|testing = pulp content path segment.
 BOLT_SOURCE=""
 # E-mail for the trial license; empty = skip the trial request (activate manually on the License page).
@@ -30,6 +39,25 @@ ADMIN_EMAIL=""
 MARIADB_SERIES=""
 # AB-2228: the MariaDB series of a new install (10.11 until then).
 readonly DEFAULT_MARIADB_SERIES="11.4"
+# AB-2331: --skip-database / --skip-apache. A database server already on the
+# box skips the database steps by itself (see database_skip_decide), so an
+# installer run never replaces one.
+SKIP_DATABASE=0
+SKIP_APACHE=0
+DATABASE_SKIP_REASON=""
+DATABASE_SKIP_DECIDED=0
+# Packages that mean a database server is installed. The globs go to rpm -qa.
+readonly DATABASE_SERVER_PACKAGES="MariaDB-server mariadb-server mysql-server mysql-community-server percona-server-server"
+readonly DATABASE_SERVER_PACKAGE_GLOBS="cl-MySQL* cl-MariaDB* Percona-Server-server*"
+# The systemd units a MySQL-compatible server runs under, in the order they are looked for.
+readonly DATABASE_UNITS="mariadb mysqld mysql"
+# With the database skipped, the agent takes the server's credentials from here.
+ROOT_MY_CNF="/root/.my.cnf"
+AGENT_CONF="/etc/bolt-agent/agent.conf"
+# ID from os-release (almalinux, rocky, cloudlinux), set in Stage 1.
+DISTRO_ID=""
+OS_RELEASE_FILE="/etc/os-release"
+readonly EPEL_RELEASE_URL="https://dl.fedoraproject.org/pub/epel/epel-release-latest-9.noarch.rpm"
 # AB-2106: --ssh-key= value (a public key, or an https:// URL serving keys); empty = no SSH changes.
 SSH_KEY_ARG=""
 # Validated key lines and their SHA256 fingerprints, filled in Stage 1.
@@ -988,12 +1016,18 @@ _report_write_panel_settings() {
 
 _report_ready() {
     local states code
-    # One bounded call; it prints one state per unit, all must be "active".
-    # Without mail (--without=mail) Postfix and Dovecot are not expected.
-    local -a units=(bolt-agent bolt-nginx bolt-php mariadb)
+    # One bounded call; it prints one state per unit, in the order asked. The
+    # services must all be "active" (with --without=mail, Postfix and Dovecot
+    # are not expected), and the database server under one of its unit names
+    # (AB-2331: mariadb, or mysqld / mysql for MySQL, such as cl-MySQL on
+    # CloudLinux; MariaDB answers to all three). systemctl prints "inactive"
+    # for a unit that does not exist.
+    local -a units=(bolt-agent bolt-nginx bolt-php) db_units
     _report_in_list mail "$LEFT_OUT_COMPONENTS" || units+=(postfix dovecot)
-    states=$(_report_bounded systemctl is-active "${units[@]}" </dev/null 2>/dev/null)
-    [[ "$(printf '%s\n' "$states" | grep -cx active)" -eq "${#units[@]}" ]] || return 1
+    read -r -a db_units <<<"$DATABASE_UNITS"
+    states=$(_report_bounded systemctl is-active "${units[@]}" "${db_units[@]}" </dev/null 2>/dev/null)
+    [[ "$(printf '%s\n' "$states" | head -n "${#units[@]}" | grep -cx active)" -eq "${#units[@]}" ]] || return 1
+    printf '%s\n' "$states" | tail -n "+$((${#units[@]} + 1))" | grep -qx active || return 1
     code=$(curl -k -s -o /dev/null -w '%{http_code}' --connect-timeout 2 --max-time 3 "$REPORT_PANEL_URL" </dev/null 2>/dev/null) || true
     [[ "$code" =~ ^[1-4][0-9][0-9]$ ]]
 }
@@ -1068,14 +1102,15 @@ stage_prerequisites() {
         report_fail check_root not_root
         exit 1
     fi
-    # Distro: AlmaLinux 9 or Rocky Linux 9
+    # Distro: AlmaLinux 9, Rocky Linux 9 or CloudLinux 9
     local distro_info
     report_step_start check_os
     if ! distro_info=$(detect_distribution); then
-        print_error "This script supports AlmaLinux 9 and Rocky Linux 9 only. Current system is not supported."
+        print_error "This script supports AlmaLinux 9, Rocky Linux 9 and CloudLinux 9 only. Current system is not supported."
         report_fail check_os unsupported_os
         exit 1
     fi
+    DISTRO_ID="${distro_info%%|*}"
     print_success "Detected: $distro_info"
     # Required commands
     report_step_start check_commands
@@ -1085,6 +1120,8 @@ stage_prerequisites() {
         exit 1
     fi
     check_port_8443
+    # AB-2331: decided before anything is installed, and said once.
+    database_skip_decide
     # AB-2106: a bad key stops the install here, before anything is changed.
     if [[ -n "$SSH_KEY_ARG" ]]; then
         # Reported as a bad argument, not as the port check that ran before it.
@@ -1097,20 +1134,22 @@ stage_prerequisites() {
     print_progress "33% — prerequisites"
 }
 
-# Detect distribution: AlmaLinux 9 or Rocky Linux 9
+# Detect distribution: AlmaLinux 9, Rocky Linux 9 or CloudLinux 9 (AB-2331;
+# a RHEL 9 rebuild, installed the same way). Prints ID|VERSION_ID. Read in a
+# subshell, so os-release sets nothing in the installer's own shell.
 detect_distribution() {
-    if [ ! -f /etc/os-release ]; then
-        return 1
-    fi
-    # shellcheck source=/dev/null
-    . /etc/os-release
-    case "$ID" in
-        almalinux|rocky) ;;
-        *) return 1 ;;
-    esac
-    [[ "$VERSION_ID" =~ ^9(\.[0-9]*)?$ ]] || return 1
-    echo "${ID}|${VERSION_ID}"
-    return 0
+    [ -f "$OS_RELEASE_FILE" ] || return 1
+    (
+        ID="" VERSION_ID=""
+        # shellcheck disable=SC1090
+        . "$OS_RELEASE_FILE" >/dev/null 2>&1 || exit 1
+        case "$ID" in
+            almalinux|rocky|cloudlinux) ;;
+            *) exit 1 ;;
+        esac
+        [[ "$VERSION_ID" =~ ^9(\.[0-9]*)?$ ]] || exit 1
+        echo "${ID}|${VERSION_ID}"
+    )
 }
 
 # ---------- SSH key and password login (AB-2106) ----------
@@ -1649,6 +1688,33 @@ print_left_out_components() {
     echo -e ""
 }
 
+# EPEL from the distribution's own repositories (AlmaLinux and Rocky ship
+# epel-release in extras). AB-2331: when the distribution does not offer it
+# (CloudLinux 9 may not), the release package straight from the Fedora
+# project, which configures the same repositories.
+install_epel_release() {
+    rpm -q epel-release &>/dev/null && return 0
+    if dnf -q list epel-release &>/dev/null; then
+        install_packages epel-release
+    else
+        print_info "epel-release is not in the ${DISTRO_ID:-system} repositories; installing it from ${EPEL_RELEASE_URL}"
+        install_packages "$EPEL_RELEASE_URL"
+    fi
+}
+
+# The repository ids of CodeReady Builder: "crb" on AlmaLinux and Rocky;
+# CloudLinux names its own (AB-2331), so the ids are looked up. Debug and
+# source repositories are left out; "crb" when nothing is found, as before.
+crb_repo_ids() {
+    local ids
+    ids=$(dnf -q repolist --all 2>/dev/null | awk '
+        { id = $1; lid = tolower(id) }
+        id ~ /^[A-Za-z0-9._:-]+$/ && lid ~ /(^|[-_.])(crb|powertools)$|codeready-builder/ && lid !~ /debug|source/ { print id }
+    ' | sort -u | tr '\n' ' ')
+    ids="${ids% }"
+    printf '%s' "${ids:-crb}"
+}
+
 # $3 (optional) = step id for the install report.
 run_or_warn() {
     local cmd="$1" desc="${2:-Command}" step="${3:-}"
@@ -1721,8 +1787,11 @@ stage2_install_prerequisite_packages() {
     print_info "Stage 2.2: Installing prerequisite packages"
     print_info "Enabling CRB (CodeReady Builder) repository"
     report_step_start prerequisite_packages
-    install_packages epel-release dnf-plugins-core
-    run_or_warn "dnf config-manager --set-enabled crb" "Enable CRB repo" crb_repo
+    install_epel_release
+    install_packages dnf-plugins-core
+    local crb_ids
+    crb_ids=$(crb_repo_ids)
+    run_or_warn "dnf config-manager --set-enabled ${crb_ids}" "Enable CRB repo (${crb_ids})" crb_repo
     report_step_start prerequisite_packages
     # Container and minimal AlmaLinux/Rocky 9 images ship curl-minimal and
     # libcurl-minimal, which conflict with the full curl/libcurl below. Replace
@@ -1902,14 +1971,14 @@ set_aside_agent_conf() {
 agent_package_command() {
     local statuses errexit=0
     if [[ -z "$log" ]]; then
-        if "$pm" "$@" -y --enablerepo=bolt bolt-agent; then dnf_status=0; else dnf_status=$?; fi
+        if "$pm" "$@" -y --enablerepo=bolt "$agent_pkg"; then dnf_status=0; else dnf_status=$?; fi
         return 0
     fi
     # Without set -e for the pipeline: a tee that cannot write the copy (a
     # full disk) must not end the installer without a word.
     [[ $- == *e* ]] && errexit=1
     set +e
-    "$pm" "$@" -y --enablerepo=bolt bolt-agent 2>&1 | tee "$log"
+    "$pm" "$@" -y --enablerepo=bolt "$agent_pkg" 2>&1 | tee "$log"
     statuses=("${PIPESTATUS[@]}")
     ((errexit)) && set -e
     dnf_status=${statuses[0]}
@@ -1920,7 +1989,15 @@ agent_package_command() {
 install_bolt_agent_and_check_post() {
     report_step_start agent_install
     local again="" problems="" damage="" hint=""
-    if rpm -q bolt-agent &>/dev/null; then
+    # AB-2331 addendum: --agent-version installs exactly that build. Another
+    # installed version is replaced by a plain install of the pinned
+    # version-release (dnf install of a version-release replaces it), and the
+    # checks below apply to the pinned build once it is the installed one.
+    local agent_pkg
+    agent_pkg=$(pinned_spec bolt-agent)
+    if [[ "$agent_pkg" != bolt-agent ]] && rpm -q bolt-agent &>/dev/null && ! rpm -q "$agent_pkg" &>/dev/null; then
+        print_info "bolt-agent $(rpm -q --qf '%{VERSION}-%{RELEASE}' bolt-agent 2>/dev/null) is installed; installing the requested ${agent_pkg}"
+    elif rpm -q bolt-agent &>/dev/null; then
         if [[ -e "$AGENT_POST_FAILED_MARKER" ]]; then
             again=marker
             print_info "bolt-agent is installed but its setup did not finish; installing it again"
@@ -2035,7 +2112,7 @@ install_bolt_panel_and_check_post() {
     local log status errexit=0
     report_step_start panel_install
     if ! log=$(mktemp 2>/dev/null); then
-        install_packages --enablerepo=bolt bolt-nginx bolt-php "$1"
+        install_packages --enablerepo=bolt "$(pinned_spec bolt-nginx)" "$(pinned_spec bolt-php)" "$1"
         report_step_result panel_install ok
         return 0
     fi
@@ -2049,7 +2126,7 @@ install_bolt_panel_and_check_post() {
     # loses its output as it would without the copy.)
     (
         ((errexit)) && set -e
-        install_packages --enablerepo=bolt bolt-nginx bolt-php "$1"
+        install_packages --enablerepo=bolt "$(pinned_spec bolt-nginx)" "$(pinned_spec bolt-php)" "$1"
     ) 2>&1 | { trap '' INT; tee "$log" || cat; }
     status=${PIPESTATUS[0]}
     ((errexit)) && set -e
@@ -2071,6 +2148,7 @@ stage2_install_bolt_packages() {
     print_info "Stage 2.3: Installing all Bolt packages"
     report_step_start repo_setup
     install_repo_rhel 9
+    pinned_versions_available
     local panel_pkg="bolt-panel"
     if [[ -n "$PANEL_VERSION" ]]; then
         panel_pkg="bolt-panel-${PANEL_VERSION}"
@@ -2078,6 +2156,7 @@ stage2_install_bolt_packages() {
     fi
     install_bolt_agent_and_check_post
     install_bolt_panel_and_check_post "$panel_pkg"
+    install_pinned_extra_packages
     report_write_panel_settings
     write_left_out_components
     report_step_start web_services_enable
@@ -2109,36 +2188,15 @@ stage_configuration() {
     run_or_warn "bolt-cli manage-nftable --action=install" "Nftable" nftables
     run_or_warn "bolt-cli manage-sshd --action=install" "SSH server" ssh_server
     run_or_warn "bolt-cli manage-powerdns --action=install" "PowerDNS" powerdns
-    # AB-1446: the MariaDB series is a choice. AB-2228: without
-    # --mariadb-version a new box gets DEFAULT_MARIADB_SERIES, asked for
-    # explicitly so a panel with an older default installs it too. A box that
-    # already runs MariaDB (the installer run again) is asked for no series,
-    # so the panel keeps the one installed there.
-    MARIADB_SERIES=$(mariadb_series_to_install "$MARIADB_SERIES")
-    if [[ -n "$MARIADB_SERIES" ]]; then
-        # QA F1: a panel that predates the --series option (an older channel
-        # head, a pinned older version) refused the flag and the box was left
-        # without a database. Fall back to the panel's default series, loudly,
-        # rather than install nothing.
-        print_info "MariaDB ${MARIADB_SERIES}"
-        local MARIADB_OUT
-        report_step_start mariadb
-        if MARIADB_OUT=$(bolt-cli manage-mariadb --action=install --series="${MARIADB_SERIES}" 2>&1); then
-            echo "$MARIADB_OUT"
-            report_step_result mariadb ok
-            print_success "MariaDB ${MARIADB_SERIES} completed"
-        elif grep -qi 'option does not exist' <<<"$MARIADB_OUT"; then
-            echo "$MARIADB_OUT"
-            echo -e "${YELLOW}WARNING:${NC} the installed panel does not support --mariadb-version yet; installing its default MariaDB series instead"
-            run_or_warn "bolt-cli manage-mariadb --action=install" "MariaDB (default series)" mariadb
-        else
-            echo "$MARIADB_OUT"
-            echo -e "${YELLOW}WARNING:${NC} MariaDB ${MARIADB_SERIES} failed (continuing)"
-            report_step_result mariadb failed
-        fi
-        echo -e ""
+    # AB-2331: with the database skipped (--skip-database, or a server found
+    # on the box) no MariaDB step runs at all: no package, no series, no root
+    # password reset, no my.cnf profile. The agent is pointed at the server
+    # that is there instead.
+    database_skip_decide
+    if ((SKIP_DATABASE)); then
+        agent_db_credentials_from_my_cnf
     else
-        run_or_warn "bolt-cli manage-mariadb --action=install" "MariaDB" mariadb
+        stage_configuration_mariadb
     fi
     run_or_warn "bolt-cli manage-postfix --action=install" "Postfix" postfix
     run_or_warn "bolt-cli manage-dovecot --action=install" "Dovecot" dovecot
@@ -2146,7 +2204,11 @@ stage_configuration() {
     run_or_warn "bolt-cli manage-rspamd --action=install" "Rspamd" rspamd
     run_or_warn "bolt-cli manage-mlmmj --action=install" "MLMMJ" mlmmj
     run_or_warn "bolt-cli manage-php --action=install --php-version=8.4" "PHP 8.4" php84
-    run_or_warn "bolt-cli manage-my-apache --action=install" "MyApache" myapache
+    if ((SKIP_APACHE)); then
+        print_info "MyApache skipped (--skip-apache)"
+    else
+        run_or_warn "bolt-cli manage-my-apache --action=install" "MyApache" myapache
+    fi
     run_or_warn "bolt-cli manage-vsftpd --action=install" "Vsftpd" vsftpd
     # Disk quota, on a box that has no accounts yet: the accounting pass is
     # instant here and enforcement is on from the first account, rather than
@@ -2165,8 +2227,16 @@ stage_configuration() {
     run_or_warn "bolt-cli manage-redis-profiles --action=install" "Redis profiles" redis_profiles
     run_or_warn "bolt-cli manage-rspamd-profiles --action=install" "Rspamd profiles" rspamd_profiles
     run_or_warn "bolt-cli setup-firewall" "Firewall setup" firewall_setup
-    run_or_warn "bolt-cli manage-mariadb-default-profile --action=install" "MariaDB profile" mariadb_profile
-    run_or_warn "bolt-cli manage-my-apache-default-profile --action=install" "MyApache profile" myapache_profile
+    if ((SKIP_DATABASE)); then
+        print_info "MariaDB profile skipped (${DATABASE_SKIP_REASON}): the database server's configuration is left as it is"
+    else
+        run_or_warn "bolt-cli manage-mariadb-default-profile --action=install" "MariaDB profile" mariadb_profile
+    fi
+    if ((SKIP_APACHE)); then
+        print_info "MyApache profile skipped (--skip-apache)"
+    else
+        run_or_warn "bolt-cli manage-my-apache-default-profile --action=install" "MyApache profile" myapache_profile
+    fi
     run_or_warn "bolt-cli manage-system-email-account --action=install" "System email" system_email
     run_or_warn "bolt-cli manage-dns-records-default-template --action=install" "DNS template" dns_template
     run_or_warn "bolt-cli manage-php-default-profile --php-version=8.4 --action=install" "PHP 8.4 profile" php84_profile
@@ -2214,6 +2284,42 @@ stage_configuration() {
     print_success "Stage 3 completed: all post-install actions done"
 }
 
+# The MariaDB step of Stage 3, on a box without a database server.
+stage_configuration_mariadb() {
+    # AB-1446: the MariaDB series is a choice. AB-2228: without
+    # --mariadb-version a new box gets DEFAULT_MARIADB_SERIES, asked for
+    # explicitly so a panel with an older default installs it too. A box that
+    # already runs a database server (the installer run again, a converted
+    # server) does not get here since AB-2331: database_skip_decide skips the
+    # database steps there.
+    MARIADB_SERIES=$(mariadb_series_to_install "$MARIADB_SERIES")
+    if [[ -n "$MARIADB_SERIES" ]]; then
+        # QA F1: a panel that predates the --series option (an older channel
+        # head, a pinned older version) refused the flag and the box was left
+        # without a database. Fall back to the panel's default series, loudly,
+        # rather than install nothing.
+        print_info "MariaDB ${MARIADB_SERIES}"
+        local MARIADB_OUT
+        report_step_start mariadb
+        if MARIADB_OUT=$(bolt-cli manage-mariadb --action=install --series="${MARIADB_SERIES}" 2>&1); then
+            echo "$MARIADB_OUT"
+            report_step_result mariadb ok
+            print_success "MariaDB ${MARIADB_SERIES} completed"
+        elif grep -qi 'option does not exist' <<<"$MARIADB_OUT"; then
+            echo "$MARIADB_OUT"
+            echo -e "${YELLOW}WARNING:${NC} the installed panel does not support --mariadb-version yet; installing its default MariaDB series instead"
+            run_or_warn "bolt-cli manage-mariadb --action=install" "MariaDB (default series)" mariadb
+        else
+            echo "$MARIADB_OUT"
+            echo -e "${YELLOW}WARNING:${NC} MariaDB ${MARIADB_SERIES} failed (continuing)"
+            report_step_result mariadb failed
+        fi
+        echo -e ""
+    else
+        run_or_warn "bolt-cli manage-mariadb --action=install" "MariaDB" mariadb
+    fi
+}
+
 # The series stage_configuration asks the panel for: the one given with
 # --mariadb-version, else DEFAULT_MARIADB_SERIES when no MariaDB server
 # package is installed yet, else none (the panel keeps the installed one).
@@ -2226,13 +2332,290 @@ mariadb_series_to_install() {
     fi
 }
 
+# ---------- Pinned package versions (AB-2331 addendum) ----------
+# An RPM version-release: no dash inside either part, exactly one between them.
+readonly PINNED_VERSION_RE='^[0-9A-Za-z._+~^]+-[0-9A-Za-z._+~^]+$'
+
+# Checks --agent-version and every --package; prints the first problem.
+# AGENT_VERSION_GIVEN is main's: an empty --agent-version= is an error too.
+pinned_versions_valid() {
+    local entry name version seen=" "
+    if [[ "${AGENT_VERSION_GIVEN:-0}" == 1 && ! "$AGENT_VERSION" =~ $PINNED_VERSION_RE ]]; then
+        print_error "Invalid --agent-version=${AGENT_VERSION} (expected <version>-<release>, e.g. 1.30.4-1.el9)"
+        return 1
+    fi
+    while IFS= read -r entry; do
+        [[ -n "$entry" ]] || continue
+        name="${entry%%=*}"
+        version="${entry#*=}"
+        if [[ "$entry" != *=* || ! "$name" =~ ^bolt-[a-z0-9-]+$ || ! "$version" =~ $PINNED_VERSION_RE ]]; then
+            print_error "Invalid --package=${entry} (expected bolt-<name>=<version>-<release>, e.g. bolt-php=8.4.14-1.el9)"
+            return 1
+        fi
+        case "$name" in
+            bolt-panel) print_error "--package=${entry}: use --version= for bolt-panel"; return 1 ;;
+            bolt-agent) print_error "--package=${entry}: use --agent-version= for bolt-agent"; return 1 ;;
+        esac
+        if [[ "$seen" == *" $name "* ]]; then
+            print_error "--package=${name}= given twice"
+            return 1
+        fi
+        seen+="$name "
+    done <<<"$PINNED_PACKAGES"
+    return 0
+}
+
+# The package spec to install: name-version-release when pinned, else the name.
+pinned_spec() {
+    local entry
+    if [[ "$1" == bolt-agent && -n "$AGENT_VERSION" ]]; then
+        printf '%s' "bolt-agent-${AGENT_VERSION}"
+        return 0
+    fi
+    while IFS= read -r entry; do
+        [[ -n "$entry" && "${entry%%=*}" == "$1" ]] || continue
+        printf '%s' "$1-${entry#*=}"
+        return 0
+    done <<<"$PINNED_PACKAGES"
+    printf '%s' "$1"
+}
+
+# Every pinned spec (bolt-agent first), one per line.
+pinned_specs() {
+    local entry
+    [[ -n "$AGENT_VERSION" ]] && echo "bolt-agent-${AGENT_VERSION}"
+    while IFS= read -r entry; do
+        [[ -n "$entry" ]] && echo "${entry%%=*}-${entry#*=}"
+    done <<<"$PINNED_PACKAGES"
+    return 0
+}
+
+# Stops the install, before any Bolt package is installed, when a pinned
+# version is not in the repositories just configured (--source, or the
+# bolt-repo default). dnf install of an exact version-release installs it
+# whatever version is there, so a pinned version also moves a box back.
+pinned_versions_available() {
+    local spec missing=()
+    [[ -n "$AGENT_VERSION$PINNED_PACKAGES" ]] || return 0
+    # Reported as the repository step: the install report takes only its
+    # fixed list of step ids.
+    report_step_start repo_setup
+    while IFS= read -r spec; do
+        [[ -n "$spec" ]] || continue
+        if dnf -q --enablerepo=bolt --showduplicates list "$spec" >/dev/null 2>&1; then
+            print_success "Pinned version found: ${spec}"
+        else
+            missing+=("$spec")
+        fi
+    done < <(pinned_specs)
+    if ((${#missing[@]})); then
+        print_error "Not found in the Bolt repositories (source=${BOLT_SOURCE:-default}): ${missing[*]}. Check the version-release, or the --source the build was published to (PR builds: --source=testing)."
+        report_fail repo_setup package_install_failed
+        exit 1
+    fi
+    report_step_result repo_setup ok
+}
+
+# The pinned packages Stage 2.3 does not install by itself (all but
+# bolt-agent, bolt-nginx and bolt-php), at exactly the given versions.
+install_pinned_extra_packages() {
+    local entry name specs=()
+    while IFS= read -r entry; do
+        [[ -n "$entry" ]] || continue
+        name="${entry%%=*}"
+        case "$name" in bolt-nginx|bolt-php) continue ;; esac
+        specs+=("$name-${entry#*=}")
+    done <<<"$PINNED_PACKAGES"
+    ((${#specs[@]})) || return 0
+    print_info "Installing pinned packages: ${specs[*]}"
+    # Bolt packages like the panel's: reported as that step.
+    report_step_start panel_install
+    install_packages --enablerepo=bolt "${specs[@]}"
+    report_step_result panel_install ok
+}
+
+# ---------- Database server already on the box (AB-2331) ----------
+# MariaDB's install step reaches `dnf install MariaDB-server --allowerasing`
+# in bolt-agent and resets root's password, so it must never run where a
+# database server already is: it would replace MySQL (cl-MySQL under MySQL
+# Governor on CloudLinux, a cPanel server being converted) and start MariaDB
+# on its data directory.
+
+# Prints why the box counts as having a database server; fails when it has
+# none. A server that answers is enough (mysqladmin ping exits 0 even when it
+# refuses the login); so is any server package, running or not.
+database_server_found() {
+    local admin p hit
+    local -a globs
+    for admin in mysqladmin mariadb-admin; do
+        command -v "$admin" >/dev/null 2>&1 || continue
+        if run_bounded 15 "$admin" --connect-timeout=5 ping </dev/null >/dev/null 2>&1; then
+            echo "a database server answers ($admin ping)"
+            return 0
+        fi
+        break
+    done
+    for p in $DATABASE_SERVER_PACKAGES; do
+        if rpm -q "$p" >/dev/null 2>&1; then
+            echo "$p is installed"
+            return 0
+        fi
+    done
+    # Read into an array: unquoted, the globs would match files in the current directory.
+    read -r -a globs <<<"$DATABASE_SERVER_PACKAGE_GLOBS"
+    for p in "${globs[@]}"; do
+        hit=$(rpm -qa "$p" 2>/dev/null | head -n 1)
+        if [[ -n "$hit" ]]; then
+            echo "$hit is installed"
+            return 0
+        fi
+    done
+    return 1
+}
+
+# Sets SKIP_DATABASE (and DATABASE_SKIP_REASON) once per run, and says why.
+database_skip_decide() {
+    ((DATABASE_SKIP_DECIDED)) && return 0
+    DATABASE_SKIP_DECIDED=1
+    local found
+    if ((SKIP_DATABASE)); then
+        DATABASE_SKIP_REASON="--skip-database"
+    elif found=$(database_server_found); then
+        SKIP_DATABASE=1
+        DATABASE_SKIP_REASON="$found"
+    else
+        return 0
+    fi
+    print_info "Database steps skipped (${DATABASE_SKIP_REASON}): no database server is installed, upgraded or reconfigured, and root's password is not reset; the panel uses the server on this box with the credentials in ${ROOT_MY_CNF}"
+    if [[ -n "$MARIADB_SERIES" ]]; then
+        echo -e "${YELLOW}WARNING:${NC} --mariadb-version=${MARIADB_SERIES} ignored: the database steps are skipped"
+    fi
+    return 0
+}
+
+# timeout(1) when there is one; the command as it is otherwise.
+run_bounded() {
+    local secs="$1"; shift
+    if command -v timeout >/dev/null 2>&1; then timeout -k 2 "$secs" "$@"; else "$@"; fi
+}
+
+# The value of key $3 in section [$2] of the INI file $1 (the last one
+# wins), surrounding blanks and quotes removed; empty when there is none.
+ini_value() {
+    local v
+    v=$(awk -v want="$2" -v key="$3" '
+        /^[[:space:]]*\[/ {
+            sec = $0
+            gsub(/^[[:space:]]*\[[[:space:]]*|[[:space:]]*\][[:space:]]*$/, "", sec)
+            insec = (tolower(sec) == want)
+            next
+        }
+        insec {
+            line = $0
+            sub(/^[[:space:]]+/, "", line)
+            i = index(line, "=")
+            if (i == 0) next
+            k = substr(line, 1, i - 1)
+            sub(/[[:space:]]+$/, "", k)
+            if (tolower(k) != key) next
+            val = substr(line, i + 1)
+            gsub(/^[[:space:]]+|[[:space:]]+$/, "", val)
+        }
+        END { print val }
+    ' "$1" 2>/dev/null) || return 0
+    while [[ "$v" == [\"\']* ]]; do v="${v:1}"; done
+    while [[ "$v" == *[\"\'] ]]; do v="${v:0:${#v}-1}"; done
+    printf '%s' "$v"
+}
+
+# With the database skipped, bolt-agent still needs the server's administrator
+# login: [dbservers.mariadb] user/password in agent.conf, which the MariaDB
+# step would otherwise have written. Taken from root's /root/.my.cnf
+# ([client], then [mysql]; user root when only a password is there), the way
+# bolt-migrate does it after the install, and written the same way (quoted),
+# so its later sync finds the same values. The file is rewritten in place:
+# the agent watches it and reloads it, as after the MariaDB step.
+agent_db_credentials_from_my_cnf() {
+    local user="" pass="" v cur_user cur_pass tmp
+    if [[ -r "$ROOT_MY_CNF" ]]; then
+        for v in client mysql; do
+            [[ -n "$(ini_value "$ROOT_MY_CNF" "$v" user)" ]] && user=$(ini_value "$ROOT_MY_CNF" "$v" user)
+            [[ -n "$(ini_value "$ROOT_MY_CNF" "$v" password)" ]] && pass=$(ini_value "$ROOT_MY_CNF" "$v" password)
+        done
+    fi
+    [[ -n "$pass" && -z "$user" ]] && user="root"
+    if [[ -z "$pass" ]]; then
+        echo -e "${YELLOW}WARNING:${NC} no database password in ${ROOT_MY_CNF}: set user= and password= of the database administrator in [dbservers.mariadb] of ${AGENT_CONF} (bolt-agent reloads it by itself)"
+        return 0
+    fi
+    if [[ "$user$pass" == *\"* ]]; then
+        echo -e "${YELLOW}WARNING:${NC} the database login in ${ROOT_MY_CNF} contains a double quote, which ${AGENT_CONF} cannot hold: set [dbservers.mariadb] user= and password= there by hand"
+        return 0
+    fi
+    if [[ ! -f "$AGENT_CONF" ]]; then
+        echo -e "${YELLOW}WARNING:${NC} ${AGENT_CONF} not found: bolt-agent cannot be pointed at the database server"
+        return 0
+    fi
+    cur_user=$(ini_value "$AGENT_CONF" dbservers.mariadb user)
+    cur_pass=$(ini_value "$AGENT_CONF" dbservers.mariadb password)
+    if [[ "$cur_user" == "$user" && "$cur_pass" == "$pass" ]]; then
+        print_success "bolt-agent already uses the database login from ${ROOT_MY_CNF}"
+        return 0
+    fi
+    if ! tmp=$(mktemp "${AGENT_CONF}.XXXXXX" 2>/dev/null); then
+        echo -e "${YELLOW}WARNING:${NC} could not update ${AGENT_CONF}: set [dbservers.mariadb] user= and password= there by hand"
+        return 0
+    fi
+    # Values through the environment: awk -v would turn backslashes into escapes.
+    if DB_USER="$user" DB_PASS="$pass" awk '
+        function keys() {
+            if (!have_user) print "user=\"" ENVIRON["DB_USER"] "\""
+            if (!have_pass) print "password=\"" ENVIRON["DB_PASS"] "\""
+        }
+        /^[[:space:]]*\[/ {
+            if (insec) keys()
+            sec = $0
+            gsub(/^[[:space:]]*\[[[:space:]]*|[[:space:]]*\][[:space:]]*$/, "", sec)
+            insec = (tolower(sec) == "dbservers.mariadb")
+            if (insec) { found = 1; have_user = 0; have_pass = 0 }
+            print
+            next
+        }
+        insec && /^[[:space:]]*[Uu][Ss][Ee][Rr][[:space:]]*=/ { print "user=\"" ENVIRON["DB_USER"] "\""; have_user = 1; next }
+        insec && /^[[:space:]]*[Pp][Aa][Ss][Ss][Ww][Oo][Rr][Dd][[:space:]]*=/ { print "password=\"" ENVIRON["DB_PASS"] "\""; have_pass = 1; next }
+        { print }
+        END {
+            if (insec) keys()
+            if (!found) {
+                print ""
+                print "[dbservers.mariadb]"
+                print "type=mysql"
+                print "host=localhost"
+                print "port=3306"
+                have_user = 0; have_pass = 0
+                keys()
+            }
+        }
+    ' "$AGENT_CONF" >"$tmp" && cat "$tmp" >"$AGENT_CONF"; then
+        rm -f "$tmp"
+        print_success "bolt-agent pointed at the database server on this box (login from ${ROOT_MY_CNF})"
+    else
+        rm -f "$tmp"
+        echo -e "${YELLOW}WARNING:${NC} could not update ${AGENT_CONF}: set [dbservers.mariadb] user= and password= there by hand"
+    fi
+    return 0
+}
+
 # ---------- Main ----------
 print_usage() {
-    echo "Usage: sudo $0 [--help] [--version=<PANEL_VERSION>] [--source=<stable|staging|testing>] [--email=<address>] [--mariadb-version=<10.11|11.4>] [--without=<mail,dns,ftp>] [--channel=<name>] [--no-telemetry] [--ssh-key=<public key|https URL>]"
-    echo "AlmaLinux 9 / Rocky Linux 9. Stages: 1=ready check, 2=(2.1 settings, 2.2 prereq packages, 2.3 bolt packages), 3=post-install."
+    echo "Usage: sudo $0 [--help] [--version=<PANEL_VERSION>] [--agent-version=<version-release>] [--package=<bolt-name>=<version-release> ...] [--source=<stable|staging|testing>] [--email=<address>] [--mariadb-version=<10.11|11.4>] [--without=<mail,dns,ftp>] [--skip-database] [--skip-apache] [--channel=<name>] [--no-telemetry] [--ssh-key=<public key|https URL>]"
+    echo "AlmaLinux 9 / Rocky Linux 9 / CloudLinux 9. Stages: 1=ready check, 2=(2.1 settings, 2.2 prereq packages, 2.3 bolt packages), 3=post-install."
     echo "If --version is not provided, latest bolt-panel from repo is installed."
     echo "If --source is not provided, the bolt-repo RPM from adminbolt is used (default). Otherwise repos point at pulp content stable/staging/testing."
-    echo "If --mariadb-version is not provided, MariaDB ${DEFAULT_MARIADB_SERIES} is installed (long-term series, supported until 2029); --mariadb-version=10.11 installs the previous long-term series (supported until 2028). Without the option, a server that already runs MariaDB keeps its series."
+    echo "--agent-version installs exactly that bolt-agent build (e.g. 1.30.4-1.el9); --package=<bolt-name>=<version-release> does the same for another bolt-* package (repeatable, e.g. --package=bolt-php=8.4.14-1.el9). Both come from the repositories --source selects (PR builds: --source=testing); the install stops before any Bolt package is installed when a version is not there."
+    echo "--skip-database runs no database step (no MariaDB package, series, root password reset or my.cnf profile); the panel uses the MySQL/MariaDB server already on this server, with the administrator login from ${ROOT_MY_CNF} ([client] user= and password=) copied into [dbservers.mariadb] of ${AGENT_CONF}. The database steps are skipped by themselves when a database server answers (mysqladmin ping) or a server package is installed (MariaDB-server, mariadb-server, mysql-server, cl-MySQL*, cl-MariaDB*, ...)."
+    echo "--skip-apache runs no Apache step (manage-my-apache and its default profile); the web server is then the caller's to set up."
+    echo "If --mariadb-version is not provided, MariaDB ${DEFAULT_MARIADB_SERIES} is installed (long-term series, supported until 2029); --mariadb-version=10.11 installs the previous long-term series (supported until 2028). A server that already has a database server keeps it as it is (see --skip-database)."
     echo "If --email is provided, a 24h trial licence is requested for that address at the very end of the install (clicking the e-mailed confirmation link extends it to the full trial period); the install completes even if the request is refused."
     echo "Without --email the install proceeds unlicensed; activate on the panel's License page."
     echo "--without leaves optional components out, for servers with little memory (comma-separated; everything is installed by default):"
@@ -2247,6 +2630,7 @@ print_usage() {
 }
 
 main() {
+    local AGENT_VERSION_GIVEN=0
     for arg in "$@"; do
         case "$arg" in
             -h|--help)
@@ -2277,6 +2661,19 @@ main() {
                 # in the same argument, after "--without=".
                 ((WITHOUT_GIVEN)) && WITHOUT_ARG+=","
                 WITHOUT_GIVEN=1
+                ;;
+            --skip-database)
+                SKIP_DATABASE=1
+                ;;
+            --skip-apache)
+                SKIP_APACHE=1
+                ;;
+            --agent-version=*)
+                AGENT_VERSION="${arg#--agent-version=}"
+                AGENT_VERSION_GIVEN=1
+                ;;
+            --package=*)
+                PINNED_PACKAGES+="${arg#--package=}"$'\n'
                 ;;
             --channel=*)
                 REPORT_CHANNEL_ARG="${arg#--channel=}"
@@ -2345,6 +2742,13 @@ main() {
     if [[ -n "$ADMIN_EMAIL" && ! "$ADMIN_EMAIL" =~ $email_re ]]; then
         printf '%bERROR:%b Invalid --email=%s (expected name@domain.tld; no spaces, ", $, `, ; or control characters)\n' \
             "$RED" "$NC" "$(shown_arg "$ADMIN_EMAIL")" >&2
+        print_usage
+        report_fail parse_arguments invalid_argument
+        exit 1
+    fi
+
+    # AB-2331 addendum: pinned versions, checked before anything is installed.
+    if ! pinned_versions_valid; then
         print_usage
         report_fail parse_arguments invalid_argument
         exit 1
