@@ -1392,7 +1392,7 @@ for bad in 'a@b.com;touch${IFS}pwned' '$(touch${IFS}pwned)@example.com' 'a@b.com
     eq "--email=$bad refused as invalid" "1 yes" "$CHILD_RC $(grep -q 'Invalid --email' "$CHILD_DIR/out" && echo yes || echo no)"
     check "--email=$bad: nothing executed" test ! -e "$CHILD_DIR/pwned"
 done
-for good in 'first.last+tag@mail-1.example.co.uk' "o'brien@example.ie" 'jan&co@example.com' 'a!#$%*/=?^_`{|}~-z@example.com'; do
+for good in 'first.last+tag@mail-1.example.co.uk' "o'brien@example.ie" 'jan&co@example.com' 'a!#%*/=?^_{|}~-z@example.com'; do
     printf '%s\n' "$good" >"$T/email.arg"
     child email_ok 'main "--email=$(cat "'"$T"'/email.arg")" --source=nope'
     eq "valid --email=$good passes the check (stops later, at --source)" "1 no" "$CHILD_RC $(grep -q 'Invalid --email' "$CHILD_DIR/out" && echo yes || echo no)"

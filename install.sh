@@ -1,18 +1,24 @@
 #!/bin/bash
 #
-# AdminBolt Install Script (AlmaLinux 9, Rocky Linux 9)
+# AdminBolt Install Script (AlmaLinux 9, Rocky Linux 9, CloudLinux 9)
 #
 # Reorganizes the installation into three stages:
 #   Stage 1: Check that everything is in place and ready for installation
 #   Stage 2: (2.1) Prepare settings → (2.2) Install prerequisite packages → (2.3) Install all Bolt packages
 #   Stage 3: Execute bolt-cli / post-install actions (database, agent, services, profiles, etc.)
 #
-# Supported: AlmaLinux 9, Rocky Linux 9. Panel is installed from RPM; %pre/%post skipped.
+# Supported: AlmaLinux 9, Rocky Linux 9, CloudLinux 9. Panel is installed from RPM; %pre/%post skipped.
 # Usage:
 #   sudo ./install.sh                          # install latest bolt-panel from repo
 #   sudo ./install.sh --version=1.0.0.beta3-v46.el9 # install specific bolt-panel version from repo
 #   sudo ./install.sh --source=staging         # use staging pulp repos (stable|staging|testing); default unchanged
 #   sudo ./install.sh --email=user@example.com # activate a 24h trial license for this e-mail (confirmation link extends it to 30 days)
+#   sudo ./install.sh --mariadb-version=10.11  # MariaDB 10.11 instead of the default 11.4 (10.11 or 11.4)
+#   sudo ./install.sh --without=mail,dns,ftp   # leave optional components out (small servers); the end of the install says how to add them later
+#   sudo ./install.sh --skip-database          # keep the database server already on the box (no MariaDB steps)
+#   sudo ./install.sh --skip-apache            # no Apache steps (the caller sets the web server up)
+#   sudo ./install.sh --source=testing --agent-version=1.30.4-pr230.1.el9 --package=bolt-php=8.4.14-1.el9
+#                                              # exact builds of bolt-agent / other bolt-* packages
 #
 set -e
 
@@ -20,13 +26,62 @@ set -e
 # bolt-panel install: from repo (latest by default; --version= selects a specific version)
 # ---------------------------------------------------------------------------
 PANEL_VERSION=""
+# AB-2331 addendum: --agent-version= (bolt-agent version-release) and
+# --package=<bolt-name>=<version-release> (repeatable), installed exactly,
+# from the repositories --source points at. PINNED_PACKAGES: one name=version per line.
+AGENT_VERSION=""
+PINNED_PACKAGES=""
 # Empty = current behavior (bolt-repo RPM from adminbolt). stable|staging|testing = pulp content path segment.
 BOLT_SOURCE=""
 # E-mail for the trial license; empty = skip the trial request (activate manually on the License page).
 ADMIN_EMAIL=""
+# --mariadb-version=; empty = the default below on a new box (see stage_configuration).
 MARIADB_SERIES=""
+# AB-2228: the MariaDB series of a new install (10.11 until then).
+readonly DEFAULT_MARIADB_SERIES="11.4"
+# AB-2331: --skip-database / --skip-apache. A database server already on the
+# box skips the database steps by itself (see database_skip_decide), so an
+# installer run never replaces one.
+SKIP_DATABASE=0
+SKIP_APACHE=0
+DATABASE_SKIP_REASON=""
+DATABASE_SKIP_DECIDED=0
+# Packages that mean a database server is installed. The globs go to rpm -qa.
+readonly DATABASE_SERVER_PACKAGES="MariaDB-server mariadb-server mysql-server mysql-community-server percona-server-server"
+readonly DATABASE_SERVER_PACKAGE_GLOBS="cl-MySQL* cl-MariaDB* Percona-Server-server*"
+# The systemd units a MySQL-compatible server runs under, in the order they are looked for.
+readonly DATABASE_UNITS="mariadb mysqld mysql"
+# With the database skipped, the agent takes the server's credentials from here.
+ROOT_MY_CNF="/root/.my.cnf"
+AGENT_CONF="/etc/bolt-agent/agent.conf"
+# ID from os-release (almalinux, rocky, cloudlinux), set in Stage 1.
+DISTRO_ID=""
+OS_RELEASE_FILE="/etc/os-release"
+readonly EPEL_RELEASE_URL="https://dl.fedoraproject.org/pub/epel/epel-release-latest-9.noarch.rpm"
+# AB-2106: --ssh-key= value (a public key, or an https:// URL serving keys); empty = no SSH changes.
+SSH_KEY_ARG=""
+# Validated key lines and their SHA256 fingerprints, filled in Stage 1.
+SSH_KEYS=""
+SSH_KEY_FPS=""
+ROOT_AUTHORIZED_KEYS="/root/.ssh/authorized_keys"
+# Sorts before every other drop-in, so its first values win over 50-cloud-init.conf and the panel's files.
+SSHD_KEY_ONLY_DROP_IN="/etc/ssh/sshd_config.d/00-adminbolt-ssh-key-only.conf"
+# Seconds the installer waits, at a terminal, for a sign-in with the key before it gives up and keeps password login.
+SSH_KEY_LOGIN_WAIT=600
+SSH_KEY_TTY="/dev/tty"
+SSH_KEY_LOGIN_ADDR=""
+SSH_KEY_PROOF_SINCE=0
+# Outcome line for the end of the install.
+SSH_PASSWORD_NOTE=""
+# Raw --without= values as given (comma-separated, every occurrence joined),
+# and whether the option was given at all, so an empty value is refused.
+WITHOUT_ARG=""
+WITHOUT_GIVEN=0
+# Components left out, in the order of OPTIONAL_COMPONENTS (set by set_left_out_components).
+LEFT_OUT_COMPONENTS=""
+# "<component> <command>" for every step skipped for them, in the order Stage 3 reached it.
+SKIPPED_COMMANDS=()
 readonly WEB_INSTALL_ROOT="/usr/local/bolt/web"
-readonly POST_INSTALL_DB_PATH="/var/lib/adminbolt/db.sqlite3"
 
 # Colors
 RED='\033[0;31m'
@@ -40,6 +95,16 @@ REPO_BASE_URL="https://mirror.adminbolt.com/pulp/content/adminbolt"
 REPO_PACKAGE="bolt-repo-1.0.7-1"
 
 print_error() { echo -e "${RED}ERROR:${NC} $1" >&2; }
+# A value the user typed, made safe to show in a message: cut to 40
+# characters, anything unprintable as "?". Print the result with %s, never
+# through print_error or echo -e, so escape sequences are not interpreted.
+# Filtered under LC_ALL=C, so every non-ASCII byte is "?" too, whatever the
+# box's locale (a UTF-8 locale would let through e.g. U+202E).
+shown_arg() {
+    local LC_ALL=C
+    local v="${1:0:40}"
+    printf '%s' "${v//[^[:print:]]/?}"
+}
 print_success() { echo -e "${GREEN}SUCCESS:${NC} $1"; }
 print_info() { echo -e "${YELLOW}INFO:${NC} $1"; }
 print_progress() { echo -e "${CYAN}PROGRESS:${NC} $1"; }
@@ -149,7 +214,9 @@ INSTALL_MARKER_CREATED=0
 REPORT_CHANNELS="direct get-script web-installer vultr akamai node image-build test hostinger digitalocean aws azure"
 REPORT_REASONS="not_root unsupported_os invalid_argument missing_command port_in_use repo_download_failed package_install_failed agent_install_failed panel_scriptlet_failed agent_panel_connect_failed required_step_failed readiness_check_failed interrupted unclassified"
 
-# required | optional | unknown
+# Prints the class of one install step id for the report: required (its failure
+# is the install's failure), optional (its failure only adds a warning) or
+# unknown (not a step id).
 report_step_class() {
     case "$1" in
         check_root|check_os|check_commands|check_port_8443|parse_arguments) echo required ;;
@@ -949,9 +1016,18 @@ _report_write_panel_settings() {
 
 _report_ready() {
     local states code
-    # One bounded call; it prints one state per unit, all must be "active".
-    states=$(_report_bounded systemctl is-active bolt-agent bolt-nginx bolt-php mariadb postfix dovecot </dev/null 2>/dev/null)
-    [[ "$(printf '%s\n' "$states" | grep -cx active)" -eq 6 ]] || return 1
+    # One bounded call; it prints one state per unit, in the order asked. The
+    # services must all be "active" (with --without=mail, Postfix and Dovecot
+    # are not expected), and the database server under one of its unit names
+    # (AB-2331: mariadb, or mysqld / mysql for MySQL, such as cl-MySQL on
+    # CloudLinux; MariaDB answers to all three). systemctl prints "inactive"
+    # for a unit that does not exist.
+    local -a units=(bolt-agent bolt-nginx bolt-php) db_units
+    _report_in_list mail "$LEFT_OUT_COMPONENTS" || units+=(postfix dovecot)
+    read -r -a db_units <<<"$DATABASE_UNITS"
+    states=$(_report_bounded systemctl is-active "${units[@]}" "${db_units[@]}" </dev/null 2>/dev/null)
+    [[ "$(printf '%s\n' "$states" | head -n "${#units[@]}" | grep -cx active)" -eq "${#units[@]}" ]] || return 1
+    printf '%s\n' "$states" | tail -n "+$((${#units[@]} + 1))" | grep -qx active || return 1
     code=$(curl -k -s -o /dev/null -w '%{http_code}' --connect-timeout 2 --max-time 3 "$REPORT_PANEL_URL" </dev/null 2>/dev/null) || true
     [[ "$code" =~ ^[1-4][0-9][0-9]$ ]]
 }
@@ -1026,46 +1102,362 @@ stage_prerequisites() {
         report_fail check_root not_root
         exit 1
     fi
-    # Distro: AlmaLinux 9 or Rocky Linux 9
+    # Distro: AlmaLinux 9, Rocky Linux 9 or CloudLinux 9
     local distro_info
     report_step_start check_os
     if ! distro_info=$(detect_distribution); then
-        print_error "This script supports AlmaLinux 9 and Rocky Linux 9 only. Current system is not supported."
+        print_error "This script supports AlmaLinux 9, Rocky Linux 9 and CloudLinux 9 only. Current system is not supported."
         report_fail check_os unsupported_os
         exit 1
     fi
+    DISTRO_ID="${distro_info%%|*}"
     print_success "Detected: $distro_info"
     # Required commands
     report_step_start check_commands
-    for cmd in curl; do
-        if ! command -v "$cmd" >/dev/null 2>&1; then
-            print_error "Required command not found: $cmd"
-            report_fail check_commands missing_command
-            exit 1
-        fi
-    done
+    if ! command -v curl >/dev/null 2>&1; then
+        print_error "Required command not found: curl"
+        report_fail check_commands missing_command
+        exit 1
+    fi
     check_port_8443
+    # AB-2331: decided before anything is installed, and said once.
+    database_skip_decide
+    # AB-2106: a bad key stops the install here, before anything is changed.
+    if [[ -n "$SSH_KEY_ARG" ]]; then
+        # Reported as a bad argument, not as the port check that ran before it.
+        report_step_start parse_arguments
+        ssh_key_load || { report_fail parse_arguments invalid_argument; exit 1; }
+        report_step_result parse_arguments ok
+        print_success "SSH key checked ($(grep -c . <<<"$SSH_KEYS") key(s))"
+    fi
     print_success "Stage 1 completed: ready for installation"
     print_progress "33% — prerequisites"
 }
 
-# Detect distribution: AlmaLinux 9 or Rocky Linux 9
+# Detect distribution: AlmaLinux 9, Rocky Linux 9 or CloudLinux 9 (AB-2331;
+# a RHEL 9 rebuild, installed the same way). Prints ID|VERSION_ID. Read in a
+# subshell, so os-release sets nothing in the installer's own shell.
 detect_distribution() {
-    if [ ! -f /etc/os-release ]; then
+    [ -f "$OS_RELEASE_FILE" ] || return 1
+    (
+        ID="" VERSION_ID=""
+        # shellcheck disable=SC1090
+        . "$OS_RELEASE_FILE" >/dev/null 2>&1 || exit 1
+        case "$ID" in
+            almalinux|rocky|cloudlinux) ;;
+            *) exit 1 ;;
+        esac
+        [[ "$VERSION_ID" =~ ^9(\.[0-9]*)?$ ]] || exit 1
+        echo "${ID}|${VERSION_ID}"
+    )
+}
+
+# ---------- SSH key and password login (AB-2106) ----------
+# --ssh-key= adds root's key in Stage 2.1 and turns SSH password login for
+# root off at the very end, but only once sshd has logged a root sign-in with
+# that key after every install step that configures sshd, and its effective
+# settings for that client still let root in with the key. Anything short of
+# that keeps password login on and says why: the customer must never be
+# locked out of their own server. Other users (hosting accounts) keep their
+# password login, and root login itself stays under the panel's SSH settings.
+
+# Read --ssh-key= into SSH_KEYS / SSH_KEY_FPS. Every non-comment line must be
+# a plain public key: no authorized_keys options (command=, from=, ...).
+ssh_key_load() {
+    local raw line tmp fp keys="" fps=""
+    local key_re='^(ssh-ed25519|ssh-rsa|ecdsa-sha2-nistp256|ecdsa-sha2-nistp384|ecdsa-sha2-nistp521|sk-ssh-ed25519@openssh\.com|sk-ecdsa-sha2-nistp256@openssh\.com) [A-Za-z0-9+/]+=*( [^[:cntrl:]]*)?$'
+    if ! command -v ssh-keygen >/dev/null 2>&1; then
+        print_error "ssh-keygen not found; cannot check --ssh-key"
         return 1
     fi
-    . /etc/os-release
-    case "$ID" in
-        almalinux|rocky) ;;
-        *) return 1 ;;
-    esac
-    [[ "$VERSION_ID" =~ ^9(\.[0-9]*)?$ ]] || return 1
-    echo "${ID}|${VERSION_ID}"
+    if [[ "$SSH_KEY_ARG" == https://* ]]; then
+        if ! raw=$(curl -fsSL --proto =https --proto-redir =https --max-time 30 "$SSH_KEY_ARG"); then
+            print_error "Could not download the SSH key from ${SSH_KEY_ARG}"
+            return 1
+        fi
+    elif [[ "$SSH_KEY_ARG" == *://* ]]; then
+        print_error "--ssh-key takes a public key or an https:// URL"
+        return 1
+    else
+        raw="$SSH_KEY_ARG"
+    fi
+    tmp=$(mktemp)
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        line="${line%$'\r'}"
+        line="${line#"${line%%[![:space:]]*}"}"
+        line="${line%"${line##*[![:space:]]}"}"
+        [[ -z "$line" || "$line" == \#* ]] && continue
+        printf '%s\n' "$line" >"$tmp"
+        if [[ ! "$line" =~ $key_re ]] || ! fp=$(ssh-keygen -l -E sha256 -f "$tmp" 2>/dev/null | awk '{print $2}') || [[ -z "$fp" ]]; then
+            rm -f "$tmp"
+            print_error "--ssh-key: not an SSH public key: ${line:0:60} (put the whole key in quotes: --ssh-key=\"ssh-ed25519 AAAA... comment\")"
+            return 1
+        fi
+        keys+="${line}"$'\n'
+        fps+="${fp}"$'\n'
+    done <<<"$raw"
+    rm -f "$tmp"
+    if [[ -z "$keys" ]]; then
+        print_error "--ssh-key: no SSH public key found"
+        return 1
+    fi
+    SSH_KEYS="$keys"
+    SSH_KEY_FPS="$fps"
+}
+
+# 0 when key line $1 is in authorized_keys file $2 as a plain line (type and key first; the comment is ignored).
+ssh_key_present() {
+    local type b64
+    read -r type b64 _ <<<"$1"
+    [[ -f "$2" ]] && awk -v t="$type" -v k="$b64" '$1 == t && $2 == k { f = 1 } END { exit !f }' "$2"
+}
+
+# 0 when key line $1 also appears in file $2 behind options (command=, from=, restrict, ...):
+# a sign-in with it can succeed and still give no shell, so it proves nothing.
+ssh_key_restricted() {
+    local type b64
+    read -r type b64 _ <<<"$1"
+    [[ -f "$2" ]] && awk -v t="$type" -v k="$b64" '$1 !~ /^#/ { for (i = 2; i < NF; i++) if ($i == t && $(i + 1) == k) f = 1 } END { exit !f }' "$2"
+}
+
+# Root's AuthorizedKeysFile paths from `sshd -T` output $1, one per line, with %h, %u, %U and %%
+# expanded as sshd does and relative paths under root's home. 1 when the list cannot be worked out.
+ssh_root_key_files() {
+    local v f home
+    local -a files
+    home=$(getent passwd root 2>/dev/null | cut -d: -f6)
+    v=$(sshd_value authorizedkeysfile "$1")
+    [[ -n "$home" && -n "$v" ]] || return 1
+    read -ra files <<<"$v"
+    for f in "${files[@]}"; do
+        [[ "$f" == none ]] && continue
+        f=${f//"%%"/$'\001'}
+        f=${f//"%h"/$home}
+        f=${f//"%u"/root}
+        f=${f//"%U"/0}
+        [[ "$f" != *%* ]] || return 1
+        f=${f//$'\001'/%}
+        [[ "$f" == /* ]] || f="$home/$f"
+        printf '%s\n' "$f"
+    done
+}
+
+# Why a sign-in with the key may give no shell under `sshd -T` output $1; empty when it cannot.
+# sshd takes the first file that lists the key, so the key behind options (command=, restrict,
+# no-pty, ...) in any of root's key files, or keys from a command, means the log proves nothing.
+ssh_key_restriction_blocker() {
+    local v files f line
+    v=$(sshd_value authorizedkeyscommand "$1")
+    [[ -z "$v" || "$v" == none ]] || { echo "sshd also takes root's keys from AuthorizedKeysCommand ${v}"; return; }
+    files=$(ssh_root_key_files "$1") || { echo "could not work out root's AuthorizedKeysFile list"; return; }
+    while IFS= read -r f; do
+        [[ -n "$f" ]] || continue
+        while IFS= read -r line; do
+            [[ -n "$line" ]] || continue
+            if ssh_key_restricted "$line" "$f"; then
+                echo "${f} also lists the key with restrictions (command=, restrict, no-pty, ...)"
+                return
+            fi
+        done <<<"$SSH_KEYS"
+    done <<<"$ROOT_AUTHORIZED_KEYS"$'\n'"$files"
+}
+
+ssh_keys_in_place() {
+    local line
+    while IFS= read -r line; do
+        [[ -n "$line" ]] || continue
+        ssh_key_present "$line" "$ROOT_AUTHORIZED_KEYS" || return 1
+    done <<<"$SSH_KEYS"
+}
+
+# Stage 2.1: add the keys to root's authorized_keys; keys already there are kept as they are.
+ssh_key_install() {
+    [[ -n "$SSH_KEYS" ]] || return 0
+    local dir line added=0
+    dir=$(dirname "$ROOT_AUTHORIZED_KEYS")
+    if ! { mkdir -p "$dir" && chmod 700 "$dir" && touch "$ROOT_AUTHORIZED_KEYS" && chmod 600 "$ROOT_AUTHORIZED_KEYS"; }; then
+        print_error "Could not prepare ${ROOT_AUTHORIZED_KEYS}"
+        exit 1
+    fi
+    while IFS= read -r line; do
+        [[ -n "$line" ]] || continue
+        ssh_key_present "$line" "$ROOT_AUTHORIZED_KEYS" && continue
+        # A file without a final newline would glue the new key onto its last line.
+        [[ -s "$ROOT_AUTHORIZED_KEYS" && -n "$(tail -c1 "$ROOT_AUTHORIZED_KEYS")" ]] && echo >>"$ROOT_AUTHORIZED_KEYS"
+        printf '%s\n' "$line" >>"$ROOT_AUTHORIZED_KEYS"
+        added=$((added + 1))
+    done <<<"$SSH_KEYS"
+    chown root:root "$dir" "$ROOT_AUTHORIZED_KEYS" 2>/dev/null || true
+    command -v restorecon >/dev/null 2>&1 && { restorecon -R "$dir" >/dev/null 2>&1 || true; }
+    if ! ssh_keys_in_place; then
+        print_error "The SSH key is not in ${ROOT_AUTHORIZED_KEYS} after writing it"
+        exit 1
+    fi
+    print_success "SSH key in ${ROOT_AUTHORIZED_KEYS} (${added} added)"
+}
+
+# Effective sshd settings for root connecting from address $1.
+sshd_effective_for_root() {
+    sshd -T -C "user=root,host=$1,addr=$1" 2>/dev/null
+}
+
+# Value of setting $1 in `sshd -T` output $2 (first line only; empty when absent).
+sshd_value() {
+    awk -v k="$1" 'tolower($1) == k { $1 = ""; sub(/^ /, ""); print; exit }' <<<"$2"
+}
+
+# Why root cannot sign in with a key under `sshd -T` output $1; empty when it can.
+ssh_root_key_login_blocker() {
+    local cfg="$1" v
+    [[ -n "$cfg" ]] || { echo "sshd -T did not run"; return; }
+    v=$(sshd_value permitrootlogin "$cfg")
+    case "$v" in yes|prohibit-password|without-password) ;; *) echo "root login over SSH is not allowed (PermitRootLogin ${v:-unset})"; return ;; esac
+    v=$(sshd_value pubkeyauthentication "$cfg")
+    [[ "$v" == yes ]] || { echo "key login is off (PubkeyAuthentication ${v:-unset})"; return; }
+    v=$(sshd_value authorizedkeysfile "$cfg")
+    [[ " $v " == *.ssh/authorized_keys\ * ]] || { echo "sshd does not read .ssh/authorized_keys (AuthorizedKeysFile ${v:-unset})"; return; }
+    v=$(sshd_value authenticationmethods "$cfg")
+    [[ -z "$v" || "$v" == any || "$v" == publickey ]] || { echo "sshd requires more than a key (AuthenticationMethods ${v})"; return; }
+    v=$(sshd_value forcecommand "$cfg")
+    [[ -z "$v" || "$v" == none ]] || { echo "root's SSH sessions are forced to run ${v}"; return; }
+    ssh_key_restriction_blocker "$cfg"
+}
+
+# Set SSH_KEY_LOGIN_ADDR to the client address of the latest root sign-in with one of the keys
+# that sshd logged since epoch second $1. The whole message must match: a login name is logged
+# as typed in failed attempts, so a partial match could be forged from the network.
+ssh_key_login_seen() {
+    local addr
+    addr=$(journalctl -q --no-pager -o cat -u sshd --since "@$1" 2>/dev/null | awk -v fps="$SSH_KEY_FPS" '
+        BEGIN { n = split(fps, a, "\n"); for (i = 1; i <= n; i++) if (a[i] != "") want[a[i]] = 1 }
+        /^Accepted publickey for root from [0-9A-Fa-f.:]+ port [0-9]+ ssh2: [A-Z0-9-]+ SHA256:[A-Za-z0-9+\/]+$/ && ($NF in want) { last = $6 }
+        END { print last }')
+    [[ -n "$addr" ]] || return 1
+    SSH_KEY_LOGIN_ADDR="$addr"
+}
+
+# At a terminal, ask for a sign-in with the key and wait for sshd to log it. 1 = skipped, timed out or no terminal.
+ssh_key_login_wait() {
+    { exec 3<"$SSH_KEY_TTY"; } 2>/dev/null || return 1
+    local ip port deadline rc
+    ip=$(hostname -I 2>/dev/null | awk '{print $1}')
+    port=$(sshd_value port "$(sshd_effective_for_root 127.0.0.1)")
+    echo -e "\n${BOLD}${CYAN}--- Check your SSH key before password login for root is turned off ---${NC}"
+    echo -e "Keep this session open. From a new terminal, sign in with your key:"
+    echo -e "  ${BOLD}ssh -p ${port:-22} root@${ip:-<this-server-ip>}${NC}"
+    echo -e "Waiting up to $((SSH_KEY_LOGIN_WAIT / 60)) minutes for that sign-in. Press Enter to skip and keep password login on."
+    deadline=$(($(date +%s) + SSH_KEY_LOGIN_WAIT))
+    while (($(date +%s) < deadline)); do
+        if ssh_key_login_seen "$SSH_KEY_PROOF_SINCE"; then
+            exec 3<&-
+            print_success "Sign-in with your key seen from ${SSH_KEY_LOGIN_ADDR}"
+            return 0
+        fi
+        # Enter or a closed terminal ends the wait; only a timeout (status > 128) keeps it going.
+        rc=0
+        read -r -t 5 -u 3 _ || rc=$?
+        ((rc > 128)) || break
+    done
+    exec 3<&-
+    return 1
+}
+
+# Password login was not changed: say why, and what sshd actually does for root now.
+ssh_password_kept() {
+    local now
+    now=$(sshd_value passwordauthentication "$(sshd_effective_for_root 127.0.0.1)")
+    if [[ "$now" == no ]]; then
+        SSH_PASSWORD_NOTE="${YELLOW}NOTE:${NC} The installer did not change SSH password login for root ($1); sshd already has it off. Your key is in ${ROOT_AUTHORIZED_KEYS}.\n"
+        echo -e "${YELLOW}WARNING:${NC} SSH password login for root not changed: $1"
+        return 0
+    fi
+    SSH_PASSWORD_NOTE="${YELLOW}NOTE:${NC} SSH password login for root left ON: $1. Your key is in ${ROOT_AUTHORIZED_KEYS}. After you sign in with it, turn password login for root off with:\n  ${BOLD}printf 'Match User root\\\\n    PasswordAuthentication no\\\\n    KbdInteractiveAuthentication no\\\\n' > ${SSHD_KEY_ONLY_DROP_IN} && sshd -t && systemctl reload sshd${NC}\n"
+    echo -e "${YELLOW}WARNING:${NC} SSH password login for root left on: $1"
+}
+
+# Put the drop-in back as it was ($1 = saved copy, or empty when there was none) and reload when $2 = reload.
+# Never fails: a copy that cannot be put back is removed rather than left half-written.
+ssh_drop_in_restore() {
+    if [[ -n "$1" ]]; then
+        mv -f "$1" "$SSHD_KEY_ONLY_DROP_IN" 2>/dev/null || rm -f "$SSHD_KEY_ONLY_DROP_IN" "$1" 2>/dev/null || true
+    else
+        rm -f "$SSHD_KEY_ONLY_DROP_IN" 2>/dev/null || true
+    fi
+    if [[ "${2:-}" == reload ]]; then systemctl reload sshd >/dev/null 2>&1 || true; fi
     return 0
+}
+
+# End of Stage 3: turn SSH password login for root off once the key is proven. Never fatal.
+ssh_password_login_off() {
+    [[ -n "$SSH_KEYS" ]] || return 0
+    print_info "SSH: turning password login for root off (--ssh-key)"
+    local blocker saved="" tmp cfg
+    # Only a sign-in from now on counts: it ran under the sshd settings the install left behind.
+    SSH_KEY_PROOF_SINCE=$(date +%s)
+    if ! ssh_keys_in_place; then
+        ssh_password_kept "the key is no longer in ${ROOT_AUTHORIZED_KEYS}"
+        return 0
+    fi
+    # Also checks every file sshd reads root's keys from for the key behind options.
+    blocker=$(ssh_root_key_login_blocker "$(sshd_effective_for_root 127.0.0.1)")
+    if [[ -n "$blocker" ]]; then
+        ssh_password_kept "$blocker"
+        return 0
+    fi
+    if ! ssh_key_login_wait; then
+        ssh_password_kept "no sign-in with the key was seen after the installer set up SSH"
+        return 0
+    fi
+    # The settings for the address the key was used from, not only for localhost.
+    blocker=$(ssh_root_key_login_blocker "$(sshd_effective_for_root "$SSH_KEY_LOGIN_ADDR")")
+    if [[ -n "$blocker" ]]; then
+        ssh_password_kept "$blocker (for ${SSH_KEY_LOGIN_ADDR})"
+        return 0
+    fi
+    if [[ -e "$SSHD_KEY_ONLY_DROP_IN" ]]; then
+        saved="${SSHD_KEY_ONLY_DROP_IN}.saved.$$"
+        if ! cp -p "$SSHD_KEY_ONLY_DROP_IN" "$saved"; then ssh_password_kept "could not back up ${SSHD_KEY_ONLY_DROP_IN}"; return 0; fi
+    fi
+    # Written next to the target under a name sshd does not read (*.conf only), then moved into place.
+    tmp="${SSHD_KEY_ONLY_DROP_IN}.new.$$"
+    if ! {
+        printf '# Written by install.sh --ssh-key (AB-2106). Remove this file and reload sshd to allow SSH password login for root again.\n'
+        printf 'Match User root\n    PasswordAuthentication no\n    KbdInteractiveAuthentication no\n'
+    } >"$tmp" || ! chmod 600 "$tmp" || ! mv -f "$tmp" "$SSHD_KEY_ONLY_DROP_IN"; then
+        rm -f "$tmp"
+        ssh_drop_in_restore "$saved"
+        ssh_password_kept "could not write ${SSHD_KEY_ONLY_DROP_IN}"
+        return 0
+    fi
+    if ! sshd -t >/dev/null 2>&1; then
+        ssh_drop_in_restore "$saved"
+        ssh_password_kept "sshd -t refused the new setting"
+        return 0
+    fi
+    cfg=$(sshd_effective_for_root "$SSH_KEY_LOGIN_ADDR") || cfg=""
+    blocker=$(ssh_root_key_login_blocker "$cfg")
+    if [[ -n "$blocker" || "$(sshd_value passwordauthentication "$cfg")" != no || "$(sshd_value kbdinteractiveauthentication "$cfg")" != no ]]; then
+        ssh_drop_in_restore "$saved"
+        ssh_password_kept "another sshd setting overrides ${SSHD_KEY_ONLY_DROP_IN}${blocker:+ ($blocker)}"
+        return 0
+    fi
+    if ! systemctl reload sshd >/dev/null 2>&1; then
+        ssh_drop_in_restore "$saved" reload
+        ssh_password_kept "sshd did not reload"
+        return 0
+    fi
+    rm -f "$saved"
+    SSH_PASSWORD_NOTE="${GREEN}SSH:${NC} password login for root is off; root signs in with your key. Other users are not changed. To allow passwords again: ${BOLD}rm ${SSHD_KEY_ONLY_DROP_IN} && systemctl reload sshd${NC}\n"
+    print_success "SSH password login for root turned off"
 }
 
 # ---------- Stage 2: Install base packages ----------
 # Write bolt / bolt-noarch repos for a pulp content tier (stable, staging, testing).
+#
+# Priorities below dnf's default of 99 (lower wins, AB-1407): the AdminBolt
+# repositories carry their own builds of packages the distribution also ships
+# (httpd, httpd-core, ...), and with the previous 300/400 every such name
+# resolved to appstream/baseos instead - hosts ran the distribution Apache.
 install_bolt_repos_from_source() {
     local tier="$1"
     local repofile="$BOLT_REPO_FILE"
@@ -1076,7 +1468,7 @@ name = Adminbolt RHEL - \$releasever - \$basearch
 baseurl = https://mirror.adminbolt.com/pulp/content/${tier}/rhel/\$releasever/\$basearch
 enabled = 1
 gpgcheck = 0
-priority = 300
+priority = 30
 sslverify = 0
 
 [bolt-noarch]
@@ -1084,7 +1476,7 @@ name = Adminbolt RHEL - \$releasever - noarch
 baseurl = https://mirror.adminbolt.com/pulp/content/${tier}/rhel/\$releasever/noarch
 enabled = 1
 gpgcheck = 0
-priority = 400
+priority = 40
 sslverify = 0
 EOF
     print_success "Repository file written: ${repofile}"
@@ -1132,7 +1524,34 @@ install_repo_rhel() {
     (command -v dnf >/dev/null 2>&1 && dnf install -y "$temp_rpm") || (command -v yum >/dev/null 2>&1 && yum install -y "$temp_rpm") || rpm -ivh "$temp_rpm" \
         || { rc=$?; report_fail repo_setup package_install_failed; exit "$rc"; }
     rm -f "$temp_rpm"
+    rank_bolt_repos "$BOLT_REPO_FILE"
     print_success "Repository installed"
+}
+
+# bolt-repo up to 1.0.7 ships priorities 100 to 400, which lose to dnf's
+# default 99, so a fresh server took httpd from appstream instead of the
+# AdminBolt repositories (AB-1407). Same values as bolt-agent's
+# POST /api/system/repos/bolt and the panel upgrade step; a file that already
+# has them (bolt-repo 1.0.8) is left untouched.
+rank_bolt_repos() {
+    local repo=$1 tmp
+    [[ -f "$repo" ]] || return 0
+    tmp=$(mktemp "${repo%/*}/.bolt.repo.XXXXXX") || return 0
+    awk '/^\[/{sec=$0}
+        /^[[:space:]]*priority[[:space:]]*=/{
+            if (sec=="[bolt-cdn]") {print "priority = 10"; next}
+            if (sec=="[bolt-noarch-cdn]") {print "priority = 20"; next}
+            if (sec=="[bolt]") {print "priority = 30"; next}
+            if (sec=="[bolt-noarch]") {print "priority = 40"; next}
+            if (sec ~ /^\[bolt/) {print "priority = 50"; next}
+        }
+        {print}' "$repo" >"$tmp" || { rm -f "$tmp"; return 0; }
+    # Plain bash comparison: a minimal server has no cmp (diffutils).
+    if [[ "$(<"$repo")" == "$(<"$tmp")" ]]; then
+        rm -f "$tmp"
+    else
+        chmod 0644 "$tmp" && mv -f "$tmp" "$repo" && print_success "Bolt repository priorities set below dnf's default"
+    fi
 }
 
 # Single package install helper: dnf or yum only (AlmaLinux). Skips already-installed. Optional leading args: dnf opts (e.g. --enablerepo=bolt, --exclude=bolt-bootstrap).
@@ -1159,9 +1578,147 @@ install_packages() {
     print_success "Packages installed"
 }
 
+# ---------------------------------------------------------------------------
+# Optional components (--without=)
+#
+# A small server can leave out whole components. Each one is a set of Stage 3
+# steps, skipped together, because their parts only work together: Postfix
+# hands mail to Dovecot, its submission ports refuse mail while Rspamd is
+# missing (milter_default_action=tempfail), webmail (Roundcube) and the
+# system e-mail account need both. A skipped step is not run and not reported
+# as a result, so the install report does not count it as a failure. The
+# panel computes each service's Installed state on the server, so every
+# skipped service shows as not installed on Health > Services. Install there
+# sets up the package only, not its profiles, so the end of the install
+# prints the skipped commands themselves: run in that order, they add the
+# component later.
+# ---------------------------------------------------------------------------
+readonly OPTIONAL_COMPONENTS="mail dns ftp"
+
+# Stage 3 step ids of an optional component.
+component_steps() {
+    case "$1" in
+        mail) echo "postfix dovecot rspamd mlmmj postfix_profiles dovecot_profiles rspamd_profiles rspamd_restart system_email app_roundcube" ;;
+        dns) echo "powerdns" ;;
+        ftp) echo "vsftpd vsftpd_profile" ;;
+    esac
+}
+
+# What leaving a component out takes away, for --help and the end of the install.
+component_description() {
+    case "$1" in
+        mail) echo "mail: Postfix, Dovecot, Rspamd (spam filter), MLMMJ (mailing lists), Roundcube webmail and the system e-mail account - no mailboxes or webmail, and the panel's own e-mail (alerts, password resets) is not sent" ;;
+        dns) echo "dns: PowerDNS - the server answers no DNS queries, so domains need DNS hosted elsewhere" ;;
+        ftp) echo "ftp: vsftpd - no FTP accounts; files can still be managed in the panel's file manager" ;;
+    esac
+}
+
+# Sets LEFT_OUT_COMPONENTS from a comma-separated list. Every item must be a
+# known component; an empty list or item, or an unknown one, is refused
+# (returns 1, LEFT_OUT_COMPONENTS unchanged) rather than installing more or
+# less than was asked for.
+set_left_out_components() {
+    local list="$1" item component chosen=" " result=""
+    # Lower-case names and commas only: nothing else can name a component,
+    # and a newline would end the split below early.
+    [[ "$list" =~ ^[a-z,]+$ ]] || return 1
+    # A trailing comma would otherwise vanish in the split below.
+    [[ "$list" != *, ]] || return 1
+    local -a items
+    IFS=',' read -r -a items <<<"$list"
+    for item in "${items[@]}"; do
+        _report_in_list "$item" "$OPTIONAL_COMPONENTS" || return 1
+        chosen+="$item "
+    done
+    for component in $OPTIONAL_COMPONENTS; do
+        [[ "$chosen" == *" $component "* ]] && result+="${result:+ }$component"
+    done
+    LEFT_OUT_COMPONENTS="$result"
+}
+
+# Prints the left-out component a Stage 3 step belongs to; returns 1 when the
+# step is to run.
+left_out_component_of_step() {
+    local step="$1" component
+    for component in $LEFT_OUT_COMPONENTS; do
+        if _report_in_list "$step" "$(component_steps "$component")"; then
+            printf '%s' "$component"
+            return 0
+        fi
+    done
+    return 1
+}
+
+# Returns 0 (after saying so, and keeping the command for the end of the
+# install) when the step belongs to a left-out component.
+skip_left_out_step() {
+    local step="$1" desc="$2" cmd="$3" component
+    component=$(left_out_component_of_step "$step") || return 1
+    SKIPPED_COMMANDS+=("$component $cmd")
+    print_info "${desc}: skipped (--without=${component})"
+    echo -e ""
+    return 0
+}
+
+# The choice is kept for the panel in bolt-config.ini, next to the install
+# ID: only the installer knows that a service is missing because it was
+# left out. Written on every install, empty when nothing was left out, so a
+# reinstall that puts everything back leaves no old list behind.
+write_left_out_components() {
+    local value="${LEFT_OUT_COMPONENTS// /,}"
+    _report_ini_set "$REPORT_BOLT_CONFIG" BOLT_INSTALL_WITHOUT "$value" \
+        || echo -e "${YELLOW}WARNING:${NC} could not write BOLT_INSTALL_WITHOUT=${value} to ${REPORT_BOLT_CONFIG}; set it with: bolt-cli set-ini-settings BOLT_INSTALL_WITHOUT ${value:-\"\"}"
+}
+
+print_left_out_components() {
+    local component
+    [[ -n "$LEFT_OUT_COMPONENTS" ]] || return 0
+    echo -e "${YELLOW}NOTE:${NC} Left out at your request (--without):"
+    for component in $LEFT_OUT_COMPONENTS; do
+        echo "  - $(component_description "$component")"
+    done
+    echo "To add one later, run the commands skipped for it as root, in this order:"
+    local entry
+    for component in $LEFT_OUT_COMPONENTS; do
+        echo "  ${component}:"
+        for entry in "${SKIPPED_COMMANDS[@]}"; do
+            [[ "${entry%% *}" == "$component" ]] && echo "    ${entry#* }"
+        done
+    done
+    echo -e ""
+}
+
+# EPEL from the distribution's own repositories (AlmaLinux and Rocky ship
+# epel-release in extras). AB-2331: when the distribution does not offer it
+# (CloudLinux 9 may not), the release package straight from the Fedora
+# project, which configures the same repositories.
+install_epel_release() {
+    rpm -q epel-release &>/dev/null && return 0
+    if dnf -q list epel-release &>/dev/null; then
+        install_packages epel-release
+    else
+        print_info "epel-release is not in the ${DISTRO_ID:-system} repositories; installing it from ${EPEL_RELEASE_URL}"
+        install_packages "$EPEL_RELEASE_URL"
+    fi
+}
+
+# The repository ids of CodeReady Builder: "crb" on AlmaLinux and Rocky;
+# CloudLinux names its own (AB-2331), so the ids are looked up. Debug and
+# source repositories are left out; "crb" when nothing is found, as before.
+crb_repo_ids() {
+    local ids
+    ids=$(dnf -q repolist --all 2>/dev/null | awk '
+        { id = $1; lid = tolower(id) }
+        id ~ /^[A-Za-z0-9._:-]+$/ && lid ~ /(^|[-_.])(crb|powertools)$|codeready-builder/ && lid !~ /debug|source/ { print id }
+    ' | sort -u | tr '\n' ' ')
+    ids="${ids% }"
+    printf '%s' "${ids:-crb}"
+}
+
 # $3 (optional) = step id for the install report.
 run_or_warn() {
     local cmd="$1" desc="${2:-Command}" step="${3:-}"
+    skip_left_out_step "$step" "$desc" "$cmd" && return 0
     print_info "$desc"
     report_step_start "$step"
     if eval "$cmd"; then print_success "$desc completed"; report_step_result "$step" ok; else echo -e "${YELLOW}WARNING:${NC} $desc failed (continuing)"; report_step_result "$step" failed; fi
@@ -1169,6 +1726,7 @@ run_or_warn() {
 }
 run_or_fail() {
     local cmd="$1" desc="${2:-Command}" step="${3:-}"
+    skip_left_out_step "$step" "$desc" "$cmd" && return 0
     report_step_start "$step"
     if ! eval "$cmd"; then print_error "${desc} failed"; report_fail "$step"; exit 1; fi
     report_step_result "$step" ok
@@ -1187,12 +1745,20 @@ selinux_not_enforcing() {
 }
 
 # Sets the caller's TRIAL_LICENCE_OK to 1 when a trial licence was issued.
-# run_or_warn evaluates the command in this shell, so the assignment records
-# the outcome. The address is quoted with %q for that eval: whatever
-# characters it holds (' $ ` | & and the like are valid in an address), none
-# is ever parsed as shell code.
+# Same output as run_or_warn, but bolt-cli is called directly with the
+# address as one argument: the address never becomes part of a command text
+# and never goes through eval (AB-2211). A refused request only warns.
 request_trial_licence() {
-    run_or_warn "bolt-cli request-trial-license --email=$(printf '%q' "$ADMIN_EMAIL") && TRIAL_LICENCE_OK=1" "Request trial licence"
+    local desc="Request trial licence"
+    print_info "$desc"
+    report_step_start ""
+    if bolt-cli request-trial-license "--email=${ADMIN_EMAIL}"; then
+        TRIAL_LICENCE_OK=1
+        print_success "$desc completed"; report_step_result "" ok
+    else
+        echo -e "${YELLOW}WARNING:${NC} $desc failed (continuing)"; report_step_result "" failed
+    fi
+    echo -e ""
 }
 
 # ---------- Stage 2: Prepare → Prerequisite packages → Bolt packages ----------
@@ -1201,7 +1767,19 @@ stage2_prepare_settings() {
     print_info "Stage 2.1: Preparing settings"
     run_or_warn "selinux_not_enforcing || setenforce 0" "SELinux enforce" selinux_enforce
     run_or_warn "sed -i 's#^SELINUX=.*#SELINUX=disabled#' /etc/selinux/config" "SELinux config" selinux_config
+    ssh_key_install
     print_success "Stage 2.1 completed: settings prepared"
+}
+
+# CloudLinux tools (X-Ray, MySQL Governor, lve-utils) call /sbin/service
+# directly; minimal EL9 images ship neither package that provides it.
+ensure_service_command() {
+    if rpm -q initscripts &>/dev/null || rpm -q initscripts-service &>/dev/null; then
+        print_success "service command already provided (initscripts/initscripts-service)"
+        return 0
+    fi
+    print_info "Installing initscripts-service (provides the service command)"
+    install_packages initscripts-service
 }
 
 # Step 2.2: Install all prerequisite packages (EPEL, CRB, libsodium, traceroute, openssl, jq, etc.)
@@ -1209,8 +1787,11 @@ stage2_install_prerequisite_packages() {
     print_info "Stage 2.2: Installing prerequisite packages"
     print_info "Enabling CRB (CodeReady Builder) repository"
     report_step_start prerequisite_packages
-    install_packages epel-release dnf-plugins-core
-    run_or_warn "dnf config-manager --set-enabled crb" "Enable CRB repo" crb_repo
+    install_epel_release
+    install_packages dnf-plugins-core
+    local crb_ids
+    crb_ids=$(crb_repo_ids)
+    run_or_warn "dnf config-manager --set-enabled ${crb_ids}" "Enable CRB repo (${crb_ids})" crb_repo
     report_step_start prerequisite_packages
     # Container and minimal AlmaLinux/Rocky 9 images ship curl-minimal and
     # libcurl-minimal, which conflict with the full curl/libcurl below. Replace
@@ -1223,6 +1804,7 @@ stage2_install_prerequisite_packages() {
         libsodium traceroute openssl jq rsync ca-certificates wget curl tar gzip unzip zip sudo apg \
         systemd openssl-libs libcurl libzip zlib gmp freetype libjpeg-turbo libpng libwebp libXpm gd \
         gettext-libs libicu sqlite-libs oniguruma libxslt shadow-utils chrony restic rclone git
+    ensure_service_command
     run_or_warn "systemctl enable --now chronyd" "Time synchronization (chronyd)" chronyd
     # pipefail: a failed download feeds sh nothing, which sh reports as success.
     run_or_warn "(set -o pipefail; curl https://get.acme.sh | sh -s email=issue-ssl@adminbolt.com)" "acme.sh" acme_sh
@@ -1231,35 +1813,243 @@ stage2_install_prerequisite_packages() {
 
 # dnf reports a failed %post scriptlet as a warning but the package
 # transaction still exits 0, so install_packages()'s exit-code check cannot
-# see it - bolt-agent's %post ends with `systemctl enable/restart/start
-# bolt-agent`, and a failure earlier in the script (permissions, disk space,
-# a real certificate issuance failure the self-signed fallback did not
-# catch) aborts before reaching that. Left undetected here, the only symptom
-# shows up later in Stage 3 as a bare agent connection error, which does not
-# name the actual cause. Kept separate from install_packages() (used by
-# every other package install in this script) so this check only ever
-# applies to bolt-agent, and every other install keeps its existing
-# behavior unchanged.
-install_bolt_agent_and_check_post() {
-    report_step_start agent_install
-    if rpm -q bolt-agent &>/dev/null; then
-        print_success "bolt-agent already installed"
+# see it - a failure in bolt-agent's %post (permissions, disk space, a real
+# certificate issuance failure the self-signed fallback did not catch) stops
+# the rest of the agent's setup. Left undetected here, the only symptom shows
+# up later in Stage 3 as a bare agent connection error, which does not name
+# the actual cause. Kept separate from install_packages() (used by every
+# other package install in this script) so this check only ever applies to
+# bolt-agent, and every other install keeps its existing behavior unchanged.
+#
+# The failed %post does not undo the package install, so on the rerun the
+# error message asks for, rpm -q alone would report bolt-agent as installed
+# and skip it. Nor is the service state enough: %post does not start the
+# agent, the package's %posttrans enables and restarts it whatever %post did,
+# so an agent whose setup stopped halfway is often running. And a clean
+# looking %post proves nothing either: the package records nothing when its
+# %post finishes, much of it ignores its own errors (a full disk turns the
+# certificate step into a warning and leaves HTTPS off), and the copy of
+# dnf's output the failure message is looked for in can itself be lost to a
+# full disk. So the setup counts as done only on positive proof: dnf
+# succeeded, its complete output names no failed %post, and the end state a
+# finished %post and %posttrans leave behind is there (agent_setup_problems).
+# Anything short of that stops the install and leaves AGENT_POST_FAILED_MARKER
+# behind; while it exists an installed bolt-agent is installed again (its
+# %post with it), and only that positive proof removes it. Without the marker
+# an installed agent is installed again too when its end state is
+# incomplete, or - only as a best effort, carrying on as before if that
+# cannot be done - when it is not running.
+AGENT_POST_FAILED_MARKER="/var/lib/adminbolt/agent-post-failed"
+AGENT_CONF="/etc/bolt-agent/agent.conf"
+AGENT_CONF_BACKUP_DIR="/var/lib/adminbolt/agent-conf-backup"
+AGENT_ACTIVE_WAIT_SECONDS=30
+
+# Value of KEY in [SECTION] of agent.conf, read the way bolt-agent's own
+# scripts read it.
+agent_conf_value() {
+    awk -F= -v section="[$1]" -v key="$2" '
+        index($0, section) == 1 { in_s = 1; next }
+        /^\[/ { in_s = 0 }
+        in_s && $1 == key { sub(/^[^=]*=/, "", $0); print $0; exit }
+    ' "$AGENT_CONF" 2>/dev/null
+}
+
+# What is wrong with an existing agent.conf that bolt-agent's %post cannot put
+# right: it keeps an existing file and only appends a few sections to it, so
+# a file cut short (a full disk while %post wrote it) stays broken on every
+# rerun - without the certificate paths %post stops each time, without the
+# [security] section or with an empty token the agent has no token. Prints
+# the first such problem; returns 0 when there is one.
+agent_conf_damage() {
+    [[ -e "$AGENT_CONF" ]] || return 1
+    if [[ ! -s "$AGENT_CONF" ]]; then echo "$AGENT_CONF is empty"; return 0; fi
+    if ! grep -q '^\[server\]' "$AGENT_CONF"; then echo "$AGENT_CONF has no [server] section"; return 0; fi
+    local key
+    for key in https_cert_path https_key_path https_ca_path; do
+        if [[ -z "$(agent_conf_value server "$key")" ]]; then echo "$AGENT_CONF has no $key"; return 0; fi
+    done
+    if ! grep -q '^\[security\]' "$AGENT_CONF"; then echo "$AGENT_CONF has no [security] section"; return 0; fi
+    if grep -q '^token=' "$AGENT_CONF" && [[ -z "$(agent_conf_value security token)" ]]; then
+        echo "$AGENT_CONF has an empty token"
         return 0
     fi
+    return 1
+}
 
-    local log dnf_status
-    log=$(mktemp)
-    if command -v dnf >/dev/null 2>&1; then
-        dnf install -y --enablerepo=bolt bolt-agent 2>&1 | tee "$log"
-        dnf_status=${PIPESTATUS[0]}
-    elif command -v yum >/dev/null 2>&1; then
-        yum install -y --enablerepo=bolt bolt-agent 2>&1 | tee "$log"
-        dnf_status=${PIPESTATUS[0]}
+# The files a finished %post leaves behind, in every bolt-agent version this
+# installer can install: agent.conf with a token, HTTPS on (%post turns it on
+# once a certificate is in place, or stops) and the certificate files it
+# names. Prints each thing missing, one per line; returns 1 if anything is.
+agent_setup_problems() {
+    local missing=() damage key file
+    if [[ ! -e "$AGENT_CONF" ]]; then
+        missing+=("$AGENT_CONF is missing")
+    elif damage=$(agent_conf_damage); then
+        missing+=("$damage")
     else
-        rm -f "$log"
+        [[ -n "$(agent_conf_value security token)" ]] || missing+=("$AGENT_CONF has no token")
+        grep -Eq '^[[:space:]]*https_enabled=true[[:space:]]*$' "$AGENT_CONF" ||
+            missing+=("HTTPS is off in $AGENT_CONF")
+        for key in https_cert_path https_key_path https_ca_path; do
+            file=$(agent_conf_value server "$key")
+            [[ -s "$file" ]] || missing+=("the certificate file $file is missing or empty")
+        done
+    fi
+    ((${#missing[@]} == 0)) && return 0
+    printf '%s\n' "${missing[@]}"
+    return 1
+}
+
+# The agent service is up: %posttrans restarts it, a crash on start shows as
+# activating or failed for a moment, so it is given AGENT_ACTIVE_WAIT_SECONDS.
+agent_service_active() {
+    local waited=0
+    until systemctl is-active --quiet bolt-agent 2>/dev/null; do
+        ((waited >= AGENT_ACTIVE_WAIT_SECONDS)) && return 1
+        sleep 1
+        waited=$((waited + 1))
+    done
+    return 0
+}
+
+# A likely reason worth naming: a full disk, from dnf's output (when there is
+# a copy, $1) or from what df reports for the directories the setup writes to.
+agent_disk_hint() {
+    local dir avail
+    if [[ -n "${1:-}" && -s "$1" ]] && grep -q 'No space left on device' "$1"; then
+        echo "the disk is full (No space left on device)"
+        return 0
+    fi
+    for dir in /etc /var/lib "${TMPDIR:-/tmp}"; do
+        avail=$(df -Pk "$dir" 2>/dev/null | awk 'NR == 2 { print $4 }') || avail=""
+        if [[ "$avail" =~ ^[0-9]+$ ]] && ((avail < 20480)); then
+            echo "the disk holding $dir is (almost) full, ${avail} KB free"
+            return 0
+        fi
+    done
+    return 0
+}
+
+# Stops the install because bolt-agent's setup is not done. $1 says what went
+# wrong, $2 (optional) what to do. The marker is left behind so the rerun
+# installs the agent again; if it cannot be written (and is not there), the
+# message says so and how to make the rerun do it anyway.
+agent_setup_failed() {
+    local next="${2:-Fix the cause, then rerun this installer; it retries the agent install.}"
+    { mkdir -p "$(dirname "$AGENT_POST_FAILED_MARKER")" &&
+        date -u '+%Y-%m-%dT%H:%M:%SZ' >"$AGENT_POST_FAILED_MARKER"; } 2>/dev/null || true
+    if [[ ! -e "$AGENT_POST_FAILED_MARKER" ]]; then
+        next="The installer could not record this failure in $AGENT_POST_FAILED_MARKER, so a rerun may not install the agent again by itself. Fix the cause, run 'mkdir -p $(dirname "$AGENT_POST_FAILED_MARKER") && touch $AGENT_POST_FAILED_MARKER', then rerun this installer."
+    fi
+    print_error "$1 $next"
+    report_fail agent_scriptlet agent_install_failed
+    exit 1
+}
+
+# Moves a damaged agent.conf (agent_conf_damage, $1) into a dated copy under
+# AGENT_CONF_BACKUP_DIR, next to a MANIFEST saying what it was and why it was
+# moved, so the agent's %post writes a new one. The manifest is written
+# first; when either step fails nothing is moved and the install stops.
+set_aside_agent_conf() {
+    local reason="$1" dir sum size
+    dir="$AGENT_CONF_BACKUP_DIR/$(date -u '+%Y%m%dT%H%M%SZ')"
+    sum=$(sha256sum "$AGENT_CONF" 2>/dev/null | awk '{ print $1 }') || sum=""
+    size=$(wc -c <"$AGENT_CONF" 2>/dev/null | tr -d ' ') || size=""
+    if ! { mkdir -p "$dir" && chmod 700 "$dir" &&
+        printf 'original=%s\nmoved_at=%s\nreason=%s\nsize_bytes=%s\nsha256=%s\nmoved_by=AdminBolt installer (install.sh), before installing bolt-agent again\n' \
+            "$AGENT_CONF" "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" "$reason" "${size:-unknown}" "${sum:-unknown}" >"$dir/MANIFEST" &&
+        mv "$AGENT_CONF" "$dir/agent.conf"; } 2>/dev/null; then
+        agent_setup_failed "bolt-agent's configuration is damaged ($reason) and could not be moved aside to $dir, so its setup cannot write a new one." \
+            "Make room on the disk (or move $AGENT_CONF away yourself), then rerun this installer; it retries the agent install."
+    fi
+    print_info "Moved the damaged $AGENT_CONF to $dir (MANIFEST there says why); bolt-agent's setup writes a new one"
+}
+
+# Runs one package command for bolt-agent ($@: dnf/yum subcommand), on screen
+# and, when there is a temporary file, copied to $log. Sets the caller's
+# dnf_status, and log_ok=0 when the copy is incomplete (writing it failed).
+agent_package_command() {
+    local statuses errexit=0
+    if [[ -z "$log" ]]; then
+        if "$pm" "$@" -y --enablerepo=bolt "$agent_pkg"; then dnf_status=0; else dnf_status=$?; fi
+        return 0
+    fi
+    # Without set -e for the pipeline: a tee that cannot write the copy (a
+    # full disk) must not end the installer without a word.
+    [[ $- == *e* ]] && errexit=1
+    set +e
+    "$pm" "$@" -y --enablerepo=bolt "$agent_pkg" 2>&1 | tee "$log"
+    statuses=("${PIPESTATUS[@]}")
+    ((errexit)) && set -e
+    dnf_status=${statuses[0]}
+    [[ "${statuses[1]}" -eq 0 ]] || log_ok=0
+    return 0
+}
+
+install_bolt_agent_and_check_post() {
+    report_step_start agent_install
+    local again="" problems="" damage="" hint=""
+    # AB-2331 addendum: --agent-version installs exactly that build. Another
+    # installed version is replaced by a plain install of the pinned
+    # version-release (dnf install of a version-release replaces it), and the
+    # checks below apply to the pinned build once it is the installed one.
+    local agent_pkg
+    agent_pkg=$(pinned_spec bolt-agent)
+    if [[ "$agent_pkg" != bolt-agent ]] && rpm -q bolt-agent &>/dev/null && ! rpm -q "$agent_pkg" &>/dev/null; then
+        print_info "bolt-agent $(rpm -q --qf '%{VERSION}-%{RELEASE}' bolt-agent 2>/dev/null) is installed; installing the requested ${agent_pkg}"
+    elif rpm -q bolt-agent &>/dev/null; then
+        if [[ -e "$AGENT_POST_FAILED_MARKER" ]]; then
+            again=marker
+            print_info "bolt-agent is installed but its setup did not finish; installing it again"
+        elif ! problems=$(agent_setup_problems); then
+            again=incomplete
+            print_info "bolt-agent is installed but its setup is incomplete (${problems//$'\n'/; }); installing it again"
+        elif ! systemctl is-active --quiet bolt-agent 2>/dev/null; then
+            again=stopped
+            print_info "bolt-agent is installed but not running; reinstalling it to rerun its setup"
+        else
+            print_success "bolt-agent already installed"
+            return 0
+        fi
+    fi
+    if damage=$(agent_conf_damage); then
+        set_aside_agent_conf "$damage"
+    fi
+
+    local pm log dnf_status=0 log_ok=1
+    if command -v dnf >/dev/null 2>&1; then pm=dnf
+    elif command -v yum >/dev/null 2>&1; then pm=yum
+    else
         print_error "dnf/yum not found"
         report_fail agent_install agent_install_failed
         exit 1
+    fi
+    # No temporary file (a full disk): dnf runs as usual, but nothing can show
+    # its %post was clean, so the setup cannot count as done below.
+    log=$(mktemp 2>/dev/null) || log=""
+    [[ -n "$log" ]] || log_ok=0
+    if [[ -n "$again" ]]; then
+        agent_package_command reinstall
+        if [[ "$dnf_status" -ne 0 && "$again" == stopped ]]; then
+            # Nothing says this agent's setup failed: keep the installed
+            # version and go on, as the installer did before.
+            rm -f "$log"
+            echo -e "${YELLOW}WARNING:${NC} reinstalling bolt-agent failed; keeping the installed version (continuing)"
+            report_step_result agent_install ok
+            return 0
+        fi
+        # The setup did fail. If the installed version is gone from the
+        # repository, upgrade to the newer one there, which runs %post too.
+        if [[ "$dnf_status" -ne 0 && -n "$log" ]] && grep -q 'not available' "$log"; then
+            agent_package_command upgrade
+            if [[ "$dnf_status" -eq 0 && -n "$log" ]] && grep -q '^Nothing to do' "$log"; then
+                rm -f "$log"
+                agent_setup_failed "bolt-agent's setup has to run again, but the installed version is not in the repository and there is no newer one to install." \
+                    "Rerun this installer with the --source (stable, staging or testing) whose repository has this version or a newer one; it retries the agent install."
+            fi
+        fi
+    else
+        agent_package_command install
     fi
 
     if [[ "$dnf_status" -ne 0 ]]; then
@@ -1268,15 +2058,42 @@ install_bolt_agent_and_check_post() {
         report_fail agent_install agent_install_failed
         exit 1
     fi
-    if grep -Eq '%post\(bolt-agent[^)]*\) scriptlet failed' "$log"; then
+    if [[ -n "$log" ]] && grep -Eq '%post\(bolt-agent[^)]*\) scriptlet failed|Error in POSTIN scriptlet in rpm package bolt-agent' "$log"; then
+        hint=$(agent_disk_hint "$log")
         rm -f "$log"
-        print_error "bolt-agent's post-install script (%post) failed. Check the output above (or 'journalctl -u bolt-agent') for the cause, fix it, then rerun this installer."
-        report_fail agent_scriptlet agent_install_failed
-        exit 1
+        agent_setup_failed "bolt-agent's post-install script (%post) failed${hint:+ ($hint)}. Check the output above (or 'journalctl -u bolt-agent') for the cause."
     fi
-    rm -f "$log"
+    if ((log_ok == 0)); then
+        hint=$(agent_disk_hint "")
+        rm -f "$log"
+        agent_setup_failed "The installer could not keep a complete copy of bolt-agent's install output${hint:+ ($hint)}, so nothing shows that the agent's post-install script (%post) finished."
+    fi
+    problems=$(agent_setup_problems) || true
+    agent_service_active || problems+="${problems:+$'\n'}the bolt-agent service is not running"
+    if [[ -n "$problems" ]]; then
+        hint=$(agent_disk_hint "$log")
+        rm -f "$log"
+        agent_setup_failed "bolt-agent's setup did not finish: ${problems//$'\n'/; }${hint:+ (likely cause: $hint)}. Check the output above (or 'journalctl -u bolt-agent')."
+    fi
+    rm -f "$log" "$AGENT_POST_FAILED_MARKER"
     report_step_result agent_install ok
     print_success "bolt-agent installed"
+}
+
+# Stage 3 end: the agent's end state is checked once more before the install
+# is reported complete, so a failure after Stage 2 (a disk that filled up
+# meanwhile, HTTPS turned off) stops the install rather than end in
+# "Installation Completed Successfully".
+check_agent_setup_at_end() {
+    local problems="" hint=""
+    report_step_start agent_scriptlet
+    problems=$(agent_setup_problems) || true
+    agent_service_active || problems+="${problems:+$'\n'}the bolt-agent service is not running"
+    if [[ -n "$problems" ]]; then
+        hint=$(agent_disk_hint "")
+        agent_setup_failed "bolt-agent's setup is not complete at the end of the install: ${problems//$'\n'/; }${hint:+ (likely cause: $hint)}. Check 'journalctl -u bolt-agent'."
+    fi
+    report_step_result agent_scriptlet ok
 }
 
 # bolt-panel's %post (database install, base setup, marking the panel as
@@ -1295,7 +2112,7 @@ install_bolt_panel_and_check_post() {
     local log status errexit=0
     report_step_start panel_install
     if ! log=$(mktemp 2>/dev/null); then
-        install_packages --enablerepo=bolt bolt-nginx bolt-php "$1"
+        install_packages --enablerepo=bolt "$(pinned_spec bolt-nginx)" "$(pinned_spec bolt-php)" "$1"
         report_step_result panel_install ok
         return 0
     fi
@@ -1309,7 +2126,7 @@ install_bolt_panel_and_check_post() {
     # loses its output as it would without the copy.)
     (
         ((errexit)) && set -e
-        install_packages --enablerepo=bolt bolt-nginx bolt-php "$1"
+        install_packages --enablerepo=bolt "$(pinned_spec bolt-nginx)" "$(pinned_spec bolt-php)" "$1"
     ) 2>&1 | { trap '' INT; tee "$log" || cat; }
     status=${PIPESTATUS[0]}
     ((errexit)) && set -e
@@ -1331,6 +2148,7 @@ stage2_install_bolt_packages() {
     print_info "Stage 2.3: Installing all Bolt packages"
     report_step_start repo_setup
     install_repo_rhel 9
+    pinned_versions_available
     local panel_pkg="bolt-panel"
     if [[ -n "$PANEL_VERSION" ]]; then
         panel_pkg="bolt-panel-${PANEL_VERSION}"
@@ -1338,7 +2156,9 @@ stage2_install_bolt_packages() {
     fi
     install_bolt_agent_and_check_post
     install_bolt_panel_and_check_post "$panel_pkg"
+    install_pinned_extra_packages
     report_write_panel_settings
+    write_left_out_components
     report_step_start web_services_enable
     systemctl enable --now bolt-nginx bolt-php
     report_step_result web_services_enable ok
@@ -1368,8 +2188,126 @@ stage_configuration() {
     run_or_warn "bolt-cli manage-nftable --action=install" "Nftable" nftables
     run_or_warn "bolt-cli manage-sshd --action=install" "SSH server" ssh_server
     run_or_warn "bolt-cli manage-powerdns --action=install" "PowerDNS" powerdns
-    # AB-1446: the MariaDB series is a choice; without --mariadb-version the
-    # panel's default series is installed.
+    # AB-2331: with the database skipped (--skip-database, or a server found
+    # on the box) no MariaDB step runs at all: no package, no series, no root
+    # password reset, no my.cnf profile. The agent is pointed at the server
+    # that is there instead.
+    database_skip_decide
+    if ((SKIP_DATABASE)); then
+        agent_db_credentials_from_my_cnf
+    else
+        stage_configuration_mariadb
+    fi
+    run_or_warn "bolt-cli manage-postfix --action=install" "Postfix" postfix
+    run_or_warn "bolt-cli manage-dovecot --action=install" "Dovecot" dovecot
+    run_or_warn "bolt-cli manage-redis --action=install" "Redis" redis
+    run_or_warn "bolt-cli manage-rspamd --action=install" "Rspamd" rspamd
+    run_or_warn "bolt-cli manage-mlmmj --action=install" "MLMMJ" mlmmj
+    run_or_warn "bolt-cli manage-php --action=install --php-version=8.4" "PHP 8.4" php84
+    if ((SKIP_APACHE)); then
+        print_info "MyApache skipped (--skip-apache)"
+    else
+        run_or_warn "bolt-cli manage-my-apache --action=install" "MyApache" myapache
+    fi
+    run_or_warn "bolt-cli manage-vsftpd --action=install" "Vsftpd" vsftpd
+    # Disk quota, on a box that has no accounts yet: the accounting pass is
+    # instant here and enforcement is on from the first account, rather than
+    # being switched on later under accounts that are already over their
+    # plans. Warn-only - a filesystem that cannot carry quota is a reason to
+    # tell the administrator, not to fail the install.
+    run_or_warn "bolt-cli manage-disk-quota --action=install" "Disk quota enforcement" disk_quota
+    run_or_warn "bolt-cli manage-fail2ban --action=install" "Fail2Ban" fail2ban
+    for app in local-api filemanager phpmyadmin roundcube git metrics adminer; do
+        run_or_warn "bolt-php ${WEB_INSTALL_ROOT}/artisan bolt:manage-app --action=install --app-name=${app}" "App ${app}" "app_${app}"
+    done
+    sleep 5
+    run_or_warn "bolt-cli manage-sshd-profiles --action=install" "SSH server profiles" ssh_profiles
+    run_or_warn "bolt-cli manage-postfix-profiles --action=install" "Postfix profiles" postfix_profiles
+    run_or_warn "bolt-cli manage-dovecot-profiles --action=install" "Dovecot profiles" dovecot_profiles
+    run_or_warn "bolt-cli manage-redis-profiles --action=install" "Redis profiles" redis_profiles
+    run_or_warn "bolt-cli manage-rspamd-profiles --action=install" "Rspamd profiles" rspamd_profiles
+    run_or_warn "bolt-cli setup-firewall" "Firewall setup" firewall_setup
+    if ((SKIP_DATABASE)); then
+        print_info "MariaDB profile skipped (${DATABASE_SKIP_REASON}): the database server's configuration is left as it is"
+    else
+        run_or_warn "bolt-cli manage-mariadb-default-profile --action=install" "MariaDB profile" mariadb_profile
+    fi
+    if ((SKIP_APACHE)); then
+        print_info "MyApache profile skipped (--skip-apache)"
+    else
+        run_or_warn "bolt-cli manage-my-apache-default-profile --action=install" "MyApache profile" myapache_profile
+    fi
+    run_or_warn "bolt-cli manage-system-email-account --action=install" "System email" system_email
+    run_or_warn "bolt-cli manage-dns-records-default-template --action=install" "DNS template" dns_template
+    run_or_warn "bolt-cli manage-php-default-profile --php-version=8.4 --action=install" "PHP 8.4 profile" php84_profile
+    run_or_warn "bolt-cli manage-vsftpd-profiles --action=install" "Vsftpd profile" vsftpd_profile
+    run_or_warn "bolt-cli manage-fail2ban-profiles --action=install" "Fail2Ban profile" fail2ban_profile
+    run_or_warn "bolt-cli setup-cron-jobs" "Setup Cron jobs" cron_jobs
+    # Only records a provisioning plan and returns; the panel scheduler (installed by setup-cron-jobs) executes it in the background.
+    run_or_warn "bolt-cli post-install-provision" "Queue post-install provisioning (remaining PHP versions, SecureBox, SymLock)" postinstall_queue
+    run_or_warn "bolt-cli setup-hidepid" "Harden /proc (hidepid)" hidepid
+    # QA F2: a bare restart under set -e aborted the whole run (no trial
+    # licence, no SSO URL, no banner) whenever rspamd was not installed.
+    run_or_warn "systemctl restart rspamd" "Rspamd restart" rspamd_restart
+    # AB-2069: the page the web server shows on port 80 for the server IP (and
+    # for domains with no site yet). Written by the panel through bolt-agent, so
+    # it carries the brand and the panel port; never fatal. No step id: the
+    # install report takes only the step ids its receiver knows.
+    run_or_warn "bolt-cli publish-default-site-page" "Default site page"
+    # Before the trial licence and the SSH password change: a failed install
+    # keeps password login and does not use up the trial request.
+    check_agent_setup_at_end
+    # Trial licence last: nothing in the install depends on it, and the licence server refuses repeats
+    # per e-mail and per IP, which must never abort an otherwise complete installation.
+    local TRIAL_LICENCE_OK=0
+    if [[ -n "$ADMIN_EMAIL" ]]; then
+        request_trial_licence
+        # Its own report field; never part of the install result.
+        if [[ "${TRIAL_LICENCE_OK}" -eq 1 ]]; then report_trial_licence ok; else report_trial_licence failed; fi
+    else
+        report_trial_licence skipped
+        print_info "No --email= provided; skipping trial licence request. Activate a licence later on the panel's License page."
+    fi
+    # AB-2106: last, after every step that configures sshd, so they cannot undo it and a failed install keeps password login.
+    ssh_password_login_off || true
+    local SSO_URL
+    SSO_URL=$(bolt-cli admin-sso-generate 2>/dev/null || echo "")
+    if [ -z "${SSO_URL}" ]; then
+        echo -e "${YELLOW}WARNING:${NC} SSO URL not generated"
+    else
+        print_success "SSO URL generated"
+    fi
+    [ -n "${SSH_PASSWORD_NOTE}" ] && echo -e "\n${SSH_PASSWORD_NOTE}"
+    echo -e "\n${BOLD}${GREEN}+----------------------------------------------------------+${NC}"
+    echo -e "${BOLD}${GREEN}|          Installation Completed Successfully             |${NC}"
+    echo -e "${BOLD}${GREEN}+----------------------------------------------------------+${NC}\n"
+    [ -n "${ADMIN_EMAIL}" ] && [ "${TRIAL_LICENCE_OK}" -eq 0 ] && echo -e "${YELLOW}NOTE:${NC} Trial licence not issued (request refused or licence server unreachable). The installation itself succeeded and the panel is usable; activate a licence on its License page.\n"
+    print_left_out_components
+    [ -n "${SSO_URL:-}" ] && echo -e "${BOLD}${CYAN}--- Access ---${NC}\n${GREEN}Admin Panel:${NC}\n${BOLD}${SSO_URL}${NC}\n"
+    # AB-2069: nothing here used to say which login the panel takes, and the
+    # guesses (root, the hosting username, an e-mail) each counted towards a
+    # Fail2Ban ban. The link above signs in once; this is for every time after.
+    echo -e "${BOLD}${CYAN}--- Signing in later ---${NC}"
+    echo -e "${GREEN}Admin username:${NC} ${BOLD}admin${NC} (or the e-mail you enter in the setup wizard)"
+    echo -e "${GREEN}Password:${NC} the one you set in the setup wizard that opens with the link above"
+    echo -e "${GREEN}Until the setup wizard is finished, root can also sign in with this server's root password; the wizard offers to turn that off.${NC}\n"
+    echo -e "${BOLD}${CYAN}--- If you get locked out ---${NC}"
+    echo -e "${GREEN}New one-time sign-in link:${NC} ${BOLD}bolt-cli admin-sso-generate${NC}"
+    echo -e "${GREEN}Reset the admin password:${NC}  ${BOLD}bolt-cli reset-admin-account-password${NC}"
+    echo -e "${GREEN}Lift a Fail2Ban ban:${NC}       ${BOLD}bolt-cli fail2ban-unban <your-ip> --whitelist${NC}"
+    print_progress "100% — post-install"
+    print_success "Stage 3 completed: all post-install actions done"
+}
+
+# The MariaDB step of Stage 3, on a box without a database server.
+stage_configuration_mariadb() {
+    # AB-1446: the MariaDB series is a choice. AB-2228: without
+    # --mariadb-version a new box gets DEFAULT_MARIADB_SERIES, asked for
+    # explicitly so a panel with an older default installs it too. A box that
+    # already runs a database server (the installer run again, a converted
+    # server) does not get here since AB-2331: database_skip_decide skips the
+    # database steps there.
+    MARIADB_SERIES=$(mariadb_series_to_install "$MARIADB_SERIES")
     if [[ -n "$MARIADB_SERIES" ]]; then
         # QA F1: a panel that predates the --series option (an older channel
         # head, a pinned older version) refused the flag and the box was left
@@ -1395,96 +2333,319 @@ stage_configuration() {
     else
         run_or_warn "bolt-cli manage-mariadb --action=install" "MariaDB" mariadb
     fi
-    run_or_warn "bolt-cli manage-postfix --action=install" "Postfix" postfix
-    run_or_warn "bolt-cli manage-dovecot --action=install" "Dovecot" dovecot
-    run_or_warn "bolt-cli manage-redis --action=install" "Redis" redis
-    run_or_warn "bolt-cli manage-rspamd --action=install" "Rspamd" rspamd
-    run_or_warn "bolt-cli manage-mlmmj --action=install" "MLMMJ" mlmmj
-    run_or_warn "bolt-cli manage-php --action=install --php-version=8.4" "PHP 8.4" php84
-    run_or_warn "bolt-cli manage-my-apache --action=install" "MyApache" myapache
-    run_or_warn "bolt-cli manage-vsftpd --action=install" "Vsftpd" vsftpd
-    # Disk quota, on a box that has no accounts yet: the accounting pass is
-    # instant here and enforcement is on from the first account, rather than
-    # being switched on later under accounts that are already over their
-    # plans. Warn-only - a filesystem that cannot carry quota is a reason to
-    # tell the administrator, not to fail the install.
-    run_or_warn "bolt-cli manage-disk-quota --action=install" "Disk quota enforcement" disk_quota
-    run_or_warn "bolt-cli manage-fail2ban --action=install" "Fail2Ban" fail2ban
-    for app in local-api filemanager phpmyadmin roundcube git metrics adminer; do
-        run_or_warn "bolt-php ${WEB_INSTALL_ROOT}/artisan bolt:manage-app --action=install --app-name=${app}" "App ${app}" "app_${app}"
-    done
-    sleep 5
-    run_or_warn "bolt-cli manage-sshd-profiles --action=install" "SSH server profiles" ssh_profiles
-    run_or_warn "bolt-cli manage-postfix-profiles --action=install" "Postfix profiles" postfix_profiles
-    run_or_warn "bolt-cli manage-dovecot-profiles --action=install" "Dovecot profiles" dovecot_profiles
-    run_or_warn "bolt-cli manage-redis-profiles --action=install" "Redis profiles" redis_profiles
-    run_or_warn "bolt-cli manage-rspamd-profiles --action=install" "Rspamd profiles" rspamd_profiles
-    run_or_warn "bolt-cli setup-firewall" "Firewall setup" firewall_setup
-    run_or_warn "bolt-cli manage-mariadb-default-profile --action=install" "MariaDB profile" mariadb_profile
-    run_or_warn "bolt-cli manage-my-apache-default-profile --action=install" "MyApache profile" myapache_profile
-    run_or_warn "bolt-cli manage-system-email-account --action=install" "System email" system_email
-    run_or_warn "bolt-cli manage-dns-records-default-template --action=install" "DNS template" dns_template
-    run_or_warn "bolt-cli manage-php-default-profile --php-version=8.4 --action=install" "PHP 8.4 profile" php84_profile
-    run_or_warn "bolt-cli manage-vsftpd-profiles --action=install" "Vsftpd profile" vsftpd_profile
-    run_or_warn "bolt-cli manage-fail2ban-profiles --action=install" "Fail2Ban profile" fail2ban_profile
-    run_or_warn "bolt-cli setup-cron-jobs" "Setup Cron jobs" cron_jobs
-    # Only records a provisioning plan and returns; the panel scheduler (installed by setup-cron-jobs) executes it in the background.
-    run_or_warn "bolt-cli post-install-provision" "Queue post-install provisioning (remaining PHP versions, SecureBox, SymLock)" postinstall_queue
-    run_or_warn "bolt-cli setup-hidepid" "Harden /proc (hidepid)" hidepid
-    # QA F2: a bare restart under set -e aborted the whole run (no trial
-    # licence, no SSO URL, no banner) whenever rspamd was not installed.
-    run_or_warn "systemctl restart rspamd" "Rspamd restart" rspamd_restart
-    # AB-2069: the page the web server shows on port 80 for the server IP (and
-    # for domains with no site yet). Written by the panel through bolt-agent, so
-    # it carries the brand and the panel port; never fatal.
-    run_or_warn "bolt-cli publish-default-site-page" "Default site page" default_site_page
-    # Trial licence last: nothing in the install depends on it, and the licence server refuses repeats
-    # per e-mail and per IP, which must never abort an otherwise complete installation.
-    local TRIAL_LICENCE_OK=0
-    if [[ -n "$ADMIN_EMAIL" ]]; then
-        request_trial_licence
-        # Its own report field; never part of the install result.
-        if [[ "${TRIAL_LICENCE_OK}" -eq 1 ]]; then report_trial_licence ok; else report_trial_licence failed; fi
-    else
-        report_trial_licence skipped
-        print_info "No --email= provided; skipping trial licence request. Activate a licence later on the panel's License page."
+}
+
+# The series stage_configuration asks the panel for: the one given with
+# --mariadb-version, else DEFAULT_MARIADB_SERIES when no MariaDB server
+# package is installed yet, else none (the panel keeps the installed one).
+mariadb_series_to_install() {
+    local given="${1:-}"
+    if [[ -n "$given" ]]; then
+        echo "$given"
+    elif ! rpm -q MariaDB-server >/dev/null 2>&1 && ! rpm -q mariadb-server >/dev/null 2>&1; then
+        echo "$DEFAULT_MARIADB_SERIES"
     fi
-    local SSO_URL=$(bolt-cli admin-sso-generate 2>/dev/null || echo "")
-    [ -z "${SSO_URL}" ] && echo -e "${YELLOW}WARNING:${NC} SSO URL not generated" || print_success "SSO URL generated"
-    echo -e "\n${BOLD}${GREEN}+----------------------------------------------------------+${NC}"
-    echo -e "${BOLD}${GREEN}|          Installation Completed Successfully             |${NC}"
-    echo -e "${BOLD}${GREEN}+----------------------------------------------------------+${NC}\n"
-    [ -n "${ADMIN_EMAIL}" ] && [ "${TRIAL_LICENCE_OK}" -eq 0 ] && echo -e "${YELLOW}NOTE:${NC} Trial licence not issued (request refused or licence server unreachable). The installation itself succeeded and the panel is usable; activate a licence on its License page.\n"
-    [ -n "${SSO_URL:-}" ] && echo -e "${BOLD}${CYAN}--- Access ---${NC}\n${GREEN}Admin Panel:${NC}\n${BOLD}${SSO_URL}${NC}\n"
-    # AB-2069: nothing here used to say which login the panel takes, and the
-    # guesses (root, the hosting username, an e-mail) each counted towards a
-    # Fail2Ban ban. The link above signs in once; this is for every time after.
-    echo -e "${BOLD}${CYAN}--- Signing in later ---${NC}"
-    echo -e "${GREEN}Admin username:${NC} ${BOLD}admin${NC} (or the e-mail you enter in the setup wizard)"
-    echo -e "${GREEN}Password:${NC} the one you set in the setup wizard that opens with the link above"
-    echo -e "${GREEN}Until the setup wizard is finished, root can also sign in with this server's root password; the wizard offers to turn that off.${NC}\n"
-    echo -e "${BOLD}${CYAN}--- If you get locked out ---${NC}"
-    echo -e "${GREEN}New one-time sign-in link:${NC} ${BOLD}bolt-cli admin-sso-generate${NC}"
-    echo -e "${GREEN}Reset the admin password:${NC}  ${BOLD}bolt-cli reset-admin-account-password${NC}"
-    echo -e "${GREEN}Lift a Fail2Ban ban:${NC}       ${BOLD}bolt-cli fail2ban-unban <your-ip> --whitelist${NC}"
-    print_progress "100% — post-install"
-    print_success "Stage 3 completed: all post-install actions done"
+}
+
+# ---------- Pinned package versions (AB-2331 addendum) ----------
+# An RPM version-release: no dash inside either part, exactly one between them.
+readonly PINNED_VERSION_RE='^[0-9A-Za-z._+~^]+-[0-9A-Za-z._+~^]+$'
+
+# Checks --agent-version and every --package; prints the first problem.
+# AGENT_VERSION_GIVEN is main's: an empty --agent-version= is an error too.
+pinned_versions_valid() {
+    local entry name version seen=" "
+    if [[ "${AGENT_VERSION_GIVEN:-0}" == 1 && ! "$AGENT_VERSION" =~ $PINNED_VERSION_RE ]]; then
+        print_error "Invalid --agent-version=${AGENT_VERSION} (expected <version>-<release>, e.g. 1.30.4-1.el9)"
+        return 1
+    fi
+    while IFS= read -r entry; do
+        [[ -n "$entry" ]] || continue
+        name="${entry%%=*}"
+        version="${entry#*=}"
+        if [[ "$entry" != *=* || ! "$name" =~ ^bolt-[a-z0-9-]+$ || ! "$version" =~ $PINNED_VERSION_RE ]]; then
+            print_error "Invalid --package=${entry} (expected bolt-<name>=<version>-<release>, e.g. bolt-php=8.4.14-1.el9)"
+            return 1
+        fi
+        case "$name" in
+            bolt-panel) print_error "--package=${entry}: use --version= for bolt-panel"; return 1 ;;
+            bolt-agent) print_error "--package=${entry}: use --agent-version= for bolt-agent"; return 1 ;;
+        esac
+        if [[ "$seen" == *" $name "* ]]; then
+            print_error "--package=${name}= given twice"
+            return 1
+        fi
+        seen+="$name "
+    done <<<"$PINNED_PACKAGES"
+    return 0
+}
+
+# The package spec to install: name-version-release when pinned, else the name.
+pinned_spec() {
+    local entry
+    if [[ "$1" == bolt-agent && -n "$AGENT_VERSION" ]]; then
+        printf '%s' "bolt-agent-${AGENT_VERSION}"
+        return 0
+    fi
+    while IFS= read -r entry; do
+        [[ -n "$entry" && "${entry%%=*}" == "$1" ]] || continue
+        printf '%s' "$1-${entry#*=}"
+        return 0
+    done <<<"$PINNED_PACKAGES"
+    printf '%s' "$1"
+}
+
+# Every pinned spec (bolt-agent first), one per line.
+pinned_specs() {
+    local entry
+    [[ -n "$AGENT_VERSION" ]] && echo "bolt-agent-${AGENT_VERSION}"
+    while IFS= read -r entry; do
+        [[ -n "$entry" ]] && echo "${entry%%=*}-${entry#*=}"
+    done <<<"$PINNED_PACKAGES"
+    return 0
+}
+
+# Stops the install, before any Bolt package is installed, when a pinned
+# version is not in the repositories just configured (--source, or the
+# bolt-repo default). dnf install of an exact version-release installs it
+# whatever version is there, so a pinned version also moves a box back.
+pinned_versions_available() {
+    local spec missing=()
+    [[ -n "$AGENT_VERSION$PINNED_PACKAGES" ]] || return 0
+    # Reported as the repository step: the install report takes only its
+    # fixed list of step ids.
+    report_step_start repo_setup
+    while IFS= read -r spec; do
+        [[ -n "$spec" ]] || continue
+        if dnf -q --enablerepo=bolt --showduplicates list "$spec" >/dev/null 2>&1; then
+            print_success "Pinned version found: ${spec}"
+        else
+            missing+=("$spec")
+        fi
+    done < <(pinned_specs)
+    if ((${#missing[@]})); then
+        print_error "Not found in the Bolt repositories (source=${BOLT_SOURCE:-default}): ${missing[*]}. Check the version-release, or the --source the build was published to (PR builds: --source=testing)."
+        report_fail repo_setup package_install_failed
+        exit 1
+    fi
+    report_step_result repo_setup ok
+}
+
+# The pinned packages Stage 2.3 does not install by itself (all but
+# bolt-agent, bolt-nginx and bolt-php), at exactly the given versions.
+install_pinned_extra_packages() {
+    local entry name specs=()
+    while IFS= read -r entry; do
+        [[ -n "$entry" ]] || continue
+        name="${entry%%=*}"
+        case "$name" in bolt-nginx|bolt-php) continue ;; esac
+        specs+=("$name-${entry#*=}")
+    done <<<"$PINNED_PACKAGES"
+    ((${#specs[@]})) || return 0
+    print_info "Installing pinned packages: ${specs[*]}"
+    # Bolt packages like the panel's: reported as that step.
+    report_step_start panel_install
+    install_packages --enablerepo=bolt "${specs[@]}"
+    report_step_result panel_install ok
+}
+
+# ---------- Database server already on the box (AB-2331) ----------
+# MariaDB's install step reaches `dnf install MariaDB-server --allowerasing`
+# in bolt-agent and resets root's password, so it must never run where a
+# database server already is: it would replace MySQL (cl-MySQL under MySQL
+# Governor on CloudLinux, a cPanel server being converted) and start MariaDB
+# on its data directory.
+
+# Prints why the box counts as having a database server; fails when it has
+# none. A server that answers is enough (mysqladmin ping exits 0 even when it
+# refuses the login); so is any server package, running or not.
+database_server_found() {
+    local admin p hit
+    local -a globs
+    for admin in mysqladmin mariadb-admin; do
+        command -v "$admin" >/dev/null 2>&1 || continue
+        if run_bounded 15 "$admin" --connect-timeout=5 ping </dev/null >/dev/null 2>&1; then
+            echo "a database server answers ($admin ping)"
+            return 0
+        fi
+        break
+    done
+    for p in $DATABASE_SERVER_PACKAGES; do
+        if rpm -q "$p" >/dev/null 2>&1; then
+            echo "$p is installed"
+            return 0
+        fi
+    done
+    # Read into an array: unquoted, the globs would match files in the current directory.
+    read -r -a globs <<<"$DATABASE_SERVER_PACKAGE_GLOBS"
+    for p in "${globs[@]}"; do
+        hit=$(rpm -qa "$p" 2>/dev/null | head -n 1)
+        if [[ -n "$hit" ]]; then
+            echo "$hit is installed"
+            return 0
+        fi
+    done
+    return 1
+}
+
+# Sets SKIP_DATABASE (and DATABASE_SKIP_REASON) once per run, and says why.
+database_skip_decide() {
+    ((DATABASE_SKIP_DECIDED)) && return 0
+    DATABASE_SKIP_DECIDED=1
+    local found
+    if ((SKIP_DATABASE)); then
+        DATABASE_SKIP_REASON="--skip-database"
+    elif found=$(database_server_found); then
+        SKIP_DATABASE=1
+        DATABASE_SKIP_REASON="$found"
+    else
+        return 0
+    fi
+    print_info "Database steps skipped (${DATABASE_SKIP_REASON}): no database server is installed, upgraded or reconfigured, and root's password is not reset; the panel uses the server on this box with the credentials in ${ROOT_MY_CNF}"
+    if [[ -n "$MARIADB_SERIES" ]]; then
+        echo -e "${YELLOW}WARNING:${NC} --mariadb-version=${MARIADB_SERIES} ignored: the database steps are skipped"
+    fi
+    return 0
+}
+
+# timeout(1) when there is one; the command as it is otherwise.
+run_bounded() {
+    local secs="$1"; shift
+    if command -v timeout >/dev/null 2>&1; then timeout -k 2 "$secs" "$@"; else "$@"; fi
+}
+
+# The value of key $3 in section [$2] of the INI file $1 (the last one
+# wins), surrounding blanks and quotes removed; empty when there is none.
+ini_value() {
+    local v
+    v=$(awk -v want="$2" -v key="$3" '
+        /^[[:space:]]*\[/ {
+            sec = $0
+            gsub(/^[[:space:]]*\[[[:space:]]*|[[:space:]]*\][[:space:]]*$/, "", sec)
+            insec = (tolower(sec) == want)
+            next
+        }
+        insec {
+            line = $0
+            sub(/^[[:space:]]+/, "", line)
+            i = index(line, "=")
+            if (i == 0) next
+            k = substr(line, 1, i - 1)
+            sub(/[[:space:]]+$/, "", k)
+            if (tolower(k) != key) next
+            val = substr(line, i + 1)
+            gsub(/^[[:space:]]+|[[:space:]]+$/, "", val)
+        }
+        END { print val }
+    ' "$1" 2>/dev/null) || return 0
+    while [[ "$v" == [\"\']* ]]; do v="${v:1}"; done
+    while [[ "$v" == *[\"\'] ]]; do v="${v:0:${#v}-1}"; done
+    printf '%s' "$v"
+}
+
+# With the database skipped, bolt-agent still needs the server's administrator
+# login: [dbservers.mariadb] user/password in agent.conf, which the MariaDB
+# step would otherwise have written. Taken from root's /root/.my.cnf
+# ([client], then [mysql]; user root when only a password is there), the way
+# bolt-migrate does it after the install, and written the same way (quoted),
+# so its later sync finds the same values. The file is rewritten in place:
+# the agent watches it and reloads it, as after the MariaDB step.
+agent_db_credentials_from_my_cnf() {
+    local user="" pass="" v cur_user cur_pass tmp
+    if [[ -r "$ROOT_MY_CNF" ]]; then
+        for v in client mysql; do
+            [[ -n "$(ini_value "$ROOT_MY_CNF" "$v" user)" ]] && user=$(ini_value "$ROOT_MY_CNF" "$v" user)
+            [[ -n "$(ini_value "$ROOT_MY_CNF" "$v" password)" ]] && pass=$(ini_value "$ROOT_MY_CNF" "$v" password)
+        done
+    fi
+    [[ -n "$pass" && -z "$user" ]] && user="root"
+    if [[ -z "$pass" ]]; then
+        echo -e "${YELLOW}WARNING:${NC} no database password in ${ROOT_MY_CNF}: set user= and password= of the database administrator in [dbservers.mariadb] of ${AGENT_CONF} (bolt-agent reloads it by itself)"
+        return 0
+    fi
+    if [[ "$user$pass" == *\"* ]]; then
+        echo -e "${YELLOW}WARNING:${NC} the database login in ${ROOT_MY_CNF} contains a double quote, which ${AGENT_CONF} cannot hold: set [dbservers.mariadb] user= and password= there by hand"
+        return 0
+    fi
+    if [[ ! -f "$AGENT_CONF" ]]; then
+        echo -e "${YELLOW}WARNING:${NC} ${AGENT_CONF} not found: bolt-agent cannot be pointed at the database server"
+        return 0
+    fi
+    cur_user=$(ini_value "$AGENT_CONF" dbservers.mariadb user)
+    cur_pass=$(ini_value "$AGENT_CONF" dbservers.mariadb password)
+    if [[ "$cur_user" == "$user" && "$cur_pass" == "$pass" ]]; then
+        print_success "bolt-agent already uses the database login from ${ROOT_MY_CNF}"
+        return 0
+    fi
+    if ! tmp=$(mktemp "${AGENT_CONF}.XXXXXX" 2>/dev/null); then
+        echo -e "${YELLOW}WARNING:${NC} could not update ${AGENT_CONF}: set [dbservers.mariadb] user= and password= there by hand"
+        return 0
+    fi
+    # Values through the environment: awk -v would turn backslashes into escapes.
+    if DB_USER="$user" DB_PASS="$pass" awk '
+        function keys() {
+            if (!have_user) print "user=\"" ENVIRON["DB_USER"] "\""
+            if (!have_pass) print "password=\"" ENVIRON["DB_PASS"] "\""
+        }
+        /^[[:space:]]*\[/ {
+            if (insec) keys()
+            sec = $0
+            gsub(/^[[:space:]]*\[[[:space:]]*|[[:space:]]*\][[:space:]]*$/, "", sec)
+            insec = (tolower(sec) == "dbservers.mariadb")
+            if (insec) { found = 1; have_user = 0; have_pass = 0 }
+            print
+            next
+        }
+        insec && /^[[:space:]]*[Uu][Ss][Ee][Rr][[:space:]]*=/ { print "user=\"" ENVIRON["DB_USER"] "\""; have_user = 1; next }
+        insec && /^[[:space:]]*[Pp][Aa][Ss][Ss][Ww][Oo][Rr][Dd][[:space:]]*=/ { print "password=\"" ENVIRON["DB_PASS"] "\""; have_pass = 1; next }
+        { print }
+        END {
+            if (insec) keys()
+            if (!found) {
+                print ""
+                print "[dbservers.mariadb]"
+                print "type=mysql"
+                print "host=localhost"
+                print "port=3306"
+                have_user = 0; have_pass = 0
+                keys()
+            }
+        }
+    ' "$AGENT_CONF" >"$tmp" && cat "$tmp" >"$AGENT_CONF"; then
+        rm -f "$tmp"
+        print_success "bolt-agent pointed at the database server on this box (login from ${ROOT_MY_CNF})"
+    else
+        rm -f "$tmp"
+        echo -e "${YELLOW}WARNING:${NC} could not update ${AGENT_CONF}: set [dbservers.mariadb] user= and password= there by hand"
+    fi
+    return 0
 }
 
 # ---------- Main ----------
 print_usage() {
-    echo "Usage: sudo $0 [--help] [--version=<PANEL_VERSION>] [--source=<stable|staging|testing>] [--email=<address>] [--mariadb-version=<10.11|11.4>] [--channel=<name>] [--no-telemetry]"
-    echo "AlmaLinux 9 / Rocky Linux 9. Stages: 1=ready check, 2=(2.1 settings, 2.2 prereq packages, 2.3 bolt packages), 3=post-install."
+    echo "Usage: sudo $0 [--help] [--version=<PANEL_VERSION>] [--agent-version=<version-release>] [--package=<bolt-name>=<version-release> ...] [--source=<stable|staging|testing>] [--email=<address>] [--mariadb-version=<10.11|11.4>] [--without=<mail,dns,ftp>] [--skip-database] [--skip-apache] [--channel=<name>] [--no-telemetry] [--ssh-key=<public key|https URL>]"
+    echo "AlmaLinux 9 / Rocky Linux 9 / CloudLinux 9. Stages: 1=ready check, 2=(2.1 settings, 2.2 prereq packages, 2.3 bolt packages), 3=post-install."
     echo "If --version is not provided, latest bolt-panel from repo is installed."
     echo "If --source is not provided, the bolt-repo RPM from adminbolt is used (default). Otherwise repos point at pulp content stable/staging/testing."
-    echo "If --mariadb-version is not provided, MariaDB 10.11 is installed; 11.4 is the newer long-term series (supported until 2029)."
+    echo "--agent-version installs exactly that bolt-agent build (e.g. 1.30.4-1.el9); --package=<bolt-name>=<version-release> does the same for another bolt-* package (repeatable, e.g. --package=bolt-php=8.4.14-1.el9). Both come from the repositories --source selects (PR builds: --source=testing); the install stops before any Bolt package is installed when a version is not there."
+    echo "--skip-database runs no database step (no MariaDB package, series, root password reset or my.cnf profile); the panel uses the MySQL/MariaDB server already on this server, with the administrator login from ${ROOT_MY_CNF} ([client] user= and password=) copied into [dbservers.mariadb] of ${AGENT_CONF}. The database steps are skipped by themselves when a database server answers (mysqladmin ping) or a server package is installed (MariaDB-server, mariadb-server, mysql-server, cl-MySQL*, cl-MariaDB*, ...)."
+    echo "--skip-apache runs no Apache step (manage-my-apache and its default profile); the web server is then the caller's to set up."
+    echo "If --mariadb-version is not provided, MariaDB ${DEFAULT_MARIADB_SERIES} is installed (long-term series, supported until 2029); --mariadb-version=10.11 installs the previous long-term series (supported until 2028). A server that already has a database server keeps it as it is (see --skip-database)."
     echo "If --email is provided, a 24h trial licence is requested for that address at the very end of the install (clicking the e-mailed confirmation link extends it to the full trial period); the install completes even if the request is refused."
     echo "Without --email the install proceeds unlicensed; activate on the panel's License page."
+    echo "--without leaves optional components out, for servers with little memory (comma-separated; everything is installed by default):"
+    local component
+    for component in $OPTIONAL_COMPONENTS; do
+        echo "  $(component_description "$component")"
+    done
+    echo "  The end of the install prints the skipped commands, which add a left-out component later."
     echo "--channel names what started the install (${REPORT_CHANNELS// /, }); default direct."
     echo "The installer reports its progress and result (no hostnames, e-mail addresses or passwords) to AdminBolt; --no-telemetry (or ADMINBOLT_NO_TELEMETRY=1) turns this off for the installer and the panel."
+    echo "If --ssh-key is provided (a public key, or an https:// URL serving keys), the key is added to root's authorized_keys; SSH password login for root is turned off at the end only after a root sign-in with that key is seen (at a terminal the installer waits up to 10 minutes for one), otherwise it stays on."
 }
 
 main() {
+    local AGENT_VERSION_GIVEN=0
     for arg in "$@"; do
         case "$arg" in
             -h|--help)
@@ -1503,6 +2664,32 @@ main() {
             --mariadb-version=*)
                 MARIADB_SERIES="${arg#--mariadb-version=}"
                 ;;
+            --without=*)
+                # Joined with a comma, so an empty occurrence stays visible and is refused.
+                ((WITHOUT_GIVEN)) && WITHOUT_ARG+=","
+                WITHOUT_ARG+="${arg#--without=}"
+                WITHOUT_GIVEN=1
+                ;;
+            --[Ww][Ii][Tt][Hh][Oo][Uu][Tt]*)
+                # "--without mail", "--without-mail" or "--Without=mail" would
+                # otherwise install everything without a word: the value goes
+                # in the same argument, after "--without=".
+                ((WITHOUT_GIVEN)) && WITHOUT_ARG+=","
+                WITHOUT_GIVEN=1
+                ;;
+            --skip-database)
+                SKIP_DATABASE=1
+                ;;
+            --skip-apache)
+                SKIP_APACHE=1
+                ;;
+            --agent-version=*)
+                AGENT_VERSION="${arg#--agent-version=}"
+                AGENT_VERSION_GIVEN=1
+                ;;
+            --package=*)
+                PINNED_PACKAGES+="${arg#--package=}"$'\n'
+                ;;
             --channel=*)
                 REPORT_CHANNEL_ARG="${arg#--channel=}"
                 REPORT_CHANNEL_GIVEN=1
@@ -1513,6 +2700,14 @@ main() {
                 ;;
             --no-telemetry)
                 REPORT_NO_TELEMETRY=1
+                ;;
+            --ssh-key=*)
+                SSH_KEY_ARG="${arg#--ssh-key=}"
+                if [[ -z "$SSH_KEY_ARG" ]]; then
+                    print_error "--ssh-key= needs a public key or an https:// URL"
+                    print_usage
+                    exit 1
+                fi
                 ;;
         esac
     done
@@ -1526,17 +2721,16 @@ main() {
     # reported as direct. The value is shown cut to 40 characters, with
     # anything unprintable as "?", and printed with %s, never interpreted.
     if ((REPORT_CHANNEL_GIVEN)) && ! _report_in_list "$REPORT_CHANNEL_ARG" "$REPORT_CHANNELS"; then
-        local shown="${REPORT_CHANNEL_ARG:0:40}"
-        shown="${shown//[^[:print:]]/?}"
         printf '%bWARNING:%b unknown --channel=%s, reporting this install as direct (known: %s)\n' \
-            "$YELLOW" "$NC" "$shown" "${REPORT_CHANNELS// /, }"
+            "$YELLOW" "$NC" "$(shown_arg "$REPORT_CHANNEL_ARG")" "${REPORT_CHANNELS// /, }"
     fi
 
     if [[ -n "$MARIADB_SERIES" ]]; then
         case "$MARIADB_SERIES" in
             10.11|11.4) ;;
             *)
-                print_error "Invalid --mariadb-version=${MARIADB_SERIES} (supported: 10.11, 11.4)"
+                printf '%bERROR:%b Invalid --mariadb-version=%s (supported: 10.11, 11.4)\n' \
+                    "$RED" "$NC" "$(shown_arg "$MARIADB_SERIES")" >&2
                 print_usage
                 report_fail parse_arguments invalid_argument
                 exit 1
@@ -1544,14 +2738,32 @@ main() {
         esac
     fi
 
-    # Before the @: letters, digits and the other characters RFC 5322 allows
-    # in an address (! # $ % & ' * + / = ? ^ _ ` { | } ~ . -); after it: a
-    # domain of letters, digits, hyphens and dots. No spaces, no control
-    # characters. Some of these mean something to a shell, so the address is
-    # only ever passed on quoted (request_trial_licence).
-    local email_re="^[A-Za-z0-9!#\$%&'*+/=?^_\`{|}~.-]+@[A-Za-z0-9-]+(\.[A-Za-z0-9-]+)+\$"
+    if ((WITHOUT_GIVEN)) && ! set_left_out_components "$WITHOUT_ARG"; then
+        local shown="${WITHOUT_ARG:0:40}"
+        shown="${shown//[^[:print:]]/?}"
+        printf '%bERROR:%b Invalid --without=%s (give --without=<list>, comma-separated, of: %s)\n' "$RED" "$NC" "$shown" "${OPTIONAL_COMPONENTS// /, }" >&2
+        print_usage
+        report_fail parse_arguments invalid_argument
+        exit 1
+    fi
+
+    # Before the @: letters, digits and most other characters RFC 5322 allows
+    # in an address (! # % & ' * + / = ? ^ _ { | } ~ . -); after it: a domain
+    # of letters, digits, hyphens and dots. Refused before anything is
+    # installed (AB-2211): $ and ` (valid by the RFC, but no real address
+    # needs them), quotes, ;, any whitespace and control characters. The
+    # address still only ever reaches bolt-cli as one argument.
+    local email_re="^[A-Za-z0-9!#%&'*+/=?^_{|}~.-]+@[A-Za-z0-9-]+(\.[A-Za-z0-9-]+)+\$"
     if [[ -n "$ADMIN_EMAIL" && ! "$ADMIN_EMAIL" =~ $email_re ]]; then
-        print_error "Invalid --email=${ADMIN_EMAIL}"
+        printf '%bERROR:%b Invalid --email=%s (expected name@domain.tld; no spaces, ", $, `, ; or control characters)\n' \
+            "$RED" "$NC" "$(shown_arg "$ADMIN_EMAIL")" >&2
+        print_usage
+        report_fail parse_arguments invalid_argument
+        exit 1
+    fi
+
+    # AB-2331 addendum: pinned versions, checked before anything is installed.
+    if ! pinned_versions_valid; then
         print_usage
         report_fail parse_arguments invalid_argument
         exit 1
@@ -1561,7 +2773,8 @@ main() {
         case "$BOLT_SOURCE" in
             stable|staging|testing) ;;
             *)
-                print_error "Invalid --source=${BOLT_SOURCE} (allowed: stable, staging, testing)"
+                printf '%bERROR:%b Invalid --source=%s (allowed: stable, staging, testing)\n' \
+                    "$RED" "$NC" "$(shown_arg "$BOLT_SOURCE")" >&2
                 print_usage
                 report_fail parse_arguments invalid_argument
                 exit 1
@@ -1577,7 +2790,7 @@ main() {
     # in the middle of a later stage of this whole panel-plus-agent install -
     # Stage 3 included - and break it. Always removed on exit, success or
     # failure, so a box never gets stuck with a marker nothing will ever
-    # clear. Lives under /var/lib/adminbolt (POST_INSTALL_DB_PATH's own
+    # clear. Lives under /var/lib/adminbolt (the panel's own data
     # directory) since it marks this install.sh run as a whole, not
     # anything specific to the agent package. The EXIT trap set by
     # report_init removes it (only once this run has created it).
@@ -1610,8 +2823,8 @@ main() {
 }
 
 # ADMINBOLT_INSTALL_SOURCE_ONLY=1 loads the functions without running the
-# install (tests/telemetry_test.sh). An environment switch rather than a
-# BASH_SOURCE check, which cannot tell `curl ... | bash` apart reliably.
+# install (tests/). An environment switch rather than a BASH_SOURCE check,
+# which cannot tell `curl ... | bash` apart reliably.
 if [[ "${ADMINBOLT_INSTALL_SOURCE_ONLY:-}" != 1 ]]; then
     main "$@"
 fi
