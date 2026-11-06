@@ -48,6 +48,7 @@ sudo ./install.sh --mariadb-version=10.11
 | `sudo ./install.sh` | Install latest bolt-panel from repo |
 | `sudo ./install.sh --source=<stable\|staging\|testing>` | Install from a specific repository source |
 | `sudo ./install.sh --mariadb-version=<10.11\|11.4>` | MariaDB series to install: `11.4` (default, supported until 2029-05) or `10.11` (supported until 2028-02). A server that already has a database server keeps it as it is (see below) |
+| `sudo ./install.sh --without=<mail,dns,ftp>` | Leave optional components out, for servers with little memory (see [Optional components](#optional-components)) |
 | `sudo ./install.sh --skip-database` | Run no database step: no MariaDB package, series, root password reset or MariaDB profile. The panel uses the database server already on this server (see below) |
 | `sudo ./install.sh --skip-apache` | Run no Apache step (`manage-my-apache` and the default Apache profile); the web server is then set up by whoever runs the installer |
 | `sudo ./install.sh --agent-version=<version-release>` | Install exactly this bolt-agent build (for example `1.30.4-1.el9`) instead of the latest |
@@ -107,6 +108,32 @@ The installer stops with an error when the bolt-agent package's setup did not fi
 A damaged `/etc/bolt-agent/agent.conf` that the agent's setup cannot repair is moved to `/var/lib/adminbolt/agent-conf-backup/<date>/` with a `MANIFEST` file, and a new one is written.
 
 If you know the agent's setup failed but the installer says "bolt-agent already installed", run `mkdir -p /var/lib/adminbolt && touch /var/lib/adminbolt/agent-post-failed` and run the installer again. Reinstalling the agent by hand (`dnf reinstall bolt-agent`) does not update the address the panel has saved; run `bolt-cli connect-bolt-agent-with-panel` after it.
+
+## Optional components
+
+Everything is installed by default. On a server with little memory, `--without=` leaves whole components out (comma-separated, or the option given more than once):
+
+| Component | Left out | What stops working |
+|-----------|----------|--------------------|
+| `mail` | Postfix, Dovecot, Rspamd, MLMMJ, Roundcube webmail, the system e-mail account and their profiles | Mailboxes, webmail, mailing lists, and the panel's own e-mail (alerts, password resets), which goes through the server's mail service. The spam filter is part of mail: Postfix refuses mail on its submission ports while Rspamd is missing, so it cannot be left out alone. |
+| `dns` | PowerDNS | The server answers no DNS queries; domains need their DNS hosted elsewhere. The DNS record template is still set up, for when PowerDNS is installed later. |
+| `ftp` | vsftpd and its profile | FTP accounts. Files can still be managed in the panel's file manager. |
+
+```bash
+sudo ./install.sh --without=mail,dns,ftp
+```
+
+Anything else in the value stops the install before it changes anything. The skipped steps are listed as skipped, the end of the install lists what was left out, and the choice is kept in `/etc/bolt/bolt-config.ini` as `BOLT_INSTALL_WITHOUT` (empty when nothing was left out). It records what was asked for, not what is installed: run again with `--without=mail` on a server that already has mail, the key says mail although Postfix and Dovecot stay. The install report does not count a left-out step as failed.
+
+The panel shows every left-out service as not installed on Health > Services. Install there sets up the package only, not the profiles that make it serve, so a component is added later with the commands the installer skipped, as root, in this order (the end of the install prints them):
+
+- `mail`: `bolt-cli manage-postfix --action=install`, `bolt-cli manage-dovecot --action=install`, `bolt-cli manage-rspamd --action=install`, `bolt-cli manage-mlmmj --action=install`, `bolt-php /usr/local/bolt/web/artisan bolt:manage-app --action=install --app-name=roundcube`, `bolt-cli manage-postfix-profiles --action=install`, `bolt-cli manage-dovecot-profiles --action=install`, `bolt-cli manage-rspamd-profiles --action=install`, `bolt-cli manage-system-email-account --action=install`, `systemctl restart rspamd`
+- `dns`: `bolt-cli manage-powerdns --action=install`
+- `ftp`: `bolt-cli manage-vsftpd --action=install`, `bolt-cli manage-vsftpd-profiles --action=install`
+
+The panel reads `BOLT_INSTALL_WITHOUT` together with what is installed now, so a component counts as left out only until it is installed: Health raises no warning for its services and lists them on Health > Services, in grey, as not installed by choice; the client screens and Client API routes of the component (and its entries on the Feature List) are withheld, and the API answers `This feature is not installed on this server`; creating a mailbox or an FTP account is refused before anything is stored; new domains get no mail records (MX, SPF, DMARC, DKIM, mail service records, `mail`, `webmail`, `autoconfig`, `autodiscover`) while mail is left out, and no `ftp` name while FTP is. Once the commands above have run, all of it comes back on its own; the key needs no editing. Domains created in the meantime get their mail records when the DNS template is applied again in the panel. A hostname change still ends with a warning for the mail steps, and the firewall still opens the mail, DNS and FTP ports, with nothing listening on them.
+
+PHP 8.4, Apache, MariaDB, Redis, nftables and SSH are always installed: the panel and the hosting accounts need them. So is Fail2Ban, which protects SSH and the panel login. Antivirus (ImunifyAV, Imunify360, cPGuard) is never installed by the installer; it is a module added in the panel. Backup and the AI agent are not optional either, because leaving them out would save no memory: restic and rclone are two programs that run only while a backup runs, and the AI agent is part of the panel itself, with no service of its own on the server.
 
 ## Install report
 
