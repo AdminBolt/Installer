@@ -13,6 +13,7 @@
 #   sudo ./install.sh --version=1.0.0.beta3-v46.el9 # install specific bolt-panel version from repo
 #   sudo ./install.sh --source=staging         # use staging pulp repos (stable|staging|testing); default unchanged
 #   sudo ./install.sh --email=user@example.com # activate a 24h trial license for this e-mail (confirmation link extends it to 30 days)
+#   sudo ./install.sh --admin-username=random  # first administrator: admin-<6 random characters> instead of "admin" (or a name of your choice)
 #   sudo ./install.sh --mariadb-version=10.11  # MariaDB 10.11 instead of the default 11.4 (10.11 or 11.4)
 #   sudo ./install.sh --without=mail,dns,ftp   # leave optional components out (small servers); the end of the install says how to add them later
 #   sudo ./install.sh --skip-database          # keep the database server already on the box (no MariaDB steps)
@@ -37,6 +38,10 @@ BOLT_SOURCE=""
 ADMIN_EMAIL=""
 # --mariadb-version=; empty = the default below on a new box (see stage_configuration).
 MARIADB_SERIES=""
+# AB-2104: name of the first panel administrator; empty = "admin". "random" = admin-<6 random characters>.
+# ADMIN_USERNAME_GIVEN: the option was given, so an empty value is refused.
+ADMIN_USERNAME=""
+ADMIN_USERNAME_GIVEN=0
 # AB-2228: the MariaDB series of a new install (10.11 until then).
 readonly DEFAULT_MARIADB_SERIES="11.4"
 # AB-2331: --skip-database / --skip-apache. A database server already on the
@@ -2270,12 +2275,48 @@ stage_configuration() {
     fi
     # AB-2106: last, after every step that configures sshd, so they cannot undo it and a failed install keeps password login.
     ssh_password_login_off || true
-    local SSO_URL
-    SSO_URL=$(bolt-cli admin-sso-generate 2>/dev/null || echo "")
-    if [ -z "${SSO_URL}" ]; then
-        echo -e "${YELLOW}WARNING:${NC} SSO URL not generated"
-    else
+    # AB-2104: the SSO link creates the first administrator, under the
+    # --admin-username= name when one was given.
+    local SSO_ARGS=()
+    [[ -n "$ADMIN_USERNAME" ]] && SSO_ARGS+=("--first-admin=${ADMIN_USERNAME}")
+    local SSO_URL=""
+    local SSO_OUT=""
+    local SSO_RETRY="bolt-cli admin-sso-generate"
+    local SSO_ERR_FILE
+    SSO_ERR_FILE=$(mktemp)
+    if SSO_OUT=$(bolt-cli admin-sso-generate "${SSO_ARGS[@]}" 2>"$SSO_ERR_FILE"); then
+        SSO_URL="${SSO_OUT}"
         print_success "SSO URL generated"
+    elif [[ -n "$ADMIN_USERNAME" ]] && { grep -qi 'option does not exist' "$SSO_ERR_FILE" || grep -qi 'option does not exist' <<<"$SSO_OUT"; }; then
+        # A panel that predates --first-admin: nothing was created, so fall back to the default name, loudly.
+        echo -e "${YELLOW}WARNING:${NC} the installed panel does not support --admin-username yet; the first administrator is named admin"
+        ADMIN_USERNAME=""
+        if SSO_OUT=$(bolt-cli admin-sso-generate 2>/dev/null); then
+            SSO_URL="${SSO_OUT}"
+            print_success "SSO URL generated"
+        else
+            echo -e "${YELLOW}WARNING:${NC} SSO URL not generated${SSO_OUT:+: ${SSO_OUT}}"
+        fi
+    else
+        echo -e "${YELLOW}WARNING:${NC} SSO URL not generated${SSO_OUT:+: ${SSO_OUT}}"
+        # The reason above says whether the panel refused the name; a refused name needs another one on retry.
+        [[ -n "$ADMIN_USERNAME" ]] && SSO_RETRY+=" --first-admin=<name|random>"
+    fi
+    rm -f "$SSO_ERR_FILE"
+    # The name to sign in with later: the one the panel reports for the link
+    # ("Logs in as administrator: <name>"), else the one asked for, else
+    # admin. Without a link the asked-for name may have been refused, so the
+    # retry command below names it.
+    local ADMIN_LOGIN_NAME=""
+    [[ -n "$SSO_URL" ]] && ADMIN_LOGIN_NAME=$(sed -n 's/^Logs in as administrator: //p' <<<"$SSO_OUT" | head -n 1)
+    if [[ -z "$ADMIN_LOGIN_NAME" ]]; then
+        if [[ -z "$ADMIN_USERNAME" ]]; then
+            ADMIN_LOGIN_NAME="admin"
+        elif [[ -n "$SSO_URL" && "$ADMIN_USERNAME" != random ]]; then
+            ADMIN_LOGIN_NAME="$ADMIN_USERNAME"
+        else
+            ADMIN_LOGIN_NAME="the one the panel shows when the sign-in link is generated"
+        fi
     fi
     [ -n "${SSH_PASSWORD_NOTE}" ] && echo -e "\n${SSH_PASSWORD_NOTE}"
     echo -e "\n${BOLD}${GREEN}+----------------------------------------------------------+${NC}"
@@ -2288,11 +2329,11 @@ stage_configuration() {
     # guesses (root, the hosting username, an e-mail) each counted towards a
     # Fail2Ban ban. The link above signs in once; this is for every time after.
     echo -e "${BOLD}${CYAN}--- Signing in later ---${NC}"
-    echo -e "${GREEN}Admin username:${NC} ${BOLD}admin${NC} (or the e-mail you enter in the setup wizard)"
+    echo -e "${GREEN}Admin username:${NC} ${BOLD}${ADMIN_LOGIN_NAME}${NC} (or the e-mail you enter in the setup wizard)"
     echo -e "${GREEN}Password:${NC} the one you set in the setup wizard that opens with the link above"
     echo -e "${GREEN}Until the setup wizard is finished, root can also sign in with this server's root password; the wizard offers to turn that off.${NC}\n"
     echo -e "${BOLD}${CYAN}--- If you get locked out ---${NC}"
-    echo -e "${GREEN}New one-time sign-in link:${NC} ${BOLD}bolt-cli admin-sso-generate${NC}"
+    echo -e "${GREEN}New one-time sign-in link:${NC} ${BOLD}${SSO_RETRY}${NC}"
     echo -e "${GREEN}Reset the admin password:${NC}  ${BOLD}bolt-cli reset-admin-account-password${NC}"
     echo -e "${GREEN}Lift a Fail2Ban ban:${NC}       ${BOLD}bolt-cli fail2ban-unban <your-ip> --whitelist${NC}"
     print_progress "100% — post-install"
@@ -2623,7 +2664,7 @@ agent_db_credentials_from_my_cnf() {
 
 # ---------- Main ----------
 print_usage() {
-    echo "Usage: sudo $0 [--help] [--version=<PANEL_VERSION>] [--agent-version=<version-release>] [--package=<bolt-name>=<version-release> ...] [--source=<stable|staging|testing>] [--email=<address>] [--mariadb-version=<10.11|11.4>] [--without=<mail,dns,ftp>] [--skip-database] [--skip-apache] [--channel=<name>] [--no-telemetry] [--ssh-key=<public key|https URL>]"
+    echo "Usage: sudo $0 [--help] [--version=<PANEL_VERSION>] [--agent-version=<version-release>] [--package=<bolt-name>=<version-release> ...] [--source=<stable|staging|testing>] [--email=<address>] [--mariadb-version=<10.11|11.4>] [--without=<mail,dns,ftp>] [--skip-database] [--skip-apache] [--channel=<name>] [--no-telemetry] [--ssh-key=<public key|https URL>] [--admin-username=<name|random>]"
     echo "AlmaLinux 9 / Rocky Linux 9 / CloudLinux 9. Stages: 1=ready check, 2=(2.1 settings, 2.2 prereq packages, 2.3 bolt packages), 3=post-install."
     echo "If --version is not provided, latest bolt-panel from repo is installed."
     echo "If --source is not provided, the bolt-repo RPM from adminbolt is used (default). Otherwise repos point at pulp content stable/staging/testing."
@@ -2641,6 +2682,7 @@ print_usage() {
     echo "  The end of the install prints the skipped commands, which add a left-out component later."
     echo "--channel names what started the install (${REPORT_CHANNELS// /, }); default direct."
     echo "The installer reports its progress and result (no hostnames, e-mail addresses or passwords) to AdminBolt; --no-telemetry (or ADMINBOLT_NO_TELEMETRY=1) turns this off for the installer and the panel."
+    echo "If --admin-username is not provided, the first panel administrator is named admin. --admin-username=random names it admin- plus 6 random characters; any other value is used as the name (3-32 characters: lowercase letters, numbers, dots, dashes or underscores, starting with a letter; not a reserved system name, a hosting account or an existing Linux user). The setup wizard can still rename it."
     echo "If --ssh-key is provided (a public key, or an https:// URL serving keys), the key is added to root's authorized_keys; SSH password login for root is turned off at the end only after a root sign-in with that key is seen (at a terminal the installer waits up to 10 minutes for one), otherwise it stays on."
 }
 
@@ -2701,6 +2743,16 @@ main() {
             --no-telemetry)
                 REPORT_NO_TELEMETRY=1
                 ;;
+            --admin-username=*)
+                ADMIN_USERNAME="${arg#--admin-username=}"
+                ADMIN_USERNAME_GIVEN=1
+                ;;
+            --admin-username)
+                # "--admin-username bob" would otherwise name the account admin
+                # without a word: the value goes after "--admin-username=".
+                ADMIN_USERNAME=""
+                ADMIN_USERNAME_GIVEN=1
+                ;;
             --ssh-key=*)
                 SSH_KEY_ARG="${arg#--ssh-key=}"
                 if [[ -z "$SSH_KEY_ARG" ]]; then
@@ -2757,6 +2809,17 @@ main() {
     if [[ -n "$ADMIN_EMAIL" && ! "$ADMIN_EMAIL" =~ $email_re ]]; then
         printf '%bERROR:%b Invalid --email=%s (expected name@domain.tld; no spaces, ", $, `, ; or control characters)\n' \
             "$RED" "$NC" "$(shown_arg "$ADMIN_EMAIL")" >&2
+        print_usage
+        report_fail parse_arguments invalid_argument
+        exit 1
+    fi
+
+    # AB-2104: format only, the panel's own rule for an administrator name;
+    # the panel checks the rest (root, reserved names, hosting accounts,
+    # Linux users) when it creates the account.
+    if ((ADMIN_USERNAME_GIVEN)) && [[ "$ADMIN_USERNAME" != "random" && ! "$ADMIN_USERNAME" =~ ^[a-z][a-z0-9._-]{2,31}$ ]]; then
+        printf '%bERROR:%b Invalid --admin-username=%s (3-32 characters: lowercase letters, numbers, dots, dashes or underscores, starting with a letter; or random)\n' \
+            "$RED" "$NC" "$(shown_arg "$ADMIN_USERNAME")" >&2
         print_usage
         report_fail parse_arguments invalid_argument
         exit 1
