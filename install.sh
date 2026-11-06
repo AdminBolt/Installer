@@ -2249,6 +2249,11 @@ stage_configuration() {
     # QA F2: a bare restart under set -e aborted the whole run (no trial
     # licence, no SSO URL, no banner) whenever rspamd was not installed.
     run_or_warn "systemctl restart rspamd" "Rspamd restart" rspamd_restart
+    # AB-2069: the page the web server shows on port 80 for the server IP (and
+    # for domains with no site yet). Written by the panel through bolt-agent, so
+    # it carries the brand and the panel port; never fatal. No step id: the
+    # install report takes only the step ids its receiver knows.
+    run_or_warn "bolt-cli publish-default-site-page" "Default site page"
     # Before the trial licence and the SSH password change: a failed install
     # keeps password login and does not use up the trial request.
     check_agent_setup_at_end
@@ -2279,7 +2284,17 @@ stage_configuration() {
     [ -n "${ADMIN_EMAIL}" ] && [ "${TRIAL_LICENCE_OK}" -eq 0 ] && echo -e "${YELLOW}NOTE:${NC} Trial licence not issued (request refused or licence server unreachable). The installation itself succeeded and the panel is usable; activate a licence on its License page.\n"
     print_left_out_components
     [ -n "${SSO_URL:-}" ] && echo -e "${BOLD}${CYAN}--- Access ---${NC}\n${GREEN}Admin Panel:${NC}\n${BOLD}${SSO_URL}${NC}\n"
-    echo -e "${GREEN}New SSO URL:${NC}\n${BOLD}bolt-cli admin-sso-generate${NC}"
+    # AB-2069: nothing here used to say which login the panel takes, and the
+    # guesses (root, the hosting username, an e-mail) each counted towards a
+    # Fail2Ban ban. The link above signs in once; this is for every time after.
+    echo -e "${BOLD}${CYAN}--- Signing in later ---${NC}"
+    echo -e "${GREEN}Admin username:${NC} ${BOLD}admin${NC} (or the e-mail you enter in the setup wizard)"
+    echo -e "${GREEN}Password:${NC} the one you set in the setup wizard that opens with the link above"
+    echo -e "${GREEN}Until the setup wizard is finished, root can also sign in with this server's root password; the wizard offers to turn that off.${NC}\n"
+    echo -e "${BOLD}${CYAN}--- If you get locked out ---${NC}"
+    echo -e "${GREEN}New one-time sign-in link:${NC} ${BOLD}bolt-cli admin-sso-generate${NC}"
+    echo -e "${GREEN}Reset the admin password:${NC}  ${BOLD}bolt-cli reset-admin-account-password${NC}"
+    echo -e "${GREEN}Lift a Fail2Ban ban:${NC}       ${BOLD}bolt-cli fail2ban-unban <your-ip> --whitelist${NC}"
     print_progress "100% — post-install"
     print_success "Stage 3 completed: all post-install actions done"
 }
