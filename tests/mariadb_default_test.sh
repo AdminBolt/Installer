@@ -31,16 +31,24 @@ nok() { FAIL=$((FAIL + 1)); echo "not ok - $1${2:+  [$2]}"; }
 eq() { if [[ "$2" == "$3" ]]; then ok "$1"; else nok "$1" "expected '$2', got '$3'"; fi; }
 has() { if grep -qF -- "$2" <<<"$3"; then ok "$1"; else nok "$1" "'$2' not in output"; fi; }
 
-# Fakes: rpm answers "installed" for the packages listed in $FAKE_DIR/rpm,
-# bolt-cli records its arguments, one call per line.
+# Fakes: rpm answers "installed" for the packages listed in $FAKE_DIR/rpm
+# (rpm -qa <glob> lists the matching ones, like rpm), bolt-cli records its
+# arguments, one call per line, and no database server answers a ping.
 mkdir -p "$T/bin"
 cat >"$T/bin/rpm" <<'EOF'
 #!/usr/bin/env bash
 pkg="${*: -1}"
+if [[ "$1" == -qa ]]; then
+    while read -r p; do [[ -n "$p" && "$p" == $pkg ]] && echo "$p-8.0.46-1.el9.x86_64"; done <"$FAKE_DIR/rpm"
+    exit 0
+fi
 grep -qxF -- "$pkg" "$FAKE_DIR/rpm" 2>/dev/null && { echo "$pkg-10.11.19-1.el9.x86_64"; exit 0; }
 echo "package $pkg is not installed"
 exit 1
 EOF
+printf '#!/usr/bin/env bash\nexit 1\n' >"$T/bin/mysqladmin"
+cp "$T/bin/mysqladmin" "$T/bin/mariadb-admin"
+chmod +x "$T/bin/mysqladmin" "$T/bin/mariadb-admin"
 cat >"$T/bin/bolt-cli" <<'EOF'
 #!/usr/bin/env bash
 echo "$*" >>"$FAKE_DIR/bolt-cli.log"
@@ -63,7 +71,9 @@ mariadb_calls() {
         report_step_result() { :; }
         report_fail() { :; }
         print_progress() { :; }
+        check_agent_setup_at_end() { :; }
         MARIADB_SERIES="$series"
+        ROOT_MY_CNF="$dir/my.cnf" AGENT_CONF="$dir/agent.conf"
         stage_configuration >"$dir/out" 2>&1
     )
     grep '^manage-mariadb ' "$dir/bolt-cli.log" 2>/dev/null
@@ -73,12 +83,13 @@ eq "a new box without --mariadb-version is asked for 11.4" \
     "manage-mariadb --action=install --series=11.4" "$(mariadb_calls "")"
 eq "--mariadb-version=10.11 still asks for 10.11" \
     "manage-mariadb --action=install --series=10.11" "$(mariadb_calls "10.11")"
-eq "a box that already runs MariaDB is asked for no series (the panel keeps it)" \
-    "manage-mariadb --action=install" "$(mariadb_calls "" MariaDB-server)"
+# AB-2331: a database server already on the box is never reinstalled.
+eq "a box that already runs MariaDB gets no MariaDB step" \
+    "" "$(mariadb_calls "" MariaDB-server)"
 eq "the distribution package counts as installed MariaDB as well" \
-    "manage-mariadb --action=install" "$(mariadb_calls "" mariadb-server)"
-eq "--mariadb-version on a box that runs MariaDB is passed on as given" \
-    "manage-mariadb --action=install --series=11.4" "$(mariadb_calls "11.4" MariaDB-server)"
+    "" "$(mariadb_calls "" mariadb-server)"
+eq "--mariadb-version on a box that runs MariaDB does not touch it" \
+    "" "$(mariadb_calls "11.4" MariaDB-server)"
 
 help=$( { cat "$INSTALL_SH"; } | PATH="$T/bin:$PATH" "$BASH" -s -- --help 2>&1)
 has "--help names 11.4 as the default" "If --mariadb-version is not provided, MariaDB 11.4 is installed" "$help"
