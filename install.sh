@@ -1104,25 +1104,38 @@ check_port_8443() {
     exit 1
 }
 
-# SELinux turned off on the kernel command line (selinux=0) while
-# /etc/selinux/config still says enforcing or permissive leaves the policy
-# tooling without a store: every package step that manages SELinux policy
-# (Postfix, Dovecot, Rspamd) aborts with "SELinux policy is not managed or
-# store cannot be accessed", and the install used to go on without them
-# (AB-1379). Refuse to start instead. The paths are overridable for tests.
+# SELinux policy tooling without a policy store (AB-1379). With SELINUX=
+# enforcing or permissive in /etc/selinux/config, every package step that
+# manages SELinux policy runs semanage, which aborts with "SELinux policy is
+# not managed or store cannot be accessed" when the store of the configured
+# policy is missing - and the install used to go on without Postfix, Dovecot
+# and Rspamd. Whether the store can be used is asked of semanage itself, not
+# guessed from the kernel command line: selinux=0 with SELINUX=enforcing
+# installs fine on a stock image, whose store is there (QA finding 1).
+# Without semanage (a minimal image; it arrives with the packages) the
+# store directory of the configured policy type is looked for instead.
+# SELINUX=disabled, or no config at all, needs nothing. Paths overridable
+# for tests.
 check_selinux_state() {
-    local cmdline="${SELINUX_CMDLINE_FILE:-/proc/cmdline}" config="${SELINUX_CONFIG_FILE:-/etc/selinux/config}" mode
-    grep -qw 'selinux=0' "$cmdline" 2>/dev/null || return 0
-    mode=$(sed -n 's/^SELINUX=//p' "$config" 2>/dev/null | tail -n 1)
+    local config="${SELINUX_CONFIG_FILE:-/etc/selinux/config}" mode type out
+    mode=$(sed -n 's/^[[:space:]]*SELINUX[[:space:]]*=[[:space:]]*//p' "$config" 2>/dev/null | tail -n 1 | tr -d '[:space:]"')
     case "$mode" in
-        enforcing|permissive)
-            print_error "SELinux is disabled on the kernel command line (selinux=0) but ${config} sets SELINUX=${mode}."
-            echo "Package steps that manage SELinux policy fail in this state, so Postfix, Dovecot and Rspamd would not install."
-            echo "Set SELINUX=disabled in ${config} (this installer disables SELinux anyway), then run the installer again."
-            exit 1
-            ;;
+        enforcing|permissive) ;;
+        *) return 0 ;;
     esac
-    return 0
+    type=$(sed -n 's/^[[:space:]]*SELINUXTYPE[[:space:]]*=[[:space:]]*//p' "$config" 2>/dev/null | tail -n 1 | tr -d '[:space:]"')
+    type="${type:-targeted}"
+    if command -v semanage >/dev/null 2>&1; then
+        out=$(semanage login -l 2>&1) && return 0
+        # Any other semanage failure is not this problem; the package steps report it.
+        grep -qi 'not managed or store cannot be accessed' <<<"$out" || return 0
+    elif [ -d "${SELINUX_STORE_ROOT:-/var/lib/selinux}/${type}/active" ]; then
+        return 0
+    fi
+    print_error "${config} sets SELINUX=${mode}, but the SELinux policy store (${type}) cannot be used."
+    echo "Package steps that manage SELinux policy fail in this state, so Postfix, Dovecot and Rspamd would not install."
+    echo "Install the policy (dnf install selinux-policy-${type}), or set SELINUX=disabled in ${config} (this installer disables SELinux anyway), then run the installer again."
+    exit 1
 }
 
 # ---------- Stage 1: Check ready for installation ----------
