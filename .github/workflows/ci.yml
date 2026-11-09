@@ -41,6 +41,8 @@ jobs:
         run: bash tests/agent_post_rerun_test.sh
       - name: Invalid argument values (AB-2282)
         run: bash tests/invalid_arg_test.sh
+      - name: End of the install, SELinux store, deferred PHP (AB-1379, AB-472)
+        run: bash tests/install_outcome_test.sh
       - name: SSH key and password login (AB-2106)
         # Root in a throwaway container with sshd's config, as its header asks.
         run: |

@@ -94,6 +94,18 @@ At the end of the install, SSH password login for root is turned off only when a
 Otherwise password login stays on and the installer prints the reason and the command to turn it off later.
 Password login for root is turned off by `/etc/ssh/sshd_config.d/00-adminbolt-ssh-key-only.conf`; remove that file and run `systemctl reload sshd` to allow it again.
 
+### How the install ends
+
+The end of the install lists every step that failed, with the line of its output that says why, and the exit status follows it:
+
+- MariaDB, Postfix, Dovecot or PHP 8.4 failed (critical components): `Installation Incomplete`, exit status 1.
+- Only other steps failed: `Installation Completed With Warnings`, exit status 0.
+- The install stopped early (a Stage 2 package, bolt-agent, bolt-panel, connecting the agent to the panel): the step that stopped it and the steps that failed before it, then `Installation stopped early`.
+
+Stage 1 checks that the external package repositories answer (Remi for PHP, EPEL, MariaDB) and says which do not; that never stops the install. PHP 8.4 comes from Remi: while Remi cannot be reached it is listed as `DEFERRED`, not failed, and the install ends with exit status 0. The panel installs it (and its default profile) on its own as soon as Remi answers again: its dashboard shows PHP 8.4 waiting for the Remi repository, tries again every few minutes and offers `Try now`.
+
+Stage 1 also refuses to start when `/etc/selinux/config` sets `SELINUX=enforcing` or `permissive` and `semanage` cannot use the SELinux policy store: the Postfix, Dovecot and Rspamd steps would fail. Install the policy (`dnf install selinux-policy-targeted`) or set `SELINUX=disabled`.
+
 ## Install flow
 
 The installer runs in 3 stages:

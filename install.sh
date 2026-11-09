@@ -99,6 +99,15 @@ SUMMARY_PRINTED=0
 # The step that stopped the install, "<step>: <reason>" (run_or_fail,
 # install_packages); listed first in that summary.
 STOPPED_STEP=""
+# AB-472: steps that wait for an external package repository the server
+# cannot reach. The install does not fail on them: the panel installs them
+# on its own once the repository answers (post-install setup on the
+# dashboard). "<step>: <what it waits for>".
+DEFERRED_STEPS=()
+# Outcome of the last run_or_warn: ok, failed or deferred.
+LAST_STEP_RESULT=""
+# External repositories that did not answer the Stage 1 probe, by name.
+UNREACHABLE_REPOSITORIES=()
 readonly WEB_INSTALL_ROOT="/usr/local/bolt/web"
 
 # Colors
@@ -1085,6 +1094,17 @@ report_step_result() { _report_step_result "$@" 2>/dev/null || true; }
 # report_fail [step] [reason]: the step failed (default: the current one).
 report_fail() { _report_step_result "${1:-$REPORT_STEP}" failed "${2:-}" 2>/dev/null || true; }
 report_trial_licence() { REPORT_TRIAL="$1"; }
+# AB-472: a step that waits for an external repository is reported like a
+# failed optional step (the result becomes succeeded_with_warnings), never as
+# the failure of a required one.
+report_step_deferred() {
+    {
+        [[ "$REPORT_STEP" == "$1" ]] && REPORT_STEP=""
+        [[ -n "$1" ]] || return 0
+        _report_in_list "$1" "$REPORT_FAILED_OPTIONAL" || REPORT_FAILED_OPTIONAL+="${REPORT_FAILED_OPTIONAL:+ }$1"
+        [[ "$REPORT_STAGE_RESULT" == failed ]] || REPORT_STAGE_RESULT="warnings"
+    } 2>/dev/null || true
+}
 report_write_panel_settings() { _report_write_panel_settings 2>/dev/null || true; }
 report_readiness_check() { _report_timed _report_readiness_check 2>/dev/null || true; }
 
@@ -1182,6 +1202,7 @@ stage_prerequisites() {
     check_port_8443
     report_step_start ""
     check_selinux_state
+    probe_external_repositories
     # AB-2331: decided before anything is installed, and said once.
     database_skip_decide
     # AB-2106: a bad key stops the install here, before anything is changed.
@@ -1779,8 +1800,16 @@ crb_repo_ids() {
 }
 
 # $3 (optional) = step id for the install report.
+# STEP_REPOSITORY (set just before the call, cleared by it) = the external
+# repository the step installs from ("remi"): when the step fails because
+# that repository cannot be reached, it is deferred (AB-472) instead of
+# failed. A variable, not a fourth argument: the step id stays the last word
+# of the call, where the install report's tests look for it.
+STEP_REPOSITORY=""
 run_or_warn() {
-    local cmd="$1" desc="${2:-Command}" step="${3:-}" out rc=0
+    local cmd="$1" desc="${2:-Command}" step="${3:-}" repository="$STEP_REPOSITORY" out rc=0
+    STEP_REPOSITORY=""
+    LAST_STEP_RESULT=skipped
     skip_left_out_step "$step" "$desc" "$cmd" && return 0
     print_info "$desc"
     report_step_start "$step"
@@ -1792,12 +1821,95 @@ run_or_warn() {
     wait $! 2>/dev/null || true
     if [ "$rc" -eq 0 ]; then
         print_success "$desc completed"; report_step_result "$step" ok
+        LAST_STEP_RESULT=ok
+    elif [[ -n "$repository" ]] && step_waits_for_repository "$repository" "$out"; then
+        echo -e "${YELLOW}NOTE:${NC} $desc deferred: the $(repository_name "$repository") cannot be reached right now. The panel installs it on its own as soon as the repository answers (continuing)"
+        report_step_deferred "$step"
+        DEFERRED_STEPS+=("${desc}: waits for the $(repository_name "$repository")")
+        LAST_STEP_RESULT=deferred
     else
         echo -e "${YELLOW}WARNING:${NC} $desc failed (continuing)"; report_step_result "$step" failed
         record_failure "$desc" "$out"
+        LAST_STEP_RESULT=failed
     fi
     rm -f "$out"
     echo -e ""
+}
+
+# ---------- External package repositories (AB-472) ----------
+# The panel itself comes from the AdminBolt repositories; PHP for websites
+# comes from Remi, the database server from MariaDB, many prerequisites from
+# EPEL. None of them is ours, and an outage of one used to stop an install
+# half way. Each is probed once in Stage 1 (said, never fatal); a step that
+# then fails because Remi cannot be reached is deferred and finished by the
+# panel later.
+
+repository_name() {
+    case "$1" in
+        remi) echo "Remi package repository" ;;
+        epel) echo "EPEL package repository" ;;
+        mariadb) echo "MariaDB package repository" ;;
+        *) echo "$1 package repository" ;;
+    esac
+}
+
+# URLs that answer when the repository can be used: any one is enough. Remi:
+# its mirror list host and the fallback mirrors bolt-agent configures.
+repository_probe_urls() {
+    case "$1" in
+        remi) echo "http://cdn.remirepo.net/enterprise/9/safe/x86_64/mirror https://rpms.remirepo.net/enterprise/9/safe/x86_64/repodata/repomd.xml https://mirror.23m.com/remi/enterprise/9/safe/x86_64/repodata/repomd.xml https://mirrors.ukfast.co.uk/sites/remi/enterprise/9/safe/x86_64/repodata/repomd.xml https://mirror.team-cymru.com/remi/enterprise/9/safe/x86_64/repodata/repomd.xml" ;;
+        epel) echo "https://mirrors.fedoraproject.org/metalink?repo=epel-9&arch=x86_64 https://dl.fedoraproject.org/pub/epel/9/Everything/x86_64/repodata/repomd.xml" ;;
+        mariadb) echo "https://mirror.mariadb.org/yum/ https://mirrors.gigenet.com/mariadb/yum/ https://archive.mariadb.org/" ;;
+    esac
+}
+
+# Whether any address of the repository answers; at most a few seconds each.
+repository_reachable() {
+    local url
+    for url in $(repository_probe_urls "$1"); do
+        curl -fsS -o /dev/null --connect-timeout 4 --max-time 8 "$url" </dev/null >/dev/null 2>&1 && return 0
+    done
+    return 1
+}
+
+# A failed step waits for the repository when bolt-agent said so (reason code
+# remi_repository_unreachable, from bolt-agent with AB-472), or - an agent that
+# predates it - when the step's output names the repository and the
+# repository does not answer now either.
+step_waits_for_repository() {
+    local repository="$1" out="$2"
+    case "$repository" in
+        remi)
+            grep -qiE 'remi_repository_unreachable|Remi repository unreachable' "$out" 2>/dev/null && return 0
+            grep -qiE "remirepo\.net|repo '?remi" "$out" 2>/dev/null && ! repository_reachable remi && return 0
+            ;;
+    esac
+    return 1
+}
+
+# Stage 1: says which external repositories do not answer, before anything
+# is installed. Never stops the install; the three run side by side.
+probe_external_repositories() {
+    local name dir
+    dir=$(mktemp -d) || return 0
+    for name in remi epel mariadb; do
+        { repository_reachable "$name" || : >"$dir/$name"; } &
+    done
+    wait
+    UNREACHABLE_REPOSITORIES=()
+    for name in remi epel mariadb; do
+        [[ -e "$dir/$name" ]] && UNREACHABLE_REPOSITORIES+=("$name")
+    done
+    rm -rf "$dir"
+    ((${#UNREACHABLE_REPOSITORIES[@]} == 0)) && { print_success "External package repositories answer (Remi, EPEL, MariaDB)"; return 0; }
+    for name in "${UNREACHABLE_REPOSITORIES[@]}"; do
+        case "$name" in
+            remi) echo -e "${YELLOW}NOTE:${NC} The $(repository_name remi) does not answer. The panel installs without it; PHP for websites follows on its own once it answers." ;;
+            epel) echo -e "${YELLOW}WARNING:${NC} The $(repository_name epel) does not answer. Prerequisite packages come from it, so the install may stop in Stage 2 while it is down." ;;
+            mariadb) echo -e "${YELLOW}WARNING:${NC} The $(repository_name mariadb) does not answer. The database server comes from it; the install reports it at the end if it cannot be installed." ;;
+        esac
+    done
+    return 0
 }
 
 # Remember a failed step with the line of its output that says why: the last
@@ -1828,6 +1940,12 @@ is_critical_step() {
 print_failure_summary() {
     CRITICAL_FAILED=0
     SUMMARY_PRINTED=1
+    if ((${#DEFERRED_STEPS[@]} > 0)); then
+        echo -e "${BOLD}${YELLOW}--- Deferred: installs on its own (${#DEFERRED_STEPS[@]}) ---${NC}"
+        printf '%b  %s\n' "${YELLOW}DEFERRED${NC}" "${DEFERRED_STEPS[@]}"
+        echo "The panel tries again every few minutes and finishes it as soon as the repository answers; its dashboard shows the progress and offers Try now."
+        echo -e ""
+    fi
     [[ -n "$STOPPED_STEP" ]] || [ "${#FAILED_STEPS[@]}" -gt 0 ] || return 0
     local step count=${#FAILED_STEPS[@]}
     [[ -z "$STOPPED_STEP" ]] || count=$((count + 1))
@@ -2327,7 +2445,13 @@ stage_configuration() {
     run_or_warn "bolt-cli manage-redis --action=install" "Redis" redis
     run_or_warn "bolt-cli manage-rspamd --action=install" "Rspamd" rspamd
     run_or_warn "bolt-cli manage-mlmmj --action=install" "MLMMJ" mlmmj
+    # AB-472: PHP 8.4 comes from Remi; while Remi cannot be reached it is
+    # deferred, not failed - the post-install setup queued below installs it
+    # (and its default profile) once Remi answers. Any other failure stays
+    # critical (AB-1379).
+    STEP_REPOSITORY=remi
     run_or_warn "bolt-cli manage-php --action=install --php-version=8.4" "PHP 8.4" php84
+    local php84_result="$LAST_STEP_RESULT"
     if ((SKIP_APACHE)); then
         print_info "MyApache skipped (--skip-apache)"
     else
@@ -2363,7 +2487,17 @@ stage_configuration() {
     fi
     run_or_warn "bolt-cli manage-system-email-account --action=install" "System email" system_email
     run_or_warn "bolt-cli manage-dns-records-default-template --action=install" "DNS template" dns_template
-    run_or_warn "bolt-cli manage-php-default-profile --php-version=8.4 --action=install" "PHP 8.4 profile" php84_profile
+    if [[ "$php84_result" == deferred ]]; then
+        print_info "PHP 8.4 profile: deferred, applied when PHP 8.4 installs"
+        echo -e ""
+    elif [[ "$php84_result" == failed ]]; then
+        # The profile marks the version installed in the panel; without PHP
+        # 8.4 on the server that would be untrue.
+        print_info "PHP 8.4 profile: skipped, PHP 8.4 did not install"
+        echo -e ""
+    else
+        run_or_warn "bolt-cli manage-php-default-profile --php-version=8.4 --action=install" "PHP 8.4 profile" php84_profile
+    fi
     run_or_warn "bolt-cli manage-vsftpd-profiles --action=install" "Vsftpd profile" vsftpd_profile
     run_or_warn "bolt-cli manage-fail2ban-profiles --action=install" "Fail2Ban profile" fail2ban_profile
     run_or_warn "bolt-cli setup-cron-jobs" "Setup Cron jobs" cron_jobs
@@ -2449,6 +2583,10 @@ stage_configuration() {
         echo -e "${BOLD}${YELLOW}+----------------------------------------------------------+${NC}"
         echo -e "${BOLD}${YELLOW}|          Installation Completed With Warnings            |${NC}"
         echo -e "${BOLD}${YELLOW}+----------------------------------------------------------+${NC}\n"
+    elif [ "${#DEFERRED_STEPS[@]}" -gt 0 ]; then
+        echo -e "${BOLD}${GREEN}+----------------------------------------------------------+${NC}"
+        echo -e "${BOLD}${GREEN}|      Installation Completed: deferred parts follow       |${NC}"
+        echo -e "${BOLD}${GREEN}+----------------------------------------------------------+${NC}\n"
     else
         echo -e "${BOLD}${GREEN}+----------------------------------------------------------+${NC}"
         echo -e "${BOLD}${GREEN}|          Installation Completed Successfully             |${NC}"

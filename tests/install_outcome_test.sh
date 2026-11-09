@@ -130,6 +130,7 @@ echo "# QA finding 2: an install that stops early still lists what failed"
 early() {
     (
         export FAKE_DIR="$1" PATH="$T/bin:$PATH"
+        # shellcheck source=../install.sh
         ADMINBOLT_INSTALL_SOURCE_ONLY=1 . "$INSTALL_SH"
         REPORT_MODE=off
         report_fail() { :; }
@@ -152,6 +153,63 @@ has "lists the step that failed before" "WARNING  Redis: redis: failed to start"
 has "says it stopped early" "Installation stopped early (exit status 1)." "$out"
 hasnt "nothing after the stop ran" "not reached" "$out"
 
+# ---------------------------------------------------------------- AB-472
+echo "# PHP 8.4 while Remi cannot be reached (bolt-agent says so)"
+d=$(run_stage3 'manage-php --action=install --php-version=8.4\tRemi repository unreachable: neither cdn.remirepo.net nor any of its fallback mirrors answered\n')
+out=$(strip <"$d/out")
+vars=$(cat "$d/vars")
+has "PHP 8.4 is deferred, not failed" "NOTE: PHP 8.4 deferred: the Remi package repository cannot be reached right now." "$out"
+has "the summary lists it as deferred" "DEFERRED  PHP 8.4: waits for the Remi package repository" "$out"
+has "and says it finishes on its own" "finishes it as soon as the repository answers" "$out"
+has "the install completes" "Installation Completed: deferred parts follow" "$out"
+hasnt "nothing is critical" "CRITICAL" "$out"
+has "exit status 0" "CRITICAL_FAILED=0" "$vars"
+has "no failed step" "FAILED=0" "$vars"
+has "reported as an optional failure" "REPORT_FAILED_OPTIONAL=php84" "$vars"
+hasnt "the PHP 8.4 profile is not run" "manage-php-default-profile" "$(cat "$d/bolt-cli.log")"
+has "the post-install setup is still queued" "post-install-provision" "$(cat "$d/bolt-cli.log")"
+
+echo "# PHP 8.4 while Remi cannot be reached (an older agent: dnf's words, Remi down now)"
+d=$(run_stage3 "manage-php --action=install --php-version=8.4\tError: Failed to download metadata for repo 'remi-safe': Cannot download repomd.xml\n" 'remirepo.net\nmirror.23m.com\nukfast\nteam-cymru\n')
+has "deferred as well" "DEFERRED  PHP 8.4" "$(strip <"$d/out")"
+has "exit status 0" "CRITICAL_FAILED=0" "$(cat "$d/vars")"
+d=$(run_stage3 "manage-php --action=install --php-version=8.4\tError: Failed to download metadata for repo 'remi-safe': Cannot download repomd.xml\n")
+has "but critical when Remi answers by now" "CRITICAL PHP 8.4" "$(strip <"$d/out")"
+
+echo "# PHP 8.4 fails for another reason"
+d=$(run_stage3 'manage-php --action=install --php-version=8.4\tError: Unable to find a match: php84-php-fpm\n')
+out=$(strip <"$d/out")
+has "it stays critical" "CRITICAL PHP 8.4: Error: Unable to find a match: php84-php-fpm" "$out"
+has "the install is incomplete" "Installation Incomplete" "$out"
+has "exit status 1" "CRITICAL_FAILED=1" "$(cat "$d/vars")"
+hasnt "the profile is not applied to a missing PHP" "manage-php-default-profile" "$(cat "$d/bolt-cli.log")"
+
+echo "# Remi only: another step mentioning a down repository is not deferred"
+d=$(run_stage3 'manage-postfix --action=install\tRemi repository unreachable\n')
+has "Postfix stays critical" "CRITICAL Postfix" "$(strip <"$d/out")"
+
+echo "# Stage 1 probe"
+probe() {
+    local dir; dir=$(mktemp -d "$T/probe.XXXX")
+    printf '%b' "$1" >"$dir/curl-down"
+    (
+        export FAKE_DIR="$dir" PATH="$T/bin:$PATH"
+        # shellcheck source=../install.sh
+        ADMINBOLT_INSTALL_SOURCE_ONLY=1 . "$INSTALL_SH"
+        probe_external_repositories
+        echo "rc=$?"
+    ) 2>&1 | strip
+}
+out=$(probe '')
+has "all answer" "External package repositories answer (Remi, EPEL, MariaDB)" "$out"
+out=$(probe 'remirepo.net\nmirror.23m.com\nukfast\nteam-cymru\nmariadb\n')
+has "Remi down is said" "The Remi package repository does not answer. The panel installs without it" "$out"
+has "MariaDB down is said" "The MariaDB package repository does not answer." "$out"
+hasnt "EPEL answers" "EPEL" "$out"
+has "the probe never stops the install" "rc=0" "$out"
+out=$(probe 'cdn.remirepo.net\n')
+has "one Remi mirror is enough" "External package repositories answer" "$out"
+
 echo "# QA finding 1: SELinux policy store"
 selinux() {
     local mode="$1" semanage="$2" store="$3" dir; dir=$(mktemp -d "$T/se.XXXX")
@@ -167,6 +225,7 @@ selinux() {
     (
         # Only the fakes and the coreutils the check uses: no semanage of the host.
         export PATH="$dir/bin:/usr/bin:/bin"
+        # shellcheck source=../install.sh
         ADMINBOLT_INSTALL_SOURCE_ONLY=1 . "$INSTALL_SH"
         SELINUX_CONFIG_FILE="$dir/config" SELINUX_STORE_ROOT="$dir/store"
         export SELINUX_CONFIG_FILE SELINUX_STORE_ROOT
