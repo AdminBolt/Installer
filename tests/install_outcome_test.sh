@@ -176,6 +176,15 @@ has "exit status 0" "CRITICAL_FAILED=0" "$(cat "$d/vars")"
 d=$(run_stage3 "manage-php --action=install --php-version=8.4\tError: Failed to download metadata for repo 'remi-safe': Cannot download repomd.xml\n")
 has "but critical when Remi answers by now" "CRITICAL PHP 8.4" "$(strip <"$d/out")"
 
+echo "# PHP 8.4: Remi answers but dnf failed on its metadata (review of AB-472)"
+d=$(run_stage3 'manage-php --action=install --php-version=8.4\tThe Remi repository answers, but dnf could not load its metadata: rpmdb open failed\nReason code: remi_metadata_failed\n' 'remirepo.net\nmirror.23m.com\nukfast\nteam-cymru\n')
+has "it is critical, not deferred" "CRITICAL PHP 8.4" "$(strip <"$d/out")"
+has "exit status 1" "CRITICAL_FAILED=1" "$(cat "$d/vars")"
+
+echo "# Stage 1 probe waits only for its own checks"
+has "the probe waits for its own pids" 'wait "${pids[@]}"' "$(sed -n '/^probe_external_repositories() {/,/^}/p' "$INSTALL_SH")"
+hasnt "no bare wait" "$(printf '    wait\n')" "$(sed -n '/^probe_external_repositories() {/,/^}/p' "$INSTALL_SH" | grep -x '    wait')"
+
 echo "# PHP 8.4 fails for another reason"
 d=$(run_stage3 'manage-php --action=install --php-version=8.4\tError: Unable to find a match: php84-php-fpm\n')
 out=$(strip <"$d/out")

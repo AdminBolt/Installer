@@ -1855,10 +1855,15 @@ repository_name() {
 
 # URLs that answer when the repository can be used: any one is enough. Remi:
 # its mirror list host and the fallback mirrors bolt-agent configures.
+# EL 9 only (the installer supports nothing else); the architecture is the
+# server's.
 repository_probe_urls() {
+    local arch
+    arch=$(uname -m 2>/dev/null)
+    arch="${arch:-x86_64}"
     case "$1" in
-        remi) echo "http://cdn.remirepo.net/enterprise/9/safe/x86_64/mirror https://rpms.remirepo.net/enterprise/9/safe/x86_64/repodata/repomd.xml https://mirror.23m.com/remi/enterprise/9/safe/x86_64/repodata/repomd.xml https://mirrors.ukfast.co.uk/sites/remi/enterprise/9/safe/x86_64/repodata/repomd.xml https://mirror.team-cymru.com/remi/enterprise/9/safe/x86_64/repodata/repomd.xml" ;;
-        epel) echo "https://mirrors.fedoraproject.org/metalink?repo=epel-9&arch=x86_64 https://dl.fedoraproject.org/pub/epel/9/Everything/x86_64/repodata/repomd.xml" ;;
+        remi) echo "http://cdn.remirepo.net/enterprise/9/safe/${arch}/mirror https://rpms.remirepo.net/enterprise/9/safe/${arch}/repodata/repomd.xml https://mirror.23m.com/remi/enterprise/9/safe/${arch}/repodata/repomd.xml https://mirrors.ukfast.co.uk/sites/remi/enterprise/9/safe/${arch}/repodata/repomd.xml https://mirror.team-cymru.com/remi/enterprise/9/safe/${arch}/repodata/repomd.xml" ;;
+        epel) echo "https://mirrors.fedoraproject.org/metalink?repo=epel-9&arch=${arch} https://dl.fedoraproject.org/pub/epel/9/Everything/${arch}/repodata/repomd.xml" ;;
         mariadb) echo "https://mirror.mariadb.org/yum/ https://mirrors.gigenet.com/mariadb/yum/ https://archive.mariadb.org/" ;;
     esac
 }
@@ -1880,6 +1885,9 @@ step_waits_for_repository() {
     local repository="$1" out="$2"
     case "$repository" in
         remi)
+            # Remi answers but dnf failed on it (a lock, GPG, a broken file):
+            # a real failure, never a wait.
+            grep -qi 'remi_metadata_failed' "$out" 2>/dev/null && return 1
             grep -qiE 'remi_repository_unreachable|Remi repository unreachable' "$out" 2>/dev/null && return 0
             grep -qiE "remirepo\.net|repo '?remi" "$out" 2>/dev/null && ! repository_reachable remi && return 0
             ;;
@@ -1890,12 +1898,15 @@ step_waits_for_repository() {
 # Stage 1: says which external repositories do not answer, before anything
 # is installed. Never stops the install; the three run side by side.
 probe_external_repositories() {
-    local name dir
+    local name dir pids=()
     dir=$(mktemp -d) || return 0
     for name in remi epel mariadb; do
         { repository_reachable "$name" || : >"$dir/$name"; } &
+        pids+=("$!")
     done
-    wait
+    # Only these three: a bare wait would also wait for the install report's
+    # background sender.
+    wait "${pids[@]}"
     UNREACHABLE_REPOSITORIES=()
     for name in remi epel mariadb; do
         [[ -e "$dir/$name" ]] && UNREACHABLE_REPOSITORIES+=("$name")
