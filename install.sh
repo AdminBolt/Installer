@@ -93,6 +93,12 @@ SKIPPED_COMMANDS=()
 FAILED_STEPS=()
 readonly CRITICAL_COMPONENTS=("MariaDB" "Postfix" "Dovecot" "PHP 8.4")
 CRITICAL_FAILED=0
+# Set once the closing summary is printed; an install that stops early
+# prints it from the EXIT trap instead (AB-1379 QA finding 2).
+SUMMARY_PRINTED=0
+# The step that stopped the install, "<step>: <reason>" (run_or_fail,
+# install_packages); listed first in that summary.
+STOPPED_STEP=""
 readonly WEB_INSTALL_ROOT="/usr/local/bolt/web"
 
 # Colors
@@ -773,6 +779,14 @@ report_on_exit() {
     if ((INSTALL_MARKER_CREATED)); then rm -f "$REPORT_MARKER"; fi
     REPORT_FINISH_START=$(_report_now_ms)
     [[ "$REPORT_MODE" == off ]] || _report_finish "$rc" </dev/null >/dev/null 2>&1
+    # AB-1379 QA finding 2: an install that stops early (a Stage 2 package
+    # install, connecting bolt-agent to the panel) still lists the steps
+    # that failed before it, which the closing summary never got to print.
+    if ((rc != 0)) && [[ -z "$REPORT_SIGNAL" ]] && ((!SUMMARY_PRINTED)) && { [[ -n "$STOPPED_STEP" ]] || ((${#FAILED_STEPS[@]} > 0)); }; then
+        echo -e ""
+        print_failure_summary
+        echo -e "${BOLD}${RED}Installation stopped early (exit status ${rc}).${NC}"
+    fi
     if [[ -n "$REPORT_SIGNAL" ]]; then
         trap - "$REPORT_SIGNAL"
         kill -s "$REPORT_SIGNAL" "$$"
@@ -1566,11 +1580,11 @@ install_repo_rhel() {
     local rpm_url="${REPO_BASE_URL}/rhel/${el_version}/noarch/Packages/b/${REPO_PACKAGE}.el${el_version}.noarch.rpm"
     local temp_rpm="/tmp/bolt-repo-${el_version}.rpm"
     print_info "Downloading repository package..."
-    curl -f -L -k -o "$temp_rpm" "$rpm_url" || { print_error "Failed to download repo"; report_fail repo_setup repo_download_failed; exit 1; }
+    curl -f -L -k -o "$temp_rpm" "$rpm_url" || { print_error "Failed to download repo"; STOPPED_STEP="Bolt repository: ${rpm_url} could not be downloaded"; report_fail repo_setup repo_download_failed; exit 1; }
     # A failed install of the downloaded package stops the script as before
     # (with rpm's exit code), reported as a package failure.
     (command -v dnf >/dev/null 2>&1 && dnf install -y "$temp_rpm") || (command -v yum >/dev/null 2>&1 && yum install -y "$temp_rpm") || rpm -ivh "$temp_rpm" \
-        || { rc=$?; report_fail repo_setup package_install_failed; exit "$rc"; }
+        || { rc=$?; STOPPED_STEP="Bolt repository: the repository package did not install"; report_fail repo_setup package_install_failed; exit "$rc"; }
     rm -f "$temp_rpm"
     rank_bolt_repos "$BOLT_REPO_FILE"
     print_success "Repository installed"
@@ -1620,6 +1634,7 @@ install_packages() {
     "$pm" install -y "${dnf_opts[@]}" "${missing[@]}" || {
         local status=$?
         print_error "Installing packages failed ($pm exit $status): ${missing[*]}. See $pm's output above."
+        STOPPED_STEP="Packages ${missing[*]}: $pm exit $status"
         report_fail
         exit "$status"
     }
@@ -1812,11 +1827,14 @@ is_critical_step() {
 # Sets CRITICAL_FAILED=1 when a critical component is among them.
 print_failure_summary() {
     CRITICAL_FAILED=0
-    [ "${#FAILED_STEPS[@]}" -gt 0 ] || return 0
-    local step
+    SUMMARY_PRINTED=1
+    [[ -n "$STOPPED_STEP" ]] || [ "${#FAILED_STEPS[@]}" -gt 0 ] || return 0
+    local step count=${#FAILED_STEPS[@]}
+    [[ -z "$STOPPED_STEP" ]] || count=$((count + 1))
     # printf %s, not echo -e: a reason is the step's own output and may carry a
     # literal "\n" (an agent's JSON error) that must not become a line break.
-    echo -e "${BOLD}${YELLOW}--- Failed steps (${#FAILED_STEPS[@]}) ---${NC}"
+    echo -e "${BOLD}${YELLOW}--- Failed steps (${count}) ---${NC}"
+    [[ -z "$STOPPED_STEP" ]] || printf '%b  %s\n' "${RED}STOPPED${NC}" "$STOPPED_STEP"
     for step in "${FAILED_STEPS[@]}"; do
         if is_critical_step "$step"; then
             CRITICAL_FAILED=1
@@ -1831,7 +1849,7 @@ run_or_fail() {
     local cmd="$1" desc="${2:-Command}" step="${3:-}"
     skip_left_out_step "$step" "$desc" "$cmd" && return 0
     report_step_start "$step"
-    if ! eval "$cmd"; then print_error "${desc} failed"; report_fail "$step"; exit 1; fi
+    if ! eval "$cmd"; then print_error "${desc} failed"; STOPPED_STEP="${desc}: failed, the installation cannot go on without it"; report_fail "$step"; exit 1; fi
     report_step_result "$step" ok
     print_success "${desc} completed"
     echo -e ""
@@ -2045,6 +2063,7 @@ agent_setup_failed() {
         next="The installer could not record this failure in $AGENT_POST_FAILED_MARKER, so a rerun may not install the agent again by itself. Fix the cause, run 'mkdir -p $(dirname "$AGENT_POST_FAILED_MARKER") && touch $AGENT_POST_FAILED_MARKER', then rerun this installer."
     fi
     print_error "$1 $next"
+    STOPPED_STEP="bolt-agent: its setup did not finish"
     report_fail agent_scriptlet agent_install_failed
     exit 1
 }
@@ -2158,6 +2177,7 @@ install_bolt_agent_and_check_post() {
     if [[ "$dnf_status" -ne 0 ]]; then
         rm -f "$log"
         print_error "Installing bolt-agent failed"
+        STOPPED_STEP="bolt-agent: the package did not install"
         report_fail agent_install agent_install_failed
         exit 1
     fi
@@ -2235,6 +2255,7 @@ install_bolt_panel_and_check_post() {
     ((errexit)) && set -e
     if [[ "$status" -ne 0 ]]; then
         rm -f "$log"
+        STOPPED_STEP="bolt-panel: the package did not install (exit ${status})"
         report_fail panel_install package_install_failed
         exit "$status"
     fi
@@ -2433,7 +2454,14 @@ stage_configuration() {
         echo -e "${BOLD}${GREEN}|          Installation Completed Successfully             |${NC}"
         echo -e "${BOLD}${GREEN}+----------------------------------------------------------+${NC}\n"
     fi
-    [ -n "${ADMIN_EMAIL}" ] && [ "${TRIAL_LICENCE_OK}" -eq 0 ] && echo -e "${YELLOW}NOTE:${NC} Trial licence not issued (request refused or licence server unreachable). The installation itself succeeded and the panel is usable; activate a licence on its License page.\n"
+    if [ -n "${ADMIN_EMAIL}" ] && [ "${TRIAL_LICENCE_OK}" -eq 0 ]; then
+        # QA finding 2: "the installation itself succeeded" only when it did.
+        if [ "$CRITICAL_FAILED" -eq 1 ]; then
+            echo -e "${YELLOW}NOTE:${NC} Trial licence not issued (request refused or licence server unreachable). Activate a licence on the panel's License page.\n"
+        else
+            echo -e "${YELLOW}NOTE:${NC} Trial licence not issued (request refused or licence server unreachable). The installation itself succeeded and the panel is usable; activate a licence on its License page.\n"
+        fi
+    fi
     print_left_out_components
     [ -n "${SSO_URL:-}" ] && echo -e "${BOLD}${CYAN}--- Access ---${NC}\n${GREEN}Admin Panel:${NC}\n${BOLD}${SSO_URL}${NC}\n"
     # AB-2069: nothing here used to say which login the panel takes, and the
