@@ -86,6 +86,28 @@ WITHOUT_GIVEN=0
 LEFT_OUT_COMPONENTS=""
 # "<component> <command>" for every step skipped for them, in the order Stage 3 reached it.
 SKIPPED_COMMANDS=()
+# AB-1379: steps that failed (run_or_warn), "<step>: <last error line>", and
+# the components without which the server cannot serve sites, mail or
+# databases. A failed critical component ends the install with a non-zero
+# exit status; every failure is listed in the closing summary either way.
+FAILED_STEPS=()
+readonly CRITICAL_COMPONENTS=("MariaDB" "Postfix" "Dovecot" "PHP 8.4")
+CRITICAL_FAILED=0
+# Set once the closing summary is printed; an install that stops early
+# prints it from the EXIT trap instead (AB-1379 QA finding 2).
+SUMMARY_PRINTED=0
+# The step that stopped the install, "<step>: <reason>" (run_or_fail,
+# install_packages); listed first in that summary.
+STOPPED_STEP=""
+# AB-472: steps that wait for an external package repository the server
+# cannot reach. The install does not fail on them: the panel installs them
+# on its own once the repository answers (post-install setup on the
+# dashboard). "<step>: <what it waits for>".
+DEFERRED_STEPS=()
+# Outcome of the last run_or_warn: ok, failed or deferred.
+LAST_STEP_RESULT=""
+# External repositories that did not answer the Stage 1 probe, by name.
+UNREACHABLE_REPOSITORIES=()
 readonly WEB_INSTALL_ROOT="/usr/local/bolt/web"
 
 # Colors
@@ -766,6 +788,14 @@ report_on_exit() {
     if ((INSTALL_MARKER_CREATED)); then rm -f "$REPORT_MARKER"; fi
     REPORT_FINISH_START=$(_report_now_ms)
     [[ "$REPORT_MODE" == off ]] || _report_finish "$rc" </dev/null >/dev/null 2>&1
+    # AB-1379 QA finding 2: an install that stops early (a Stage 2 package
+    # install, connecting bolt-agent to the panel) still lists the steps
+    # that failed before it, which the closing summary never got to print.
+    if ((rc != 0)) && [[ -z "$REPORT_SIGNAL" ]] && ((!SUMMARY_PRINTED)) && { [[ -n "$STOPPED_STEP" ]] || ((${#FAILED_STEPS[@]} > 0)); }; then
+        echo -e ""
+        print_failure_summary
+        echo -e "${BOLD}${RED}Installation stopped early (exit status ${rc}).${NC}"
+    fi
     if [[ -n "$REPORT_SIGNAL" ]]; then
         trap - "$REPORT_SIGNAL"
         kill -s "$REPORT_SIGNAL" "$$"
@@ -1064,6 +1094,17 @@ report_step_result() { _report_step_result "$@" 2>/dev/null || true; }
 # report_fail [step] [reason]: the step failed (default: the current one).
 report_fail() { _report_step_result "${1:-$REPORT_STEP}" failed "${2:-}" 2>/dev/null || true; }
 report_trial_licence() { REPORT_TRIAL="$1"; }
+# AB-472: a step that waits for an external repository is reported like a
+# failed optional step (the result becomes succeeded_with_warnings), never as
+# the failure of a required one.
+report_step_deferred() {
+    {
+        [[ "$REPORT_STEP" == "$1" ]] && REPORT_STEP=""
+        [[ -n "$1" ]] || return 0
+        _report_in_list "$1" "$REPORT_FAILED_OPTIONAL" || REPORT_FAILED_OPTIONAL+="${REPORT_FAILED_OPTIONAL:+ }$1"
+        [[ "$REPORT_STAGE_RESULT" == failed ]] || REPORT_STAGE_RESULT="warnings"
+    } 2>/dev/null || true
+}
 report_write_panel_settings() { _report_write_panel_settings 2>/dev/null || true; }
 report_readiness_check() { _report_timed _report_readiness_check 2>/dev/null || true; }
 
@@ -1097,6 +1138,40 @@ check_port_8443() {
     exit 1
 }
 
+# SELinux policy tooling without a policy store (AB-1379). With SELINUX=
+# enforcing or permissive in /etc/selinux/config, every package step that
+# manages SELinux policy runs semanage, which aborts with "SELinux policy is
+# not managed or store cannot be accessed" when the store of the configured
+# policy is missing - and the install used to go on without Postfix, Dovecot
+# and Rspamd. Whether the store can be used is asked of semanage itself, not
+# guessed from the kernel command line: selinux=0 with SELINUX=enforcing
+# installs fine on a stock image, whose store is there (QA finding 1).
+# Without semanage (a minimal image; it arrives with the packages) the
+# store directory of the configured policy type is looked for instead.
+# SELINUX=disabled, or no config at all, needs nothing. Paths overridable
+# for tests.
+check_selinux_state() {
+    local config="${SELINUX_CONFIG_FILE:-/etc/selinux/config}" mode type out
+    mode=$(sed -n 's/^[[:space:]]*SELINUX[[:space:]]*=[[:space:]]*//p' "$config" 2>/dev/null | tail -n 1 | tr -d '[:space:]"')
+    case "$mode" in
+        enforcing|permissive) ;;
+        *) return 0 ;;
+    esac
+    type=$(sed -n 's/^[[:space:]]*SELINUXTYPE[[:space:]]*=[[:space:]]*//p' "$config" 2>/dev/null | tail -n 1 | tr -d '[:space:]"')
+    type="${type:-targeted}"
+    if command -v semanage >/dev/null 2>&1; then
+        out=$(semanage login -l 2>&1) && return 0
+        # Any other semanage failure is not this problem; the package steps report it.
+        grep -qi 'not managed or store cannot be accessed' <<<"$out" || return 0
+    elif [ -d "${SELINUX_STORE_ROOT:-/var/lib/selinux}/${type}/active" ]; then
+        return 0
+    fi
+    print_error "${config} sets SELINUX=${mode}, but the SELinux policy store (${type}) cannot be used."
+    echo "Package steps that manage SELinux policy fail in this state, so Postfix, Dovecot and Rspamd would not install."
+    echo "Install the policy (dnf install selinux-policy-${type}), or set SELINUX=disabled in ${config} (this installer disables SELinux anyway), then run the installer again."
+    exit 1
+}
+
 # ---------- Stage 1: Check ready for installation ----------
 stage_prerequisites() {
     print_info "Stage 1: Checking that everything is in place and ready for installation"
@@ -1125,6 +1200,9 @@ stage_prerequisites() {
         exit 1
     fi
     check_port_8443
+    report_step_start ""
+    check_selinux_state
+    probe_external_repositories
     # AB-2331: decided before anything is installed, and said once.
     database_skip_decide
     # AB-2106: a bad key stops the install here, before anything is changed.
@@ -1523,11 +1601,11 @@ install_repo_rhel() {
     local rpm_url="${REPO_BASE_URL}/rhel/${el_version}/noarch/Packages/b/${REPO_PACKAGE}.el${el_version}.noarch.rpm"
     local temp_rpm="/tmp/bolt-repo-${el_version}.rpm"
     print_info "Downloading repository package..."
-    curl -f -L -k -o "$temp_rpm" "$rpm_url" || { print_error "Failed to download repo"; report_fail repo_setup repo_download_failed; exit 1; }
+    curl -f -L -k -o "$temp_rpm" "$rpm_url" || { print_error "Failed to download repo"; STOPPED_STEP="Bolt repository: ${rpm_url} could not be downloaded"; report_fail repo_setup repo_download_failed; exit 1; }
     # A failed install of the downloaded package stops the script as before
     # (with rpm's exit code), reported as a package failure.
     (command -v dnf >/dev/null 2>&1 && dnf install -y "$temp_rpm") || (command -v yum >/dev/null 2>&1 && yum install -y "$temp_rpm") || rpm -ivh "$temp_rpm" \
-        || { rc=$?; report_fail repo_setup package_install_failed; exit "$rc"; }
+        || { rc=$?; STOPPED_STEP="Bolt repository: the repository package did not install"; report_fail repo_setup package_install_failed; exit "$rc"; }
     rm -f "$temp_rpm"
     rank_bolt_repos "$BOLT_REPO_FILE"
     print_success "Repository installed"
@@ -1577,6 +1655,7 @@ install_packages() {
     "$pm" install -y "${dnf_opts[@]}" "${missing[@]}" || {
         local status=$?
         print_error "Installing packages failed ($pm exit $status): ${missing[*]}. See $pm's output above."
+        STOPPED_STEP="Packages ${missing[*]}: $pm exit $status"
         report_fail
         exit "$status"
     }
@@ -1721,19 +1800,185 @@ crb_repo_ids() {
 }
 
 # $3 (optional) = step id for the install report.
+# STEP_REPOSITORY (set just before the call, cleared by it) = the external
+# repository the step installs from ("remi"): when the step fails because
+# that repository cannot be reached, it is deferred (AB-472) instead of
+# failed. A variable, not a fourth argument: the step id stays the last word
+# of the call, where the install report's tests look for it.
+STEP_REPOSITORY=""
 run_or_warn() {
-    local cmd="$1" desc="${2:-Command}" step="${3:-}"
+    local cmd="$1" desc="${2:-Command}" step="${3:-}" repository="$STEP_REPOSITORY" out rc=0
+    STEP_REPOSITORY=""
+    LAST_STEP_RESULT=skipped
     skip_left_out_step "$step" "$desc" "$cmd" && return 0
     print_info "$desc"
     report_step_start "$step"
-    if eval "$cmd"; then print_success "$desc completed"; report_step_result "$step" ok; else echo -e "${YELLOW}WARNING:${NC} $desc failed (continuing)"; report_step_result "$step" failed; fi
+    out=$(mktemp)
+    # tee through a process substitution rather than a pipe: the command still
+    # runs in this shell, so an assignment it makes survives, and its output
+    # still streams live while a copy is kept for the summary (AB-1379).
+    eval "$cmd" > >(tee "$out") 2>&1 || rc=$?
+    wait $! 2>/dev/null || true
+    if [ "$rc" -eq 0 ]; then
+        print_success "$desc completed"; report_step_result "$step" ok
+        LAST_STEP_RESULT=ok
+    elif [[ -n "$repository" ]] && step_waits_for_repository "$repository" "$out"; then
+        echo -e "${YELLOW}NOTE:${NC} $desc deferred: the $(repository_name "$repository") cannot be reached right now. The panel installs it on its own as soon as the repository answers (continuing)"
+        report_step_deferred "$step"
+        DEFERRED_STEPS+=("${desc}: waits for the $(repository_name "$repository")")
+        LAST_STEP_RESULT=deferred
+    else
+        echo -e "${YELLOW}WARNING:${NC} $desc failed (continuing)"; report_step_result "$step" failed
+        record_failure "$desc" "$out"
+        LAST_STEP_RESULT=failed
+    fi
+    rm -f "$out"
+    echo -e ""
+}
+
+# ---------- External package repositories (AB-472) ----------
+# The panel itself comes from the AdminBolt repositories; PHP for websites
+# comes from Remi, the database server from MariaDB, many prerequisites from
+# EPEL. None of them is ours, and an outage of one used to stop an install
+# half way. Each is probed once in Stage 1 (said, never fatal); a step that
+# then fails because Remi cannot be reached is deferred and finished by the
+# panel later.
+
+repository_name() {
+    case "$1" in
+        remi) echo "Remi package repository" ;;
+        epel) echo "EPEL package repository" ;;
+        mariadb) echo "MariaDB package repository" ;;
+        *) echo "$1 package repository" ;;
+    esac
+}
+
+# URLs that answer when the repository can be used: any one is enough. Remi:
+# its mirror list host and the fallback mirrors bolt-agent configures.
+# EL 9 only (the installer supports nothing else); the architecture is the
+# server's.
+repository_probe_urls() {
+    local arch
+    arch=$(uname -m 2>/dev/null)
+    arch="${arch:-x86_64}"
+    case "$1" in
+        remi) echo "http://cdn.remirepo.net/enterprise/9/safe/${arch}/mirror https://rpms.remirepo.net/enterprise/9/safe/${arch}/repodata/repomd.xml https://mirror.23m.com/remi/enterprise/9/safe/${arch}/repodata/repomd.xml https://mirrors.ukfast.co.uk/sites/remi/enterprise/9/safe/${arch}/repodata/repomd.xml https://mirror.team-cymru.com/remi/enterprise/9/safe/${arch}/repodata/repomd.xml" ;;
+        epel) echo "https://mirrors.fedoraproject.org/metalink?repo=epel-9&arch=${arch} https://dl.fedoraproject.org/pub/epel/9/Everything/${arch}/repodata/repomd.xml" ;;
+        mariadb) echo "https://mirror.mariadb.org/yum/ https://mirrors.gigenet.com/mariadb/yum/ https://archive.mariadb.org/" ;;
+    esac
+}
+
+# Whether any address of the repository answers; at most a few seconds each.
+repository_reachable() {
+    local url
+    for url in $(repository_probe_urls "$1"); do
+        curl -fsS -o /dev/null --connect-timeout 4 --max-time 8 "$url" </dev/null >/dev/null 2>&1 && return 0
+    done
+    return 1
+}
+
+# A failed step waits for the repository when bolt-agent said so (reason code
+# remi_repository_unreachable, from bolt-agent with AB-472), or - an agent that
+# predates it - when the step's output names the repository and the
+# repository does not answer now either.
+step_waits_for_repository() {
+    local repository="$1" out="$2"
+    case "$repository" in
+        remi)
+            # Remi answers but dnf failed on it (a lock, GPG, a broken file):
+            # a real failure, never a wait.
+            grep -qi 'remi_metadata_failed' "$out" 2>/dev/null && return 1
+            grep -qiE 'remi_repository_unreachable|Remi repository unreachable' "$out" 2>/dev/null && return 0
+            grep -qiE "remirepo\.net|repo '?remi" "$out" 2>/dev/null && ! repository_reachable remi && return 0
+            ;;
+    esac
+    return 1
+}
+
+# Stage 1: says which external repositories do not answer, before anything
+# is installed. Never stops the install; the three run side by side.
+probe_external_repositories() {
+    local name dir pids=()
+    dir=$(mktemp -d) || return 0
+    for name in remi epel mariadb; do
+        { repository_reachable "$name" || : >"$dir/$name"; } &
+        pids+=("$!")
+    done
+    # Only these three: a bare wait would also wait for the install report's
+    # background sender.
+    wait "${pids[@]}"
+    UNREACHABLE_REPOSITORIES=()
+    for name in remi epel mariadb; do
+        [[ -e "$dir/$name" ]] && UNREACHABLE_REPOSITORIES+=("$name")
+    done
+    rm -rf "$dir"
+    ((${#UNREACHABLE_REPOSITORIES[@]} == 0)) && { print_success "External package repositories answer (Remi, EPEL, MariaDB)"; return 0; }
+    for name in "${UNREACHABLE_REPOSITORIES[@]}"; do
+        case "$name" in
+            remi) echo -e "${YELLOW}NOTE:${NC} The $(repository_name remi) does not answer. The panel installs without it; PHP for websites follows on its own once it answers." ;;
+            epel) echo -e "${YELLOW}WARNING:${NC} The $(repository_name epel) does not answer. Prerequisite packages come from it, so the install may stop in Stage 2 while it is down." ;;
+            mariadb) echo -e "${YELLOW}WARNING:${NC} The $(repository_name mariadb) does not answer. The database server comes from it; the install reports it at the end if it cannot be installed." ;;
+        esac
+    done
+    return 0
+}
+
+# Remember a failed step with the line of its output that says why: the last
+# line mentioning an error, or else its last non-empty line (AB-1379).
+record_failure() {
+    local desc="$1" out="$2" reason
+    reason=$(sed 's/\x1b\[[0-9;]*m//g' "$out" 2>/dev/null | grep -v '^[[:space:]]*$' | grep -iE 'error|fail|exception|cannot|not found|denied' | tail -n 1)
+    [ -n "$reason" ] || reason=$(sed 's/\x1b\[[0-9;]*m//g' "$out" 2>/dev/null | grep -v '^[[:space:]]*$' | tail -n 1)
+    reason=$(echo "${reason:-no output}" | sed 's/^[[:space:]]*//' | cut -c1-200)
+    FAILED_STEPS+=("${desc}: ${reason}")
+}
+
+# True when a failed step ("<step>: <reason>") is the install of a critical
+# component. The name must match exactly: "PHP 8.4 profile" or "Postfix
+# profiles" are follow-up steps, not the component. The MariaDB install is
+# also named after its series ("MariaDB 11.4", "MariaDB (default series)").
+is_critical_step() {
+    local step="${1%%: *}" component
+    for component in "${CRITICAL_COMPONENTS[@]}"; do
+        [ "$step" = "$component" ] && return 0
+    done
+    [[ "$step" =~ ^MariaDB\ ([0-9][0-9.]*|\(default\ series\))$ ]] && return 0
+    return 1
+}
+
+# Closing summary of every failed step, whatever the outcome (AB-1379).
+# Sets CRITICAL_FAILED=1 when a critical component is among them.
+print_failure_summary() {
+    CRITICAL_FAILED=0
+    SUMMARY_PRINTED=1
+    if ((${#DEFERRED_STEPS[@]} > 0)); then
+        echo -e "${BOLD}${YELLOW}--- Deferred: installs on its own (${#DEFERRED_STEPS[@]}) ---${NC}"
+        printf '%b  %s\n' "${YELLOW}DEFERRED${NC}" "${DEFERRED_STEPS[@]}"
+        echo "The panel tries again every few minutes and finishes it as soon as the repository answers; its dashboard shows the progress and offers Try now."
+        echo -e ""
+    fi
+    [[ -n "$STOPPED_STEP" ]] || [ "${#FAILED_STEPS[@]}" -gt 0 ] || return 0
+    local step count=${#FAILED_STEPS[@]}
+    [[ -z "$STOPPED_STEP" ]] || count=$((count + 1))
+    # printf %s, not echo -e: a reason is the step's own output and may carry a
+    # literal "\n" (an agent's JSON error) that must not become a line break.
+    echo -e "${BOLD}${YELLOW}--- Failed steps (${count}) ---${NC}"
+    [[ -z "$STOPPED_STEP" ]] || printf '%b  %s\n' "${RED}STOPPED${NC}" "$STOPPED_STEP"
+    for step in "${FAILED_STEPS[@]}"; do
+        if is_critical_step "$step"; then
+            CRITICAL_FAILED=1
+            printf '%b %s\n' "${RED}CRITICAL${NC}" "$step"
+        else
+            printf '%b  %s\n' "${YELLOW}WARNING${NC}" "$step"
+        fi
+    done
     echo -e ""
 }
 run_or_fail() {
     local cmd="$1" desc="${2:-Command}" step="${3:-}"
     skip_left_out_step "$step" "$desc" "$cmd" && return 0
     report_step_start "$step"
-    if ! eval "$cmd"; then print_error "${desc} failed"; report_fail "$step"; exit 1; fi
+    if ! eval "$cmd"; then print_error "${desc} failed"; STOPPED_STEP="${desc}: failed, the installation cannot go on without it"; report_fail "$step"; exit 1; fi
     report_step_result "$step" ok
     print_success "${desc} completed"
     echo -e ""
@@ -1947,6 +2192,7 @@ agent_setup_failed() {
         next="The installer could not record this failure in $AGENT_POST_FAILED_MARKER, so a rerun may not install the agent again by itself. Fix the cause, run 'mkdir -p $(dirname "$AGENT_POST_FAILED_MARKER") && touch $AGENT_POST_FAILED_MARKER', then rerun this installer."
     fi
     print_error "$1 $next"
+    STOPPED_STEP="bolt-agent: its setup did not finish"
     report_fail agent_scriptlet agent_install_failed
     exit 1
 }
@@ -2060,6 +2306,7 @@ install_bolt_agent_and_check_post() {
     if [[ "$dnf_status" -ne 0 ]]; then
         rm -f "$log"
         print_error "Installing bolt-agent failed"
+        STOPPED_STEP="bolt-agent: the package did not install"
         report_fail agent_install agent_install_failed
         exit 1
     fi
@@ -2137,6 +2384,7 @@ install_bolt_panel_and_check_post() {
     ((errexit)) && set -e
     if [[ "$status" -ne 0 ]]; then
         rm -f "$log"
+        STOPPED_STEP="bolt-panel: the package did not install (exit ${status})"
         report_fail panel_install package_install_failed
         exit "$status"
     fi
@@ -2208,7 +2456,13 @@ stage_configuration() {
     run_or_warn "bolt-cli manage-redis --action=install" "Redis" redis
     run_or_warn "bolt-cli manage-rspamd --action=install" "Rspamd" rspamd
     run_or_warn "bolt-cli manage-mlmmj --action=install" "MLMMJ" mlmmj
+    # AB-472: PHP 8.4 comes from Remi; while Remi cannot be reached it is
+    # deferred, not failed - the post-install setup queued below installs it
+    # (and its default profile) once Remi answers. Any other failure stays
+    # critical (AB-1379).
+    STEP_REPOSITORY=remi
     run_or_warn "bolt-cli manage-php --action=install --php-version=8.4" "PHP 8.4" php84
+    local php84_result="$LAST_STEP_RESULT"
     if ((SKIP_APACHE)); then
         print_info "MyApache skipped (--skip-apache)"
     else
@@ -2244,7 +2498,17 @@ stage_configuration() {
     fi
     run_or_warn "bolt-cli manage-system-email-account --action=install" "System email" system_email
     run_or_warn "bolt-cli manage-dns-records-default-template --action=install" "DNS template" dns_template
-    run_or_warn "bolt-cli manage-php-default-profile --php-version=8.4 --action=install" "PHP 8.4 profile" php84_profile
+    if [[ "$php84_result" == deferred ]]; then
+        print_info "PHP 8.4 profile: deferred, applied when PHP 8.4 installs"
+        echo -e ""
+    elif [[ "$php84_result" == failed ]]; then
+        # The profile marks the version installed in the panel; without PHP
+        # 8.4 on the server that would be untrue.
+        print_info "PHP 8.4 profile: skipped, PHP 8.4 did not install"
+        echo -e ""
+    else
+        run_or_warn "bolt-cli manage-php-default-profile --php-version=8.4 --action=install" "PHP 8.4 profile" php84_profile
+    fi
     run_or_warn "bolt-cli manage-vsftpd-profiles --action=install" "Vsftpd profile" vsftpd_profile
     run_or_warn "bolt-cli manage-fail2ban-profiles --action=install" "Fail2Ban profile" fail2ban_profile
     run_or_warn "bolt-cli setup-cron-jobs" "Setup Cron jobs" cron_jobs
@@ -2319,10 +2583,34 @@ stage_configuration() {
         fi
     fi
     [ -n "${SSH_PASSWORD_NOTE}" ] && echo -e "\n${SSH_PASSWORD_NOTE}"
-    echo -e "\n${BOLD}${GREEN}+----------------------------------------------------------+${NC}"
-    echo -e "${BOLD}${GREEN}|          Installation Completed Successfully             |${NC}"
-    echo -e "${BOLD}${GREEN}+----------------------------------------------------------+${NC}\n"
-    [ -n "${ADMIN_EMAIL}" ] && [ "${TRIAL_LICENCE_OK}" -eq 0 ] && echo -e "${YELLOW}NOTE:${NC} Trial licence not issued (request refused or licence server unreachable). The installation itself succeeded and the panel is usable; activate a licence on its License page.\n"
+    echo -e ""
+    print_failure_summary
+    if [ "$CRITICAL_FAILED" -eq 1 ]; then
+        echo -e "${BOLD}${RED}+----------------------------------------------------------+${NC}"
+        echo -e "${BOLD}${RED}|  Installation Incomplete: critical components failed     |${NC}"
+        echo -e "${BOLD}${RED}+----------------------------------------------------------+${NC}\n"
+        echo -e "${RED}This server cannot host mail, databases or PHP sites until the CRITICAL steps above are fixed and installed again (bolt-cli manage-<component> --action=install).${NC}\n"
+    elif [ "${#FAILED_STEPS[@]}" -gt 0 ]; then
+        echo -e "${BOLD}${YELLOW}+----------------------------------------------------------+${NC}"
+        echo -e "${BOLD}${YELLOW}|          Installation Completed With Warnings            |${NC}"
+        echo -e "${BOLD}${YELLOW}+----------------------------------------------------------+${NC}\n"
+    elif [ "${#DEFERRED_STEPS[@]}" -gt 0 ]; then
+        echo -e "${BOLD}${GREEN}+----------------------------------------------------------+${NC}"
+        echo -e "${BOLD}${GREEN}|      Installation Completed: deferred parts follow       |${NC}"
+        echo -e "${BOLD}${GREEN}+----------------------------------------------------------+${NC}\n"
+    else
+        echo -e "${BOLD}${GREEN}+----------------------------------------------------------+${NC}"
+        echo -e "${BOLD}${GREEN}|          Installation Completed Successfully             |${NC}"
+        echo -e "${BOLD}${GREEN}+----------------------------------------------------------+${NC}\n"
+    fi
+    if [ -n "${ADMIN_EMAIL}" ] && [ "${TRIAL_LICENCE_OK}" -eq 0 ]; then
+        # QA finding 2: "the installation itself succeeded" only when it did.
+        if [ "$CRITICAL_FAILED" -eq 1 ]; then
+            echo -e "${YELLOW}NOTE:${NC} Trial licence not issued (request refused or licence server unreachable). Activate a licence on the panel's License page.\n"
+        else
+            echo -e "${YELLOW}NOTE:${NC} Trial licence not issued (request refused or licence server unreachable). The installation itself succeeded and the panel is usable; activate a licence on its License page.\n"
+        fi
+    fi
     print_left_out_components
     [ -n "${SSO_URL:-}" ] && echo -e "${BOLD}${CYAN}--- Access ---${NC}\n${GREEN}Admin Panel:${NC}\n${BOLD}${SSO_URL}${NC}\n"
     # AB-2069: nothing here used to say which login the panel takes, and the
@@ -2337,7 +2625,11 @@ stage_configuration() {
     echo -e "${GREEN}Reset the admin password:${NC}  ${BOLD}bolt-cli reset-admin-account-password${NC}"
     echo -e "${GREEN}Lift a Fail2Ban ban:${NC}       ${BOLD}bolt-cli fail2ban-unban <your-ip> --whitelist${NC}"
     print_progress "100% — post-install"
-    print_success "Stage 3 completed: all post-install actions done"
+    if [ "$CRITICAL_FAILED" -eq 1 ]; then
+        print_error "Stage 3 finished with failed critical components"
+    else
+        print_success "Stage 3 completed: all post-install actions done"
+    fi
 }
 
 # The MariaDB step of Stage 3, on a box without a database server.
@@ -2369,6 +2661,11 @@ stage_configuration_mariadb() {
             echo "$MARIADB_OUT"
             echo -e "${YELLOW}WARNING:${NC} MariaDB ${MARIADB_SERIES} failed (continuing)"
             report_step_result mariadb failed
+            local mariadb_out_file
+            mariadb_out_file=$(mktemp)
+            printf '%s\n' "$MARIADB_OUT" > "$mariadb_out_file"
+            record_failure "MariaDB ${MARIADB_SERIES}" "$mariadb_out_file"
+            rm -f "$mariadb_out_file"
         fi
         echo -e ""
     else
@@ -2883,6 +3180,11 @@ main() {
     time_total_end
     # Stage 4, for the install report only: prints nothing, changes nothing.
     report_readiness_check
+
+    # AB-1379: a failed critical component makes the whole install fail, after
+    # the summary and the access details have been printed.
+    [ "${CRITICAL_FAILED:-0}" -eq 1 ] && exit 1
+    return 0
 }
 
 # ADMINBOLT_INSTALL_SOURCE_ONLY=1 loads the functions without running the
