@@ -112,7 +112,7 @@ DEFERRED_STEPS=()
 # CPANEL_CONVERSION is set by --cpanel-conversion (bolt-migrate passes it),
 # or found by itself: cPanel is installed and --skip-apache was given, which
 # every bolt-migrate conversion passes and nothing else needs on a cPanel
-# server (see cpanel_conversion_decide). Only then, and only while the cPanel
+# server (see in_cpanel_conversion). Only then, and only while the cPanel
 # package below is installed, does a failed step count as left to the
 # conversion instead of failed. "<step id> <cPanel package>" per entry.
 CPANEL_CONVERSION=0
