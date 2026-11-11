@@ -47,9 +47,15 @@ done <"$FAKE_DIR/fail"
 [[ "$1" == admin-sso-generate ]] && echo "https://203.0.113.5:8443/sso/token"
 exit 0
 EOF
-# rpm: nothing is installed. curl: every repository answers unless
+# rpm: nothing is installed, except the packages $FAKE_DIR/rpm-installed
+# lists (rpm -q <name>). curl: every repository answers unless
 # $FAKE_DIR/curl-down lists a pattern of its URL.
-printf '#!/usr/bin/env bash\nexit 1\n' >"$T/bin/rpm"
+cat >"$T/bin/rpm" <<'EOF'
+#!/usr/bin/env bash
+for a in "$@"; do pkg="$a"; done
+[[ -f "$FAKE_DIR/rpm-installed" ]] && grep -qxF -- "$pkg" "$FAKE_DIR/rpm-installed" && exit 0
+exit 1
+EOF
 cat >"$T/bin/curl" <<'EOF'
 #!/usr/bin/env bash
 for a in "$@"; do url="$a"; done
@@ -69,7 +75,10 @@ run_stage3() {
     local dir; dir=$(mktemp -d "$T/run.XXXX")
     printf '%b' "${1:-}" >"$dir/fail"
     printf '%b' "${2:-}" >"$dir/curl-down"
+    printf '%b' "${TEST_RPM_INSTALLED:-}" >"$dir/rpm-installed"
     : >"$dir/bolt-cli.log"
+    # AB-2480: TEST_CPANEL=1 puts cPanel on the fake server.
+    [[ "${TEST_CPANEL:-0}" == 1 ]] && : >"$dir/cpanel"
     (
         export FAKE_DIR="$dir" PATH="$T/bin:$PATH"
         # shellcheck source=../install.sh
@@ -84,12 +93,15 @@ run_stage3() {
         sleep() { :; }
         ADMIN_EMAIL="${TEST_EMAIL:-}"
         ROOT_MY_CNF="$dir/my.cnf" AGENT_CONF="$dir/agent.conf"
+        CPANEL_BINARY="$dir/cpanel"
+        SKIP_APACHE="${TEST_SKIP_APACHE:-0}" CPANEL_CONVERSION="${TEST_CPANEL_CONVERSION:-0}"
         stage_configuration >"$dir/out" 2>&1
         {
             echo "CRITICAL_FAILED=$CRITICAL_FAILED"
             echo "FAILED=${#FAILED_STEPS[@]}"
             echo "DEFERRED=${DEFERRED_STEPS[*]:-}"
             echo "REPORT_FAILED_OPTIONAL=${REPORT_FAILED_OPTIONAL:-}"
+            echo "CONVERSION=${#CONVERSION_STEPS[@]}"
         } >"$dir/vars"
     )
     echo "$dir"
@@ -251,6 +263,71 @@ r=$(selinux disabled nostore no); eq "SELINUX=disabled needs no store" "0" "${r%
 r=$(selinux enforcing none yes); eq "without semanage, the store directory is enough" "0" "${r%%:*}"
 r=$(selinux enforcing none no); eq "without semanage and without the store, refused" "1" "${r%%:*}"
 hasnt "the kernel command line is not read" "selinux=0" "$(sed -n '/^check_selinux_state() {/,/^}/p' "$INSTALL_SH" | grep -v '^\s*#')"
+
+# ---------------------------------------------------------------- AB-2480
+# bolt-migrate converts a live cPanel server in place by running this
+# installer next to cPanel, whose packages still own mail and DNS. The dnf
+# errors are the ones of the AB-2338 live run.
+conv_fail='manage-powerdns --action=install\tProblem: package cpanel-pdns-5.1.5-1.cp138~el9.x86_64 from @System conflicts with pdns provided by pdns-5.0.8-1pdns.el9.x86_64\n'
+conv_fail+='manage-postfix --action=install\t- installed package cpanel-exim-4.100.1-1.cp130~el9.x86_64 obsoletes postfix provided by postfix-2:3.5.25-3.el9_8.x86_64 from appstream\n'
+conv_fail+='manage-dovecot --action=install\tfile /etc/dovecot/dovecot.conf from install of dovecot-1:2.3.16-18.el9_8.8.x86_64 conflicts with file from package cpanel-dovecot-2.4.5-1.cp132~el9.x86_64\n'
+conv_fail+='manage-postfix-profiles --action=install\tFailed to apply Postfix default settings: postfix: command not found\n'
+cpanel_pkgs='cpanel-pdns\ncpanel-exim\ncpanel-dovecot\n'
+
+echo "# a conversion of a live cPanel server (cPanel installed, --skip-apache as every bolt-migrate passes)"
+d=$(TEST_CPANEL=1 TEST_SKIP_APACHE=1 TEST_RPM_INSTALLED="$cpanel_pkgs" run_stage3 "$conv_fail")
+out=$(strip <"$d/out")
+vars=$(cat "$d/vars")
+has "Postfix is left to the conversion" "CONVERSION  Postfix: cPanel's cpanel-exim still owns it, installed at the cutover" "$out"
+has "Dovecot is left to the conversion" "CONVERSION  Dovecot: cPanel's cpanel-dovecot still owns it, installed at the cutover" "$out"
+has "PowerDNS is left to the conversion" "CONVERSION  PowerDNS: cPanel's cpanel-pdns still owns it, installed at the cutover" "$out"
+has "the Postfix profiles follow Postfix" "CONVERSION  Postfix profiles: cPanel's cpanel-exim still owns it" "$out"
+has "each step says so as it happens" "NOTE: Postfix is not installed now: cPanel's cpanel-exim still owns it on this server." "$out"
+has "the summary names the section" "Left to the conversion: cPanel still owns them (4)" "$out"
+has "the install completes" "Installation Completed: mail and DNS follow at cutover" "$out"
+hasnt "nothing is critical" "CRITICAL" "$out"
+hasnt "nothing is listed as failed" "Failed steps" "$out"
+has "exit status 0" "CRITICAL_FAILED=0" "$vars"
+has "no failed step" "FAILED=0" "$vars"
+has "four steps left to the conversion" "CONVERSION=4" "$vars"
+has "reported as optional failures" "REPORT_FAILED_OPTIONAL=powerdns postfix dovecot postfix_profiles" "$vars"
+has "the Stage 3 line says it completed" "Stage 3 completed: all post-install actions done" "$out"
+
+echo "# the same with --cpanel-conversion (bolt-migrate with AB-2480 passes it)"
+d=$(TEST_CPANEL=1 TEST_CPANEL_CONVERSION=1 TEST_RPM_INSTALLED="$cpanel_pkgs" run_stage3 "$conv_fail")
+has "Postfix is left to the conversion" "CONVERSION  Postfix: cPanel's cpanel-exim" "$(strip <"$d/out")"
+has "exit status 0" "CRITICAL_FAILED=0" "$(cat "$d/vars")"
+
+echo "# a fresh install without cPanel: a failed Postfix still fails the install (AB-1379)"
+d=$(TEST_SKIP_APACHE=1 run_stage3 "$conv_fail")
+out=$(strip <"$d/out")
+has "Postfix is critical" "CRITICAL Postfix: - installed package cpanel-exim" "$out"
+has "Dovecot is critical" "CRITICAL Dovecot:" "$out"
+has "the install is incomplete" "Installation Incomplete: critical components failed" "$out"
+hasnt "nothing is left to a conversion" "CONVERSION" "$out"
+has "exit status 1" "CRITICAL_FAILED=1" "$(cat "$d/vars")"
+d=$(TEST_CPANEL_CONVERSION=1 run_stage3 'manage-postfix --action=install\tError: Unable to find a match: postfix\n')
+has "--cpanel-conversion on a server without cPanel's packages changes nothing" "CRITICAL Postfix: Error: Unable to find a match: postfix" "$(strip <"$d/out")"
+has "exit status 1" "CRITICAL_FAILED=1" "$(cat "$d/vars")"
+
+echo "# a conversion where cPanel does not own the failed component"
+d=$(TEST_CPANEL=1 TEST_SKIP_APACHE=1 TEST_RPM_INSTALLED='cpanel-pdns\ncpanel-dovecot\n' run_stage3 'manage-postfix --action=install\tError: Unable to find a match: postfix\n')
+has "Postfix is critical without cpanel-exim" "CRITICAL Postfix: Error: Unable to find a match: postfix" "$(strip <"$d/out")"
+has "exit status 1" "CRITICAL_FAILED=1" "$(cat "$d/vars")"
+
+echo "# cPanel installed but no conversion (no --skip-apache, no --cpanel-conversion)"
+d=$(TEST_CPANEL=1 TEST_RPM_INSTALLED="$cpanel_pkgs" run_stage3 "$conv_fail")
+has "Postfix stays critical" "CRITICAL Postfix" "$(strip <"$d/out")"
+has "exit status 1" "CRITICAL_FAILED=1" "$(cat "$d/vars")"
+
+echo "# a conversion where a component cPanel does not own fails"
+d=$(TEST_CPANEL=1 TEST_SKIP_APACHE=1 TEST_RPM_INSTALLED="$cpanel_pkgs" run_stage3 "${conv_fail}manage-php --action=install --php-version=8.4\tError: Unable to find a match: php84-php-fpm\nmanage-redis --action=install\tredis: failed to start\n")
+out=$(strip <"$d/out")
+has "PHP 8.4 stays critical" "CRITICAL PHP 8.4: Error: Unable to find a match: php84-php-fpm" "$out"
+has "Redis stays a warning" "WARNING  Redis: redis: failed to start" "$out"
+has "Postfix is still left to the conversion" "CONVERSION  Postfix:" "$out"
+has "the install is incomplete" "Installation Incomplete: critical components failed" "$out"
+has "exit status 1" "CRITICAL_FAILED=1" "$(cat "$d/vars")"
 
 echo "# $PASS passed, $FAIL failed"
 ((FAIL == 0))

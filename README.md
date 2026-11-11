@@ -51,6 +51,7 @@ sudo ./install.sh --mariadb-version=10.11
 | `sudo ./install.sh --without=<mail,dns,ftp>` | Leave optional components out, for servers with little memory (see [Optional components](#optional-components)) |
 | `sudo ./install.sh --skip-database` | Run no database step: no MariaDB package, series, root password reset or MariaDB profile. The panel uses the database server already on this server (see below) |
 | `sudo ./install.sh --skip-apache` | Run no Apache step (`manage-my-apache` and the default Apache profile); the web server is then set up by whoever runs the installer |
+| `sudo ./install.sh --cpanel-conversion` | Passed by bolt-migrate when it converts a live cPanel server in place: the mail and DNS steps that cPanel's packages still own are left to the conversion instead of failing the install (see [How the install ends](#how-the-install-ends)) |
 | `sudo ./install.sh --agent-version=<version-release>` | Install exactly this bolt-agent build (for example `1.30.4-1.el9`) instead of the latest |
 | `sudo ./install.sh --package=<bolt-name>=<version-release>` | Install exactly this build of another `bolt-*` package (for example `--package=bolt-php=8.4.14-1.el9`); repeatable, one package per option |
 | `sudo ./install.sh --channel=<name>` | Name what started the install (`direct` by default; `get-script`, `web-installer`, `vultr`, `akamai`, `node`, `image-build`, `test`, `hostinger`, `digitalocean`, `aws`, `azure`); any other value prints a warning and the install is reported as `direct` |
@@ -100,6 +101,7 @@ The end of the install lists every step that failed, with the line of its output
 
 - MariaDB, Postfix, Dovecot or PHP 8.4 failed (critical components): `Installation Incomplete`, exit status 1.
 - Only other steps failed: `Installation Completed With Warnings`, exit status 0.
+- In-place conversion of a live cPanel server by bolt-migrate (`--cpanel-conversion`, or cPanel installed and `--skip-apache` given): PowerDNS, Postfix and Dovecot, and the Postfix and Dovecot profiles, cannot install while cPanel's `cpanel-pdns`, `cpanel-exim` and `cpanel-dovecot` own them. They are listed as `CONVERSION` under `Left to the conversion`, not failed, and the install ends with `Installation Completed: mail and DNS follow at cutover`, exit status 0; bolt-migrate installs them at the cutover, after it stops cPanel's services. Without cPanel's package installed the step is a failure like on any other server.
 - The install stopped early (a Stage 2 package, bolt-agent, bolt-panel, connecting the agent to the panel): the step that stopped it and the steps that failed before it, then `Installation stopped early`.
 
 Stage 1 checks that the external package repositories answer (Remi for PHP, EPEL, MariaDB) and says which do not; that never stops the install. PHP 8.4 comes from Remi: while Remi cannot be reached it is listed as `DEFERRED`, not failed, and the install ends with exit status 0. The panel installs it (and its default profile) on its own as soon as Remi answers again: its dashboard shows PHP 8.4 waiting for the Remi repository, tries again every few minutes and offers `Try now`.
