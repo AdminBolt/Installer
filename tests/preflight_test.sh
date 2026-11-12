@@ -240,11 +240,11 @@ has "lists the SELinux change" "  - SELinux: enforcement is switched off now" "$
 has "lists the policy drop firewall tables" 'the nftables tables "ip filter" and "ip6 filter" are replaced by AdminBolt'"'"'s, whose INPUT and forward chains have policy drop' "$OUT"
 has "lists the configuration files written over" "/etc/postfix/main.cf and master.cf" "$OUT"
 has "lists what happens to MariaDB" "MariaDB from mariadb.org is installed, its root password is set" "$OUT"
+has "names the flag" "rerun with --force-existing-server" "$OUT"
 run 'SKIP_DATABASE=1; DATABASE_SKIP_REASON="package MariaDB-server is installed"; SKIP_APACHE=1; existing_server_changes'
 has "database skipped (AB-2331): the database server is kept" "the database server already here is kept as it is (package MariaDB-server is installed)" "$OUT"
 hasnt "database skipped: no MariaDB install or password reset listed" "its root password is set" "$OUT"
 hasnt "--skip-apache: httpd.conf not listed as written over" "/etc/httpd/conf/httpd.conf" "$OUT"
-has "names the flag" "rerun with --force-existing-server" "$OUT"
 
 in_use selinux_off
 echo Disabled >"$S/fake/selinux"
