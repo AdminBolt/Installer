@@ -1429,8 +1429,8 @@ report_stage_begin packages
 run_or_warn true "Installing bolt-panel" web_services_enable
 report_stage_begin configuration
 run_or_warn false "Installing PowerDNS" powerdns
-run_or_warn false "Installing Postfix" postfix
-run_or_warn false "Installing Dovecot" dovecot
+run_or_warn "${POSTFIX_CMD:-false}" "Installing Postfix" postfix
+run_or_warn "${DOVECOT_CMD:-false}" "Installing Dovecot" dovecot
 run_or_warn "${REDIS_CMD:-true}" "Installing Redis" redis
 run_or_warn false "Applying Postfix profiles" postfix_profiles
 run_or_warn true "Applying Dovecot profiles" dovecot_profiles
@@ -1442,7 +1442,7 @@ convert_child() { # $1 name, $2 lines before report_init, $3 steps (default CONV
     new_child "$1" "$2
 report_init
 ${3:-$CONVERT_STEPS}"
-    printf 'cpanel-pdns\ncpanel-exim\ncpanel-dovecot\n' >"$CHILD_DIR/fake/rpm_installed"
+    printf '%s\n' ${CONV_RPMS:-cpanel-pdns cpanel-exim cpanel-dovecot} >"$CHILD_DIR/fake/rpm_installed"
     printf 'postfix\ndovecot\n%s\n' "${4:-}" >"$CHILD_DIR/fake/inactive"
     : >"$CHILD_DIR/cpanel"
     run_child
@@ -1488,6 +1488,24 @@ eq "cPanel + --skip-apache, no --channel: channel convert" convert "$(field "$(e
 eq "cPanel + --skip-apache: cutover steps, succeeded" "succeeded powerdns,postfix,dovecot,postfix_profiles" "$(field "$(event install_finished)" .result) $(field "$(event install_finished)" .cutover_steps)"
 convert_child conv_named 'SKIP_APACHE=1; CPANEL_BINARY="$PWD/cpanel"; REPORT_CHANNEL_ARG=test; REPORT_CHANNEL_GIVEN=1'
 eq "a conversion keeps a channel the caller names" test "$(field "$(event install_started)" .channel)"
+convert_child conv_typo 'SKIP_APACHE=1; CPANEL_BINARY="$PWD/cpanel"; REPORT_CHANNEL_ARG=tset; REPORT_CHANNEL_GIVEN=1'
+eq "a conversion with a mistyped --channel is reported as direct, as the warning says" direct "$(field "$(event install_started)" .channel)"
+convert_child conv_empty 'SKIP_APACHE=1; CPANEL_BINARY="$PWD/cpanel"; REPORT_CHANNEL_ARG=; REPORT_CHANNEL_GIVEN=1'
+eq "a conversion with an empty --channel= is reported as direct" direct "$(field "$(event install_started)" .channel)"
+
+# Only the service whose own step was left to the cutover is left out of the
+# readiness check. cPanel without cpanel-dovecot: AdminBolt's Dovecot installs,
+# so a Dovecot that does not run is a failure the check must still see.
+CONV_RPMS="cpanel-pdns cpanel-exim" convert_child conv_part 'CPANEL_CONVERSION=1; CPANEL_BINARY="$PWD/cpanel"; REPORT_CHANNEL_ARG=convert; REPORT_CHANNEL_GIVEN=1; DOVECOT_CMD=true'
+fin=$(event install_finished)
+eq "only PowerDNS and Postfix left to the cutover: Dovecot still checked" "is-active bolt-agent bolt-nginx bolt-php dovecot mariadb mysqld mysql" "$(grep '^is-active' "$CHILD_DIR/fake/systemctl.log")"
+eq "only PowerDNS and Postfix left to the cutover, Dovecot down: readiness failed" "failed readiness readiness_check_failed" "$(field "$fin" .result) $(field "$fin" .failed_step) $(field "$fin" .reason)"
+eq "only PowerDNS and Postfix left to the cutover: cutover_steps without Dovecot" powerdns,postfix,postfix_profiles "$(field "$fin" .cutover_steps)"
+# A profile step left to the cutover does not take its service out of the check.
+convert_child conv_prof 'CPANEL_CONVERSION=1; CPANEL_BINARY="$PWD/cpanel"; REPORT_CHANNEL_ARG=convert; REPORT_CHANNEL_GIVEN=1; POSTFIX_CMD=true'
+fin=$(event install_finished)
+eq "Postfix installed, its profiles left to the cutover: Postfix still checked" "is-active bolt-agent bolt-nginx bolt-php postfix mariadb mysqld mysql" "$(grep '^is-active' "$CHILD_DIR/fake/systemctl.log")"
+eq "Postfix installed but down, its profiles left to the cutover: readiness failed" "failed readiness powerdns,dovecot,postfix_profiles" "$(field "$fin" .result) $(field "$fin" .failed_step) $(field "$fin" .cutover_steps)"
 
 # No cPanel package, or no conversion: a failure stays a failure (AB-1379),
 # and the field is not sent.
