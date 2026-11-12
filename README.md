@@ -4,6 +4,7 @@
 
 - **AlmaLinux 9**, **Rocky Linux 9** or **CloudLinux 9**
 - Root access (run with `sudo`)
+- A **fresh** server: the installer sets up its own web, mail, DNS, database and firewall stack (see [Servers already in use](#servers-already-in-use))
 
 ## Installation
 
@@ -54,6 +55,7 @@ sudo ./install.sh --mariadb-version=10.11
 | `sudo ./install.sh --agent-version=<version-release>` | Install exactly this bolt-agent build (for example `1.30.4-1.el9`) instead of the latest |
 | `sudo ./install.sh --package=<bolt-name>=<version-release>` | Install exactly this build of another `bolt-*` package (for example `--package=bolt-php=8.4.14-1.el9`); repeatable, one package per option |
 | `sudo ./install.sh --channel=<name>` | Name what started the install (`direct` by default; `get-script`, `web-installer`, `vultr`, `akamai`, `node`, `image-build`, `test`, `hostinger`, `digitalocean`, `aws`, `azure`); any other value prints a warning and the install is reported as `direct` |
+| `sudo ./install.sh --force-existing-server` | Install on a server that is already in use, after backing up its configuration (see [Servers already in use](#servers-already-in-use)) |
 | `sudo ./install.sh --no-telemetry` | Do not send the install report (same as `ADMINBOLT_NO_TELEMETRY=1`) |
 | `sudo ./install.sh --admin-username=<name\|random>` | Name the first panel administrator (default `admin`; `random` = `admin-` plus 6 random characters) |
 | `sudo ./install.sh --ssh-key="<public key>"` | Add an SSH key for root and turn SSH password login for root off once a sign-in with that key is seen (also `--ssh-key=https://...` for a URL that serves keys) |
@@ -98,7 +100,7 @@ Password login for root is turned off by `/etc/ssh/sshd_config.d/00-adminbolt-ss
 
 The installer runs in 3 stages:
 
-1. Check prerequisites (root, supported OS, required commands, port 8443 availability, an existing database server)
+1. Check prerequisites (root, supported OS, required commands, port 8443 availability, an existing database server, no existing web/mail/DNS setup or user data)
 2. Prepare system and install prerequisite/Bolt packages
 3. Run `bolt-cli` post-install actions and print access details
 
@@ -135,6 +137,26 @@ The panel shows every left-out service as not installed on Health > Services. In
 The panel reads `BOLT_INSTALL_WITHOUT` together with what is installed now, so a component counts as left out only until it is installed: Health raises no warning for its services and lists them on Health > Services, in grey, as not installed by choice; the client screens and Client API routes of the component (and its entries on the Feature List) are withheld, and the API answers `This feature is not installed on this server`; creating a mailbox or an FTP account is refused before anything is stored; new domains get no mail records (MX, SPF, DMARC, DKIM, mail service records, `mail`, `webmail`, `autoconfig`, `autodiscover`) while mail is left out, and no `ftp` name while FTP is. Once the commands above have run, all of it comes back on its own; the key needs no editing. Domains created in the meantime get their mail records when the DNS template is applied again in the panel. A hostname change still ends with a warning for the mail steps, and the firewall still opens the mail, DNS and FTP ports, with nothing listening on them.
 
 PHP 8.4, Apache, MariaDB, Redis, nftables and SSH are always installed: the panel and the hosting accounts need them. So is Fail2Ban, which protects SSH and the panel login. Antivirus (ImunifyAV, Imunify360, cPGuard) is never installed by the installer; it is a module added in the panel. Backup and the AI agent are not optional either, because leaving them out would save no memory: restic and rclone are two programs that run only while a backup runs, and the AI agent is part of the panel itself, with no service of its own on the server.
+
+## Servers already in use
+
+The installer is meant for a fresh AlmaLinux 9, Rocky Linux 9 or CloudLinux 9 server. It does not import existing sites, mailboxes or databases; to bring those over, install on a fresh server and use the panel's migration tools.
+
+Before it installs anything, the installer checks whether the server is already in use and stops if it finds any of:
+
+- an installed web, mail, DNS or database server package (`httpd`, `nginx`, `lighttpd`, `caddy`, `haproxy`, `postfix`, `sendmail`, `exim`, `dovecot`, `bind`, `pdns`, `vsftpd`, `redis`, `mariadb-server`, `MariaDB-server`, `mysql-server`, `community-mysql-server`, `mysql-community-server`, `percona-server-server`, `postgresql-server`) or such a service running;
+- something listening on a web, mail, FTP, DNS or database TCP port (21, 25, 53, 80, 110, 143, 443, 465, 587, 993, 995, 3306, 5432);
+- an nftables table not created by firewalld, or firewalld rules beyond an image's default zone (services other than `ssh`, `dhcpv6-client`, `cockpit`; open ports, sources, rich or direct rules) in the default zone or an active one;
+- a user with uid 1000 or above whose home holds files of their own, or anything else in `/home` that holds files;
+- files in `/var/www`, or database files in `/var/lib/mysql` or `/var/lib/pgsql/data`.
+
+A fresh cloud image passes: its firewalld default zone and its cloud user (whose home holds only the skeleton files, `~/.ssh` and tool caches) do not count, and neither does the installer itself when a sudo user downloads `install.sh` or clones this repository into their home. A server that already has AdminBolt (a reinstall, or a rerun after a failed install) is not checked, and nothing is backed up there.
+
+When it stops, it lists what it found and what the install would change: SELinux is switched off, firewalld is stopped and the nftables tables `ip filter` and `ip6 filter` are replaced by AdminBolt's, whose INPUT and forward chains drop everything but the panel's own ports, the main configuration files of Apache (not with `--skip-apache`), Postfix, Dovecot, PowerDNS, Redis, vsftpd, Fail2Ban and sshd are written over. A database server already on the server counts as in use too; with `--force-existing-server` it is kept as it is (see [Existing database server](#existing-database-server)), and the list says so. The refusal is reported as `check_existing_server` / `existing_server` in the install report.
+
+`--force-existing-server` installs anyway. Before anything is installed, `/etc`, `/var/spool/cron`, `/root/.my.cnf`, `/usr/bin/mlmmj-make-ml.sh` and `/var/www/html/index.html` / `index.php` are copied to `/root/adminbolt-preinstall-backup-<date>/` (root only), with the firewall's live ruleset (`nft-ruleset.nft`) and the SELinux mode; the install does not start if that copy fails. The copy needs `tar` and `gzip`; when one is missing (Hetzner's stock AlmaLinux and Rocky Linux 9 images have no `tar`), it is installed with dnf first, and the install stops if that fails. At the end the installer lists the backed-up files it changed or removed (`replaced-files.txt`). With the flag the backup is always taken, also when nothing was found. Site files and databases are not part of the backup, and nothing is restored automatically: restore single files from `files.tar.gz` as `README.txt` in that directory shows.
+
+Tests (no network, no root): `bash tests/preflight_test.sh`.
 
 ## Install report
 
