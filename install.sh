@@ -1388,7 +1388,7 @@ _backup_install_archivers() {
 # installed, with a checksum list that install_report_replaced_files compares
 # against at the end. The install does not start when the copy fails.
 backup_existing_configuration() {
-    local dir list path need avail rc umask_before
+    local dir present path need avail rc umask_before
     report_step_start preinstall_backup
     _backup_install_archivers
     dir="${BACKUP_PARENT}/adminbolt-preinstall-backup-$(date +%Y%m%d-%H%M%S)"
@@ -1398,33 +1398,33 @@ backup_existing_configuration() {
     if ! mkdir "$dir"; then
         _backup_abort "" "Cannot create ${dir} for the backup"
     fi
-    list=()
+    present=()
     for path in $BACKUP_PATHS; do
-        if [[ -e "$path" ]]; then list+=("$path"); fi
+        if [[ -e "$path" ]]; then present+=("$path"); fi
     done
-    need=$(du -sk "${list[@]}" 2>/dev/null | awk '{ s += $1 } END { print s + 0 }')
+    need=$(du -sk "${present[@]}" 2>/dev/null | awk '{ s += $1 } END { print s + 0 }')
     avail=$(df -Pk "$dir" 2>/dev/null | awk 'NR == 2 { print $4 + 0 }')
     if [[ -z "$avail" ]] || ((avail < need + 102400)); then
         _backup_abort "$dir" "Not enough free space in ${BACKUP_PARENT} for the backup (${need} KB needed, ${avail:-0} KB free, plus 100 MB to spare)"
     fi
     rc=0
     tar --create --gzip --file "$dir/files.tar.gz" --preserve-permissions --numeric-owner \
-        --xattrs --acls --selinux "${list[@]}" 2>"$dir/tar-warnings.log" || rc=$?
+        --xattrs --acls --selinux "${present[@]}" 2>"$dir/tar-warnings.log" || rc=$?
     # 1: a file changed while it was read; the archive is still complete.
     if ((rc > 1)); then
         _backup_abort "$dir" "The backup failed (tar exit ${rc}): $(tail -n 3 "$dir/tar-warnings.log" 2>/dev/null | tr '\n' ' ')"
     fi
-    find "${list[@]}" -type f -print0 2>/dev/null | xargs -0 -r sha256sum >"$dir/manifest.sha256" 2>/dev/null || true
+    find "${present[@]}" -type f -print0 2>/dev/null | xargs -0 -r sha256sum >"$dir/manifest.sha256" 2>/dev/null || true
     # Without the checksums the end of the install could not tell what it replaced.
     if [[ ! -s "$dir/manifest.sha256" ]]; then
-        _backup_abort "$dir" "The backup failed: no checksums could be taken of ${list[*]}"
+        _backup_abort "$dir" "The backup failed: no checksums could be taken of ${present[*]}"
     fi
     if command -v nft >/dev/null 2>&1; then nft list ruleset >"$dir/nft-ruleset.nft" 2>/dev/null || true; fi
     if command -v getenforce >/dev/null 2>&1; then getenforce >"$dir/selinux-mode.txt" 2>/dev/null || true; fi
     cat >"$dir/README.txt" <<NOTE
 Backup made by the AdminBolt installer before installing on a server that was already in use.
 
-files.tar.gz        ${list[*]}
+files.tar.gz        ${present[*]}
 manifest.sha256     sha256 of every file in files.tar.gz, as it was
 replaced-files.txt  files the install changed or removed (written at the end of the install)
 nft-ruleset.nft     the firewall's live ruleset (restore: nft -f nft-ruleset.nft)
