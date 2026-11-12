@@ -101,6 +101,7 @@ run_stage3() {
             echo "FAILED=${#FAILED_STEPS[@]}"
             echo "DEFERRED=${DEFERRED_STEPS[*]:-}"
             echo "REPORT_FAILED_OPTIONAL=${REPORT_FAILED_OPTIONAL:-}"
+            echo "REPORT_CUTOVER_STEPS=${REPORT_CUTOVER_STEPS:-}"
             echo "CONVERSION=${#CONVERSION_STEPS[@]}"
         } >"$dir/vars"
     )
@@ -290,7 +291,10 @@ hasnt "nothing is listed as failed" "Failed steps" "$out"
 has "exit status 0" "CRITICAL_FAILED=0" "$vars"
 has "no failed step" "FAILED=0" "$vars"
 has "four steps left to the conversion" "CONVERSION=4" "$vars"
-has "reported as optional failures" "REPORT_FAILED_OPTIONAL=powerdns postfix dovecot postfix_profiles" "$vars"
+# AB-2447: reported as left to the cutover, not as failed optional steps.
+has "reported as left to the cutover" "REPORT_CUTOVER_STEPS=powerdns postfix dovecot postfix_profiles" "$vars"
+has "not reported as optional failures" "REPORT_FAILED_OPTIONAL=" "$(grep '^REPORT_FAILED_OPTIONAL=' <<<"$vars")"
+hasnt "no step left to the cutover among the optional failures" "postfix" "$(grep '^REPORT_FAILED_OPTIONAL=' <<<"$vars")"
 has "the Stage 3 line says it completed" "Stage 3 completed: all post-install actions done" "$out"
 
 echo "# the same with --cpanel-conversion (bolt-migrate with AB-2480 passes it)"

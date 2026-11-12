@@ -136,7 +136,7 @@ fmt=""
 names=()
 while [[ $# -gt 0 ]]; do
     case "$1" in
-        -q) ;;
+        -q|--quiet) ;;
         --qf) fmt="$2"; shift ;;
         *) names+=("$1") ;;
     esac
@@ -147,7 +147,9 @@ for n in "${names[@]}"; do
     case "$n" in
         bolt-panel) v=1.9.3-1.el9 ;;
         bolt-agent) v=2.4.0-1.el9 ;;
-        *) echo "package $n is not installed"; rc=1; continue ;;
+        *)
+            # AB-2447: the cPanel packages a test puts on the server.
+            if grep -qx "$n" "$FAKE_DIR/rpm_installed" 2>/dev/null; then v=11.138-1.cp; else echo "package $n is not installed"; rc=1; continue; fi ;;
     esac
     if [[ "$fmt" == *NAME* ]]; then printf '%s %s\n' "$n" "$v"; else printf '%s' "$v"; fi
 done
@@ -1413,6 +1415,103 @@ exit 0'
 done
 
 # ---------------------------------------------------------------------------
+echo "# cPanel conversion: channel convert, steps left to the cutover (AB-2447)"
+# ---------------------------------------------------------------------------
+# bolt-migrate runs this installer next to a live cPanel. cPanel's packages
+# own mail and DNS there, so the PowerDNS, Postfix and Dovecot steps cannot
+# install (AB-2480 leaves them to the conversion). The report must not call
+# that a failure: before AB-2447 every conversion ended "failed" at the
+# readiness check (Postfix and Dovecot not running), with those steps as
+# failed optional steps, and the hub alerted "install failed" (attempts of
+# 2026-11-12 00:47 and 00:56 UTC, 1.9.6-pr1656.3345, CloudLinux 9.8).
+CONVERT_STEPS='
+report_stage_begin packages
+run_or_warn true "Installing bolt-panel" web_services_enable
+report_stage_begin configuration
+run_or_warn false "Installing PowerDNS" powerdns
+run_or_warn false "Installing Postfix" postfix
+run_or_warn false "Installing Dovecot" dovecot
+run_or_warn "${REDIS_CMD:-true}" "Installing Redis" redis
+run_or_warn false "Applying Postfix profiles" postfix_profiles
+run_or_warn true "Applying Dovecot profiles" dovecot_profiles
+report_stage_end
+report_readiness_check
+exit 0'
+# Postfix and Dovecot are not running (cPanel's Exim and Dovecot serve mail).
+convert_child() { # $1 name, $2 lines before report_init, $3 steps (default CONVERT_STEPS), $4 another stopped unit
+    new_child "$1" "$2
+report_init
+${3:-$CONVERT_STEPS}"
+    printf 'cpanel-pdns\ncpanel-exim\ncpanel-dovecot\n' >"$CHILD_DIR/fake/rpm_installed"
+    printf 'postfix\ndovecot\n%s\n' "${4:-}" >"$CHILD_DIR/fake/inactive"
+    : >"$CHILD_DIR/cpanel"
+    run_child
+}
+convert_child conv_flag 'CPANEL_CONVERSION=1; CPANEL_BINARY="$PWD/cpanel"; REPORT_CHANNEL_ARG=convert; REPORT_CHANNEL_GIVEN=1'
+st=$(event install_started); fin=$(event install_finished)
+eq "conversion (--channel=convert): channel convert" convert "$(field "$st" .channel)"
+eq "conversion: succeeded, no failed step, no reason, exit 0" "succeeded   0" "$(field "$fin" .result) $(field "$fin" .failed_step) $(field "$fin" .reason) $(field "$fin" .exit_code)"
+eq "conversion: the steps cPanel owns are cutover_steps" powerdns,postfix,dovecot,postfix_profiles "$(field "$fin" .cutover_steps)"
+eq "conversion: no failed optional step" "" "$(field "$fin" .failed_optional_steps)"
+eq "conversion: no failed required step (readiness included)" "" "$(field "$fin" .failed_required_steps)"
+eq "conversion: stages ok, readiness ok" "prerequisites:ok packages:ok configuration:ok readiness:ok" "$(spool_events | jq -r 'select(.type=="stage_finished") | "\(.stage):\(.result)"' | tr '\n' ' ' | sed 's/ $//')"
+ready=$(grep '^is-active' "$CHILD_DIR/fake/systemctl.log")
+eq "readiness asks bolt-agent, bolt-nginx, bolt-php and the database, not Postfix or Dovecot" "is-active bolt-agent bolt-nginx bolt-php mariadb mysqld mysql" "$ready"
+
+convert_child conv_nginx 'CPANEL_CONVERSION=1; CPANEL_BINARY="$PWD/cpanel"; REPORT_CHANNEL_ARG=convert; REPORT_CHANNEL_GIVEN=1' "" bolt-nginx
+fin=$(event install_finished)
+eq "conversion, bolt-nginx down: readiness failed" "failed readiness readiness_check_failed" "$(field "$fin" .result) $(field "$fin" .failed_step) $(field "$fin" .reason)"
+eq "conversion, bolt-nginx down: cutover steps still listed apart" powerdns,postfix,dovecot,postfix_profiles "$(field "$fin" .cutover_steps)"
+eq "conversion, bolt-nginx down: channel convert" convert "$(field "$(event install_started)" .channel)"
+
+convert_child conv_panel_down 'CPANEL_CONVERSION=1; CPANEL_BINARY="$PWD/cpanel"; REPORT_CHANNEL_ARG=convert; REPORT_CHANNEL_GIVEN=1; echo 000 >"$FAKE_DIR/panel_code"'
+eq "conversion, panel not answering on 8443: readiness_check_failed" "failed readiness_check_failed" "$(field "$(event install_finished)" .result) $(field "$(event install_finished)" .reason)"
+
+convert_child conv_panel_pkg 'CPANEL_CONVERSION=1; CPANEL_BINARY="$PWD/cpanel"; REPORT_CHANNEL_ARG=convert; REPORT_CHANNEL_GIVEN=1' '
+report_stage_begin packages
+install_packages() { echo "Error: nothing provides bolt-php"; exit 1; }
+install_bolt_panel_and_check_post bolt-panel
+echo NOT-REACHED'
+fin=$(event install_finished)
+eq "conversion, bolt-panel package fails: failed panel_install package_install_failed, exit 1" "failed panel_install package_install_failed 1" "$(field "$fin" .result) $(field "$fin" .failed_step) $(field "$fin" .reason) $(field "$fin" .exit_code)"
+eq "conversion, bolt-panel package fails: channel convert" convert "$(field "$(event install_started)" .channel)"
+
+convert_child conv_redis 'CPANEL_CONVERSION=1; CPANEL_BINARY="$PWD/cpanel"; REPORT_CHANNEL_ARG=convert; REPORT_CHANNEL_GIVEN=1; REDIS_CMD=false'
+fin=$(event install_finished)
+eq "conversion, Redis fails as well: failed redis required_step_failed" "failed redis required_step_failed" "$(field "$fin" .result) $(field "$fin" .failed_step) $(field "$fin" .reason)"
+eq "conversion, Redis fails as well: only Redis is a failed required step" redis "$(field "$fin" .failed_required_steps)"
+
+# Recognised without the flag (cPanel + --skip-apache, what the released
+# bolt-migrate passes): reported as convert unless the caller names a channel.
+convert_child conv_skip 'SKIP_APACHE=1; CPANEL_BINARY="$PWD/cpanel"'
+eq "cPanel + --skip-apache, no --channel: channel convert" convert "$(field "$(event install_started)" .channel)"
+eq "cPanel + --skip-apache: cutover steps, succeeded" "succeeded powerdns,postfix,dovecot,postfix_profiles" "$(field "$(event install_finished)" .result) $(field "$(event install_finished)" .cutover_steps)"
+convert_child conv_named 'SKIP_APACHE=1; CPANEL_BINARY="$PWD/cpanel"; REPORT_CHANNEL_ARG=test; REPORT_CHANNEL_GIVEN=1'
+eq "a conversion keeps a channel the caller names" test "$(field "$(event install_started)" .channel)"
+
+# No cPanel package, or no conversion: a failure stays a failure (AB-1379),
+# and the field is not sent.
+convert_child conv_nopkg 'CPANEL_CONVERSION=1; CPANEL_BINARY="$PWD/cpanel"; REPORT_CHANNEL_ARG=convert; REPORT_CHANNEL_GIVEN=1; rm -f "$FAKE_DIR/rpm_installed"; : >"$FAKE_DIR/rpm_installed"'
+fin=$(event install_finished)
+eq "conversion without cPanel's packages: PowerDNS, Postfix and Dovecot fail as on any server" "failed powerdns required_step_failed" "$(field "$fin" .result) $(field "$fin" .failed_step) $(field "$fin" .reason)"
+eq "conversion without cPanel's packages: no cutover_steps sent" false "$(jq 'has("cutover_steps")' <<<"$fin")"
+convert_child fresh_postfix 'CPANEL_BINARY="$PWD/no-cpanel"'
+st=$(event install_started); fin=$(event install_finished)
+eq "fresh install: channel direct" direct "$(field "$st" .channel)"
+eq "fresh install, Postfix fails: failed, readiness asks Postfix and Dovecot" "failed powerdns,postfix,dovecot,readiness is-active bolt-agent bolt-nginx bolt-php postfix dovecot mariadb mysqld mysql" \
+    "$(field "$fin" .result) $(field "$fin" .failed_required_steps) $(grep '^is-active' "$CHILD_DIR/fake/systemctl.log")"
+eq "fresh install: no cutover_steps sent" false "$(jq 'has("cutover_steps")' <<<"$fin")"
+
+# Through the real argument parser.
+child conv_main "CPANEL_BINARY=\"\$PWD/cpanel\"; : >\"\$PWD/cpanel\"; stage_prerequisites() { echo REACHED-STAGE1; exit 0; }
+main --skip-database --skip-apache --cpanel-conversion --channel=convert"
+eq "--channel=convert is known: no warning, reported as convert" "0 convert 0" "$CHILD_RC $(field "$(event install_started)" .channel) $(grep -c 'unknown --channel=' "$CHILD_DIR/out")"
+child conv_main_old "CPANEL_BINARY=\"\$PWD/cpanel\"; : >\"\$PWD/cpanel\"; stage_prerequisites() { echo REACHED-STAGE1; exit 0; }
+main --auto-upgrade=1 --skip-database --skip-apache"
+eq "a released bolt-migrate's arguments on cPanel: reported as convert" convert "$(field "$(event install_started)" .channel)"
+check "--help lists convert among the channels" grep -q 'azure, convert); default direct' <<<"$( { cat "$INSTALL_SH"; } | PATH="$FAKEPATH" "$BASH" -s -- --help 2>&1)"
+
+# ---------------------------------------------------------------------------
 echo "# every event of every run above against the KONTRAKT field rules"
 # ---------------------------------------------------------------------------
 SCHEMA='
@@ -1425,7 +1524,7 @@ def common: (keys - ["schema","install_id","event_id","type","sent_at"]) as $res
 common and (
   if .type == "install_started" then
     (keys | sort) == (["schema","install_id","event_id","type","sent_at","channel","platform","installer_rev","os_name","os_version","arch","requested_version","source","telemetry_notice"] | sort)
-    and (.channel | IN("direct","get-script","web-installer","vultr","akamai","node","image-build","test","hostinger","digitalocean","aws","azure"))
+    and (.channel | IN("direct","get-script","web-installer","vultr","akamai","node","image-build","test","hostinger","digitalocean","aws","azure","convert"))
     and (.platform | IN("hetzner","vultr","akamai","digitalocean","aws","azure","gcp","ovh","contabo","kvm","vmware","other","unknown"))
     and (.installer_rev | re("^[0-9a-f]{64}$")) and (.os_name | re("^[a-z0-9._-]{1,32}$")) and (.os_version | re("^[0-9A-Za-z._-]{1,16}$"))
     and (.arch | IN("x86_64","aarch64","other")) and (.requested_version | re("^[0-9A-Za-z.+~_-]{0,40}$"))
@@ -1435,7 +1534,8 @@ common and (
     and (.stage | IN("prerequisites","packages","configuration","readiness")) and (.duration_s | int(0; 86400))
     and (.result | IN("ok","warnings","failed"))
   elif .type == "install_finished" then
-    (keys | sort) == (["schema","install_id","event_id","type","sent_at","result","failed_step","reason","exit_code","signal","failed_optional_steps","failed_required_steps","panel_version","agent_version","trial_licence","duration_s"] | sort)
+    (keys - ["cutover_steps"] | sort) == (["schema","install_id","event_id","type","sent_at","result","failed_step","reason","exit_code","signal","failed_optional_steps","failed_required_steps","panel_version","agent_version","trial_licence","duration_s"] | sort)
+    and (if has("cutover_steps") then (.cutover_steps | steps) and (.cutover_steps | length > 0) else true end)
     and (.result | IN("succeeded","succeeded_with_warnings","failed","cancelled"))
     and (.failed_step | re("^[a-z0-9_-]{0,48}$"))
     and (.reason | IN("","not_root","unsupported_os","invalid_argument","missing_command","port_in_use","repo_download_failed","package_install_failed","agent_install_failed","panel_scriptlet_failed","agent_panel_connect_failed","required_step_failed","readiness_check_failed","interrupted","unclassified"))

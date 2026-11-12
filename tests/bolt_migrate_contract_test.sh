@@ -13,7 +13,9 @@
 #   - the closing summary keeps the lines bolt-migrate reads when the
 #     installer exits non-zero (AB-2480): "CRITICAL <step>: <reason>",
 #     "CONVERSION  <step>: <why>", "STOPPED" and "Stage 3 finished with
-#     failed critical components", and --cpanel-conversion is parsed.
+#     failed critical components", and --cpanel-conversion is parsed;
+#   - the report channel convert is in REPORT_CHANNELS (AB-2447): bolt-migrate
+#     passes --channel=convert only to an installer whose line lists it.
 # Renaming or removing any of these needs a matching bolt-migrate release
 # first. bolt-migrate also checks the published installer every day
 # (bolt-migrate .github/workflows/installer-compat.yml).
@@ -57,6 +59,10 @@ done
 for owned in 'postfix cpanel-exim' 'dovecot cpanel-dovecot' 'powerdns cpanel-pdns'; do
     if grep -qF -- "\"$owned\"" "$INSTALL_SH"; then ok "conversion leaves $owned to the cutover"; else nok "conversion leaves $owned to the cutover (bolt-migrate expects it)"; fi
 done
+
+# AB-2447: bolt-migrate (internal/install) reads this line to decide whether
+# it passes --channel=convert.
+if grep -qE '^REPORT_CHANNELS="([^"]* )?convert( [^"]*)?"$' "$INSTALL_SH"; then ok "REPORT_CHANNELS lists convert"; else nok "REPORT_CHANNELS lists convert (bolt-migrate passes --channel=convert)"; fi
 
 echo "# passed: $PASS, failed: $FAIL"
 [[ $FAIL -eq 0 ]]

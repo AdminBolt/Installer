@@ -54,7 +54,7 @@ sudo ./install.sh --mariadb-version=10.11
 | `sudo ./install.sh --cpanel-conversion` | Passed by bolt-migrate when it converts a live cPanel server in place: the mail and DNS steps that cPanel's packages still own are left to the conversion instead of failing the install (see [How the install ends](#how-the-install-ends)) |
 | `sudo ./install.sh --agent-version=<version-release>` | Install exactly this bolt-agent build (for example `1.30.4-1.el9`) instead of the latest |
 | `sudo ./install.sh --package=<bolt-name>=<version-release>` | Install exactly this build of another `bolt-*` package (for example `--package=bolt-php=8.4.14-1.el9`); repeatable, one package per option |
-| `sudo ./install.sh --channel=<name>` | Name what started the install (`direct` by default; `get-script`, `web-installer`, `vultr`, `akamai`, `node`, `image-build`, `test`, `hostinger`, `digitalocean`, `aws`, `azure`); any other value prints a warning and the install is reported as `direct` |
+| `sudo ./install.sh --channel=<name>` | Name what started the install (`direct` by default; `get-script`, `web-installer`, `vultr`, `akamai`, `node`, `image-build`, `test`, `hostinger`, `digitalocean`, `aws`, `azure`, `convert`); any other value prints a warning and the install is reported as `direct` |
 | `sudo ./install.sh --no-telemetry` | Do not send the install report (same as `ADMINBOLT_NO_TELEMETRY=1`) |
 | `sudo ./install.sh --admin-username=<name\|random>` | Name the first panel administrator (default `admin`; `random` = `admin-` plus 6 random characters) |
 | `sudo ./install.sh --ssh-key="<public key>"` | Add an SSH key for root and turn SSH password login for root off once a sign-in with that key is seen (also `--ssh-key=https://...` for a URL that serves keys) |
@@ -156,7 +156,9 @@ Every run reports its progress and result to `https://ai-hub.adminbolt.com/insta
 
 - `install_started`: random install ID, channel, cloud platform (from DMI, mapped to a fixed list), OS name and version, architecture, requested bolt-panel version, package source, and the SHA-256 of the running `install.sh`;
 - `stage_finished`: stage, duration, result;
-- `install_finished`: result (`succeeded`, `succeeded_with_warnings`, `failed`, `cancelled`), the failed step and its reason code, exit code, signal, failed optional and required steps, installed bolt-panel and bolt-agent versions, trial licence result, total duration.
+- `install_finished`: result (`succeeded`, `succeeded_with_warnings`, `failed`, `cancelled`), the failed step and its reason code, exit code, signal, failed optional and required steps, installed bolt-panel and bolt-agent versions, trial licence result, total duration; in a cPanel conversion also `cutover_steps`, the steps left to the cutover.
+
+A cPanel conversion (`--cpanel-conversion`, or cPanel installed and `--skip-apache` given) is reported with the channel `convert` when the caller names no other channel; bolt-migrate passes `--channel=convert`. The steps it leaves to the cutover (PowerDNS, Postfix, Dovecot and their profiles while cPanel's packages own them) are listed as `cutover_steps`, not as failed steps, and the readiness check does not wait for Postfix or Dovecot when their step is among them; it still checks bolt-agent, bolt-nginx, bolt-php, the database server and the panel on port 8443. Such an install ends `succeeded` (or `succeeded_with_warnings` for another optional step); any other failure is reported as failed, as on any other server.
 
 No hostname, e-mail address, password, licence key or command output is sent. Sending never changes the install: errors are ignored, intermediate events go out in the background, and only the final event waits (at most 5 seconds).
 

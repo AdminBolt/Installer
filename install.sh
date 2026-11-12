@@ -252,6 +252,9 @@ REPORT_FAILED_STEP=""
 REPORT_REASON=""
 REPORT_FAILED_REQUIRED=""
 REPORT_FAILED_OPTIONAL=""
+# AB-2447: steps a cPanel conversion leaves to the cutover (report_step_cutover):
+# neither failed nor warnings, sent as cutover_steps.
+REPORT_CUTOVER_STEPS=""
 REPORT_SIGNAL=""
 REPORT_SUPPRESS=0
 REPORT_TRIAL=""
@@ -260,7 +263,8 @@ REPORT_READINESS=""
 REPORT_REPO_UNREACHABLE=0
 INSTALL_MARKER_CREATED=0
 
-REPORT_CHANNELS="direct get-script web-installer vultr akamai node image-build test hostinger digitalocean aws azure"
+# convert: bolt-migrate's in-place conversion of a cPanel server (AB-2447).
+REPORT_CHANNELS="direct get-script web-installer vultr akamai node image-build test hostinger digitalocean aws azure convert"
 REPORT_REASONS="not_root unsupported_os invalid_argument missing_command port_in_use repo_download_failed package_install_failed agent_install_failed panel_scriptlet_failed agent_panel_connect_failed required_step_failed readiness_check_failed interrupted unclassified"
 
 # Prints the class of one install step id for the report: required (its failure
@@ -792,9 +796,13 @@ _report_finish() {
     _report_pkg_versions
     local duration=$(($(date +%s) - REPORT_START))
     ((duration >= 0 && duration <= 86400)) || duration=0
-    local trial
+    local trial cutover=""
     trial=$(_report_clean "$REPORT_TRIAL" '^(ok|failed|skipped)$' "")
-    _report_emit install_finished "\"result\":$(_report_json_str "$result"),\"failed_step\":$(_report_json_str "$failed_step"),\"reason\":$(_report_json_str "$reason"),\"exit_code\":${rc},\"signal\":$(_report_json_str "$sig"),\"failed_optional_steps\":$(_report_json_steps "$REPORT_FAILED_OPTIONAL"),\"failed_required_steps\":$(_report_json_steps "$REPORT_FAILED_REQUIRED"),\"panel_version\":$(_report_json_str "$REPORT_PANEL_VERSION"),\"agent_version\":$(_report_json_str "$REPORT_AGENT_VERSION"),\"trial_licence\":$(_report_json_str "$trial"),\"duration_s\":${duration}" final
+    # AB-2447: only a conversion that left steps to the cutover sends the field.
+    if [[ -n "$REPORT_CUTOVER_STEPS" ]]; then
+        cutover=",\"cutover_steps\":$(_report_json_steps "$REPORT_CUTOVER_STEPS")"
+    fi
+    _report_emit install_finished "\"result\":$(_report_json_str "$result"),\"failed_step\":$(_report_json_str "$failed_step"),\"reason\":$(_report_json_str "$reason"),\"exit_code\":${rc},\"signal\":$(_report_json_str "$sig"),\"failed_optional_steps\":$(_report_json_steps "$REPORT_FAILED_OPTIONAL"),\"failed_required_steps\":$(_report_json_steps "$REPORT_FAILED_REQUIRED")${cutover},\"panel_version\":$(_report_json_str "$REPORT_PANEL_VERSION"),\"agent_version\":$(_report_json_str "$REPORT_AGENT_VERSION"),\"trial_licence\":$(_report_json_str "$trial"),\"duration_s\":${duration}" final
     _report_spool_mark_finished
     REPORT_SPENT_MS=$((REPORT_SPENT_MS + $(_report_now_ms) - REPORT_FINISH_START))
     _report_flush
@@ -955,7 +963,13 @@ _report_put_timer() {
 
 _report_init() {
     REPORT_START=$(date +%s)
-    if _report_in_list "$REPORT_CHANNEL_ARG" "$REPORT_CHANNELS"; then REPORT_CHANNEL="$REPORT_CHANNEL_ARG"; fi
+    if _report_in_list "$REPORT_CHANNEL_ARG" "$REPORT_CHANNELS"; then
+        REPORT_CHANNEL="$REPORT_CHANNEL_ARG"
+    elif ((!REPORT_CHANNEL_GIVEN)) && in_cpanel_conversion; then
+        # AB-2447: a conversion is reported as one also when the caller names
+        # no channel (a bolt-migrate from before --channel=convert).
+        REPORT_CHANNEL="convert"
+    fi
     case "${ADMINBOLT_NO_TELEMETRY:-}" in 1|true|TRUE|yes|YES) REPORT_NO_TELEMETRY=1 ;; esac
     if ((REPORT_NO_TELEMETRY)); then
         REPORT_MODE="off"
@@ -1078,9 +1092,16 @@ _report_ready() {
     # are not expected), and the database server under one of its unit names
     # (AB-2331: mariadb, or mysqld / mysql for MySQL, such as cl-MySQL on
     # CloudLinux; MariaDB answers to all three). systemctl prints "inactive"
-    # for a unit that does not exist.
+    # for a unit that does not exist. AB-2447: a service whose step a cPanel
+    # conversion left to the cutover is not expected either; cPanel still
+    # serves mail until then.
     local -a units=(bolt-agent bolt-nginx bolt-php) db_units
-    _report_in_list mail "$LEFT_OUT_COMPONENTS" || units+=(postfix dovecot)
+    local unit
+    if ! _report_in_list mail "$LEFT_OUT_COMPONENTS"; then
+        for unit in postfix dovecot; do
+            _report_in_list "$unit" "$REPORT_CUTOVER_STEPS" || units+=("$unit")
+        done
+    fi
     read -r -a db_units <<<"$DATABASE_UNITS"
     states=$(_report_bounded systemctl is-active "${units[@]}" "${db_units[@]}" </dev/null 2>/dev/null)
     [[ "$(printf '%s\n' "$states" | head -n "${#units[@]}" | grep -cx active)" -eq "${#units[@]}" ]] || return 1
@@ -1125,6 +1146,16 @@ report_step_deferred() {
         [[ -n "$1" ]] || return 0
         _report_in_list "$1" "$REPORT_FAILED_OPTIONAL" || REPORT_FAILED_OPTIONAL+="${REPORT_FAILED_OPTIONAL:+ }$1"
         [[ "$REPORT_STAGE_RESULT" == failed ]] || REPORT_STAGE_RESULT="warnings"
+    } 2>/dev/null || true
+}
+# AB-2447: a step a cPanel conversion leaves to the cutover (cpanel_owner_of_step)
+# is not a failure and not a warning: the install report lists it as
+# cutover_steps, and the readiness check does not wait for its service.
+report_step_cutover() {
+    {
+        [[ "$REPORT_STEP" == "$1" ]] && REPORT_STEP=""
+        [[ -n "$1" ]] || return 0
+        _report_in_list "$1" "$REPORT_CUTOVER_STEPS" || REPORT_CUTOVER_STEPS+="${REPORT_CUTOVER_STEPS:+ }$1"
     } 2>/dev/null || true
 }
 report_write_panel_settings() { _report_write_panel_settings 2>/dev/null || true; }
@@ -1851,8 +1882,8 @@ run_or_warn() {
         LAST_STEP_RESULT=deferred
     elif owner=$(cpanel_owner_of_step "$step"); then
         echo -e "${YELLOW}NOTE:${NC} $desc is not installed now: cPanel's ${owner} still owns it on this server. The conversion installs it at the cutover, once cPanel is stopped (continuing)"
-        # Reported the way a deferred step is: like a failed optional step.
-        report_step_deferred "$step"
+        # Reported as left to the cutover, not as failed (AB-2447).
+        report_step_cutover "$step"
         CONVERSION_STEPS+=("${desc}: cPanel's ${owner} still owns it, installed at the cutover")
         LAST_STEP_RESULT=conversion
     else
