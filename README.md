@@ -201,3 +201,7 @@ After installation, the script prints an admin SSO URL.
 If needed, you can generate a new one with:
 
 `bolt-cli admin-sso-generate`
+
+## Release branch
+
+The one-liner above and bolt-migrate download `install.sh` from the `latest` branch. `latest` follows `main` automatically: after CI and shellcheck pass on a `main` commit, the "publish-latest" workflow fast-forwards `latest` to it (it never forces), and the workflow can also be run by hand from the Actions tab. Runs may overlap; a run whose commit `latest` already contains finishes green with nothing to do. GitHub may refuse the workflow's built-in token when the commits being published change files under `.github/workflows/`; if it does, the run fails and a maintainer fast-forwards `latest` to `main` by hand once. Later runs work again.

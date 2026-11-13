@@ -1,0 +1,101 @@
+name: publish-latest
+
+# get.adminbolt.com/install.sh and bolt-migrate download install.sh from the
+# `latest` branch, so `latest` is what every new server runs. This workflow
+# moves `latest` to the pushed `main` commit, but only after CI and
+# shellcheck have passed on that same commit. The move is fast-forward only:
+# if `latest` has diverged from `main`, the job fails and a person decides.
+# Runs are not serialised: an older run that finishes after a newer one has
+# already moved `latest` past its commit ends as a success with nothing to do.
+# GitHub may refuse the built-in token's update when the commits being
+# published change files under .github/workflows/; if it does, the run fails
+# and a maintainer fast-forwards `latest` to `main` by hand once.
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions: {}
+
+jobs:
+  ci:
+    permissions:
+      contents: read
+    uses: ./.github/workflows/ci.yml
+
+  shellcheck:
+    permissions:
+      contents: read
+    uses: ./.github/workflows/shellcheck.yml
+
+  publish:
+    needs: [ci, shellcheck]
+    if: github.repository == 'AdminBolt/Installer' && github.ref == 'refs/heads/main'
+    permissions:
+      contents: write
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Fast-forward latest to this commit
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          ref="repos/${GITHUB_REPOSITORY}/git/refs/heads/latest"
+
+          # Succeeds only when GitHub confirms that latest already contains
+          # $SHA (an overlapping newer run got there first). A failed compare
+          # call never counts as success.
+          latest_contains_sha() {
+            local cur="$1" status
+            if ! status=$(gh api "repos/${GITHUB_REPOSITORY}/compare/${SHA}...latest" --jq .status); then
+              echo "::warning::Could not compare $SHA with latest."
+              return 1
+            fi
+            case "$status" in
+              ahead|identical)
+                echo "latest ($cur) already contains $SHA; nothing to do."
+                echo "latest (\`$cur\`) already contains \`$SHA\`; nothing to do." >> "$GITHUB_STEP_SUMMARY"
+                return 0
+                ;;
+            esac
+            return 1
+          }
+
+          if ! old=$(gh api "repos/${GITHUB_REPOSITORY}/git/ref/heads/latest" --jq '.object.sha'); then
+            echo "::error::Could not read the latest branch."
+            exit 1
+          fi
+
+          if [ "$old" = "$SHA" ]; then
+            echo "latest is already at $SHA; nothing to do."
+            echo "latest already at \`$SHA\`" >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+
+          if latest_contains_sha "$old"; then
+            exit 0
+          fi
+
+          # force=false: GitHub accepts the update only as a fast-forward.
+          if ! out=$(gh api -X PATCH "$ref" -f sha="$SHA" -F force=false 2>&1); then
+            echo "GitHub's reply: $out"
+            # latest may have moved while this run waited; re-read it.
+            if cur=$(gh api "repos/${GITHUB_REPOSITORY}/git/ref/heads/latest" --jq '.object.sha'); then
+              old="$cur"
+            fi
+            if latest_contains_sha "$old"; then
+              exit 0
+            fi
+            if printf '%s' "$out" | grep -qi 'fast forward'; then
+              echo "::error::Not moving latest from $old to $SHA: not a fast-forward (latest has diverged from main, or this commit is older than latest). Not forcing; reconcile the branches by hand."
+            elif printf '%s' "$out" | grep -qi 'workflow'; then
+              echo "::error::Not moving latest from $old to $SHA: GitHub's reply mentions workflows. GitHub may refuse the built-in token's update when the commits being published change files under .github/workflows/; if that is the case, a maintainer fast-forwards latest to main by hand once and later runs work again."
+            else
+              echo "::error::GitHub refused to move latest from $old to $SHA; see GitHub's reply above. Not forcing."
+            fi
+            exit 1
+          fi
+
+          echo "Moved latest: $old -> $SHA"
+          echo "latest: \`$old\` → \`$SHA\`" >> "$GITHUB_STEP_SUMMARY"
