@@ -43,6 +43,11 @@ jobs:
         run: bash tests/invalid_arg_test.sh
       - name: End of the install, SELinux store, deferred PHP (AB-1379, AB-472)
         run: bash tests/install_outcome_test.sh
+      - name: Existing server check and backup (AB-2109)
+        # GNU tar, gzip and find for the backup, cmp for the test; the almalinux:9 image may lack them.
+        run: |
+          dnf -y -q install tar gzip findutils diffutils >/dev/null
+          bash tests/preflight_test.sh
       - name: SSH key and password login (AB-2106)
         # Root in a throwaway container with sshd's config, as its header asks.
         run: |
