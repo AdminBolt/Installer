@@ -104,7 +104,29 @@ STOPPED_STEP=""
 # on its own once the repository answers (post-install setup on the
 # dashboard). "<step>: <what it waits for>".
 DEFERRED_STEPS=()
-# Outcome of the last run_or_warn: ok, failed or deferred.
+# AB-2480: bolt-migrate converts a live cPanel server in place by running
+# this installer next to cPanel. There cPanel's own packages still own mail
+# and DNS, so dnf cannot install AdminBolt's (cpanel-exim obsoletes postfix,
+# cpanel-dovecot and cpanel-pdns conflict with dovecot and pdns). bolt-migrate
+# installs them itself at the cutover, once cPanel's services are stopped.
+# CPANEL_CONVERSION is set by --cpanel-conversion (bolt-migrate passes it),
+# or found by itself: cPanel is installed and --skip-apache was given, which
+# every bolt-migrate conversion passes and nothing else needs on a cPanel
+# server (see in_cpanel_conversion). Only then, and only while the cPanel
+# package below is installed, does a failed step count as left to the
+# conversion instead of failed. "<step id> <cPanel package>" per entry.
+CPANEL_CONVERSION=0
+CPANEL_BINARY="/usr/local/cpanel/cpanel"
+readonly CPANEL_OWNED_STEPS=(
+    "powerdns cpanel-pdns"
+    "postfix cpanel-exim"
+    "postfix_profiles cpanel-exim"
+    "dovecot cpanel-dovecot"
+    "dovecot_profiles cpanel-dovecot"
+)
+# Steps left to the conversion, "<step>: <why>", listed in the closing summary.
+CONVERSION_STEPS=()
+# Outcome of the last run_or_warn: ok, failed, deferred or conversion.
 LAST_STEP_RESULT=""
 # External repositories that did not answer the Stage 1 probe, by name.
 UNREACHABLE_REPOSITORIES=()
@@ -230,6 +252,9 @@ REPORT_FAILED_STEP=""
 REPORT_REASON=""
 REPORT_FAILED_REQUIRED=""
 REPORT_FAILED_OPTIONAL=""
+# AB-2447: steps a cPanel conversion leaves to the cutover (report_step_cutover):
+# neither failed nor warnings, sent as cutover_steps.
+REPORT_CUTOVER_STEPS=""
 REPORT_SIGNAL=""
 REPORT_SUPPRESS=0
 REPORT_TRIAL=""
@@ -238,7 +263,8 @@ REPORT_READINESS=""
 REPORT_REPO_UNREACHABLE=0
 INSTALL_MARKER_CREATED=0
 
-REPORT_CHANNELS="direct get-script web-installer vultr akamai node image-build test hostinger digitalocean aws azure"
+# convert: bolt-migrate's in-place conversion of a cPanel server (AB-2447).
+REPORT_CHANNELS="direct get-script web-installer vultr akamai node image-build test hostinger digitalocean aws azure convert"
 REPORT_REASONS="not_root unsupported_os invalid_argument missing_command port_in_use repo_download_failed package_install_failed agent_install_failed panel_scriptlet_failed agent_panel_connect_failed required_step_failed readiness_check_failed interrupted unclassified"
 
 # Prints the class of one install step id for the report: required (its failure
@@ -770,9 +796,13 @@ _report_finish() {
     _report_pkg_versions
     local duration=$(($(date +%s) - REPORT_START))
     ((duration >= 0 && duration <= 86400)) || duration=0
-    local trial
+    local trial cutover=""
     trial=$(_report_clean "$REPORT_TRIAL" '^(ok|failed|skipped)$' "")
-    _report_emit install_finished "\"result\":$(_report_json_str "$result"),\"failed_step\":$(_report_json_str "$failed_step"),\"reason\":$(_report_json_str "$reason"),\"exit_code\":${rc},\"signal\":$(_report_json_str "$sig"),\"failed_optional_steps\":$(_report_json_steps "$REPORT_FAILED_OPTIONAL"),\"failed_required_steps\":$(_report_json_steps "$REPORT_FAILED_REQUIRED"),\"panel_version\":$(_report_json_str "$REPORT_PANEL_VERSION"),\"agent_version\":$(_report_json_str "$REPORT_AGENT_VERSION"),\"trial_licence\":$(_report_json_str "$trial"),\"duration_s\":${duration}" final
+    # AB-2447: only a conversion that left steps to the cutover sends the field.
+    if [[ -n "$REPORT_CUTOVER_STEPS" ]]; then
+        cutover=",\"cutover_steps\":$(_report_json_steps "$REPORT_CUTOVER_STEPS")"
+    fi
+    _report_emit install_finished "\"result\":$(_report_json_str "$result"),\"failed_step\":$(_report_json_str "$failed_step"),\"reason\":$(_report_json_str "$reason"),\"exit_code\":${rc},\"signal\":$(_report_json_str "$sig"),\"failed_optional_steps\":$(_report_json_steps "$REPORT_FAILED_OPTIONAL"),\"failed_required_steps\":$(_report_json_steps "$REPORT_FAILED_REQUIRED")${cutover},\"panel_version\":$(_report_json_str "$REPORT_PANEL_VERSION"),\"agent_version\":$(_report_json_str "$REPORT_AGENT_VERSION"),\"trial_licence\":$(_report_json_str "$trial"),\"duration_s\":${duration}" final
     _report_spool_mark_finished
     REPORT_SPENT_MS=$((REPORT_SPENT_MS + $(_report_now_ms) - REPORT_FINISH_START))
     _report_flush
@@ -933,7 +963,13 @@ _report_put_timer() {
 
 _report_init() {
     REPORT_START=$(date +%s)
-    if _report_in_list "$REPORT_CHANNEL_ARG" "$REPORT_CHANNELS"; then REPORT_CHANNEL="$REPORT_CHANNEL_ARG"; fi
+    if _report_in_list "$REPORT_CHANNEL_ARG" "$REPORT_CHANNELS"; then
+        REPORT_CHANNEL="$REPORT_CHANNEL_ARG"
+    elif ((!REPORT_CHANNEL_GIVEN)) && in_cpanel_conversion; then
+        # AB-2447: a conversion is reported as one also when the caller names
+        # no channel (a bolt-migrate from before --channel=convert).
+        REPORT_CHANNEL="convert"
+    fi
     case "${ADMINBOLT_NO_TELEMETRY:-}" in 1|true|TRUE|yes|YES) REPORT_NO_TELEMETRY=1 ;; esac
     if ((REPORT_NO_TELEMETRY)); then
         REPORT_MODE="off"
@@ -1056,9 +1092,16 @@ _report_ready() {
     # are not expected), and the database server under one of its unit names
     # (AB-2331: mariadb, or mysqld / mysql for MySQL, such as cl-MySQL on
     # CloudLinux; MariaDB answers to all three). systemctl prints "inactive"
-    # for a unit that does not exist.
+    # for a unit that does not exist. AB-2447: a service whose step a cPanel
+    # conversion left to the cutover is not expected either; cPanel still
+    # serves mail until then.
     local -a units=(bolt-agent bolt-nginx bolt-php) db_units
-    _report_in_list mail "$LEFT_OUT_COMPONENTS" || units+=(postfix dovecot)
+    local unit
+    if ! _report_in_list mail "$LEFT_OUT_COMPONENTS"; then
+        for unit in postfix dovecot; do
+            _report_in_list "$unit" "$REPORT_CUTOVER_STEPS" || units+=("$unit")
+        done
+    fi
     read -r -a db_units <<<"$DATABASE_UNITS"
     states=$(_report_bounded systemctl is-active "${units[@]}" "${db_units[@]}" </dev/null 2>/dev/null)
     [[ "$(printf '%s\n' "$states" | head -n "${#units[@]}" | grep -cx active)" -eq "${#units[@]}" ]] || return 1
@@ -1103,6 +1146,16 @@ report_step_deferred() {
         [[ -n "$1" ]] || return 0
         _report_in_list "$1" "$REPORT_FAILED_OPTIONAL" || REPORT_FAILED_OPTIONAL+="${REPORT_FAILED_OPTIONAL:+ }$1"
         [[ "$REPORT_STAGE_RESULT" == failed ]] || REPORT_STAGE_RESULT="warnings"
+    } 2>/dev/null || true
+}
+# AB-2447: a step a cPanel conversion leaves to the cutover (cpanel_owner_of_step)
+# is not a failure and not a warning: the install report lists it as
+# cutover_steps, and the readiness check does not wait for its service.
+report_step_cutover() {
+    {
+        [[ "$REPORT_STEP" == "$1" ]] && REPORT_STEP=""
+        [[ -n "$1" ]] || return 0
+        _report_in_list "$1" "$REPORT_CUTOVER_STEPS" || REPORT_CUTOVER_STEPS+="${REPORT_CUTOVER_STEPS:+ }$1"
     } 2>/dev/null || true
 }
 report_write_panel_settings() { _report_write_panel_settings 2>/dev/null || true; }
@@ -1807,7 +1860,7 @@ crb_repo_ids() {
 # of the call, where the install report's tests look for it.
 STEP_REPOSITORY=""
 run_or_warn() {
-    local cmd="$1" desc="${2:-Command}" step="${3:-}" repository="$STEP_REPOSITORY" out rc=0
+    local cmd="$1" desc="${2:-Command}" step="${3:-}" repository="$STEP_REPOSITORY" out rc=0 owner
     STEP_REPOSITORY=""
     LAST_STEP_RESULT=skipped
     skip_left_out_step "$step" "$desc" "$cmd" && return 0
@@ -1827,6 +1880,12 @@ run_or_warn() {
         report_step_deferred "$step"
         DEFERRED_STEPS+=("${desc}: waits for the $(repository_name "$repository")")
         LAST_STEP_RESULT=deferred
+    elif owner=$(cpanel_owner_of_step "$step"); then
+        echo -e "${YELLOW}NOTE:${NC} $desc is not installed now: cPanel's ${owner} still owns it on this server. The conversion installs it at the cutover, once cPanel is stopped (continuing)"
+        # Reported as left to the cutover, not as failed (AB-2447).
+        report_step_cutover "$step"
+        CONVERSION_STEPS+=("${desc}: cPanel's ${owner} still owns it, installed at the cutover")
+        LAST_STEP_RESULT=conversion
     else
         echo -e "${YELLOW}WARNING:${NC} $desc failed (continuing)"; report_step_result "$step" failed
         record_failure "$desc" "$out"
@@ -1946,9 +2005,36 @@ is_critical_step() {
     return 1
 }
 
+# Whether this install is bolt-migrate's in-place conversion of a live cPanel
+# server (AB-2480): --cpanel-conversion, or cPanel installed and --skip-apache
+# given (what every bolt-migrate since AB-2331 passes, so an older
+# bolt-migrate that does not know --cpanel-conversion is recognised too).
+in_cpanel_conversion() {
+    ((CPANEL_CONVERSION)) && return 0
+    ((SKIP_APACHE)) && [[ -e "$CPANEL_BINARY" ]]
+}
+
+# For a step a conversion leaves to the cutover (CPANEL_OWNED_STEPS), prints
+# the cPanel package that owns its service and succeeds, but only while that
+# package is installed. Fails for every other step, outside a conversion,
+# and on a server without cPanel's package, so a failure there stays a
+# failure (a fresh install keeps exiting 1 when Postfix or Dovecot fail).
+cpanel_owner_of_step() {
+    local step="$1" entry
+    [[ -n "$step" ]] && in_cpanel_conversion || return 1
+    for entry in "${CPANEL_OWNED_STEPS[@]}"; do
+        [[ "${entry%% *}" == "$step" ]] || continue
+        rpm -q --quiet "${entry#* }" >/dev/null 2>&1 || return 1
+        echo "${entry#* }"
+        return 0
+    done
+    return 1
+}
+
 # Closing summary of every failed step, whatever the outcome (AB-1379).
 # Sets CRITICAL_FAILED=1 when a critical component is among them.
 print_failure_summary() {
+    local step count
     CRITICAL_FAILED=0
     SUMMARY_PRINTED=1
     if ((${#DEFERRED_STEPS[@]} > 0)); then
@@ -1957,8 +2043,16 @@ print_failure_summary() {
         echo "The panel tries again every few minutes and finishes it as soon as the repository answers; its dashboard shows the progress and offers Try now."
         echo -e ""
     fi
+    if ((${#CONVERSION_STEPS[@]} > 0)); then
+        echo -e "${BOLD}${CYAN}--- Left to the conversion: cPanel still owns them (${#CONVERSION_STEPS[@]}) ---${NC}"
+        for step in "${CONVERSION_STEPS[@]}"; do
+            printf '%b  %s\n' "${CYAN}CONVERSION${NC}" "$step"
+        done
+        echo "cPanel keeps serving mail and DNS until bolt-migrate stops its services at the cutover and installs these; nothing to fix here."
+        echo -e ""
+    fi
     [[ -n "$STOPPED_STEP" ]] || [ "${#FAILED_STEPS[@]}" -gt 0 ] || return 0
-    local step count=${#FAILED_STEPS[@]}
+    count=${#FAILED_STEPS[@]}
     [[ -z "$STOPPED_STEP" ]] || count=$((count + 1))
     # printf %s, not echo -e: a reason is the step's own output and may carry a
     # literal "\n" (an agent's JSON error) that must not become a line break.
@@ -2598,6 +2692,10 @@ stage_configuration() {
         echo -e "${BOLD}${GREEN}+----------------------------------------------------------+${NC}"
         echo -e "${BOLD}${GREEN}|      Installation Completed: deferred parts follow       |${NC}"
         echo -e "${BOLD}${GREEN}+----------------------------------------------------------+${NC}\n"
+    elif [ "${#CONVERSION_STEPS[@]}" -gt 0 ]; then
+        echo -e "${BOLD}${GREEN}+----------------------------------------------------------+${NC}"
+        echo -e "${BOLD}${GREEN}|  Installation Completed: mail and DNS follow at cutover  |${NC}"
+        echo -e "${BOLD}${GREEN}+----------------------------------------------------------+${NC}\n"
     else
         echo -e "${BOLD}${GREEN}+----------------------------------------------------------+${NC}"
         echo -e "${BOLD}${GREEN}|          Installation Completed Successfully             |${NC}"
@@ -2961,13 +3059,14 @@ agent_db_credentials_from_my_cnf() {
 
 # ---------- Main ----------
 print_usage() {
-    echo "Usage: sudo $0 [--help] [--version=<PANEL_VERSION>] [--agent-version=<version-release>] [--package=<bolt-name>=<version-release> ...] [--source=<stable|staging|testing>] [--email=<address>] [--mariadb-version=<10.11|11.4>] [--without=<mail,dns,ftp>] [--skip-database] [--skip-apache] [--channel=<name>] [--no-telemetry] [--ssh-key=<public key|https URL>] [--admin-username=<name|random>]"
+    echo "Usage: sudo $0 [--help] [--version=<PANEL_VERSION>] [--agent-version=<version-release>] [--package=<bolt-name>=<version-release> ...] [--source=<stable|staging|testing>] [--email=<address>] [--mariadb-version=<10.11|11.4>] [--without=<mail,dns,ftp>] [--skip-database] [--skip-apache] [--cpanel-conversion] [--channel=<name>] [--no-telemetry] [--ssh-key=<public key|https URL>] [--admin-username=<name|random>]"
     echo "AlmaLinux 9 / Rocky Linux 9 / CloudLinux 9. Stages: 1=ready check, 2=(2.1 settings, 2.2 prereq packages, 2.3 bolt packages), 3=post-install."
     echo "If --version is not provided, latest bolt-panel from repo is installed."
     echo "If --source is not provided, the bolt-repo RPM from adminbolt is used (default). Otherwise repos point at pulp content stable/staging/testing."
     echo "--agent-version installs exactly that bolt-agent build (e.g. 1.30.4-1.el9); --package=<bolt-name>=<version-release> does the same for another bolt-* package (repeatable, e.g. --package=bolt-php=8.4.14-1.el9). Both come from the repositories --source selects (PR builds: --source=testing); the install stops before any Bolt package is installed when a version is not there."
     echo "--skip-database runs no database step (no MariaDB package, series, root password reset or my.cnf profile); the panel uses the MySQL/MariaDB server already on this server, with the administrator login from ${ROOT_MY_CNF} ([client] user= and password=) copied into [dbservers.mariadb] of ${AGENT_CONF}. The database steps are skipped by themselves when a database server answers (mysqladmin ping) or a server package is installed (MariaDB-server, mariadb-server, mysql-server, cl-MySQL*, cl-MariaDB*, ...)."
     echo "--skip-apache runs no Apache step (manage-my-apache and its default profile); the web server is then the caller's to set up."
+    echo "--cpanel-conversion is passed by bolt-migrate when it converts a live cPanel server in place (a cPanel server with --skip-apache is recognised by itself): PowerDNS, Postfix and Dovecot that cannot install because cPanel's cpanel-pdns, cpanel-exim or cpanel-dovecot still owns them are listed as left to the conversion, which installs them at the cutover, and do not fail the install. Without cPanel's package a failure stays a failure."
     echo "If --mariadb-version is not provided, MariaDB ${DEFAULT_MARIADB_SERIES} is installed (long-term series, supported until 2029); --mariadb-version=10.11 installs the previous long-term series (supported until 2028). A server that already has a database server keeps it as it is (see --skip-database)."
     echo "If --email is provided, a 24h trial licence is requested for that address at the very end of the install (clicking the e-mailed confirmation link extends it to the full trial period); the install completes even if the request is refused."
     echo "Without --email the install proceeds unlicensed; activate on the panel's License page."
@@ -3021,6 +3120,9 @@ main() {
                 ;;
             --skip-apache)
                 SKIP_APACHE=1
+                ;;
+            --cpanel-conversion)
+                CPANEL_CONVERSION=1
                 ;;
             --agent-version=*)
                 AGENT_VERSION="${arg#--agent-version=}"
