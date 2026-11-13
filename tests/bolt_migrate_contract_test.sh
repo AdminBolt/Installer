@@ -15,7 +15,10 @@
 #     "CONVERSION  <step>: <why>", "STOPPED" and "Stage 3 finished with
 #     failed critical components", and --cpanel-conversion is parsed;
 #   - the report channel convert is in REPORT_CHANNELS (AB-2447): bolt-migrate
-#     passes --channel=convert only to an installer whose line lists it.
+#     passes --channel=convert only to an installer whose line lists it;
+#   - a conversion is not stopped by the existing-server check (AB-2109):
+#     bolt-migrate's arguments on a cPanel server pass Stage 1 without a
+#     backup. Tested in tests/preflight_test.sh, section "cPanel conversion".
 # Renaming or removing any of these needs a matching bolt-migrate release
 # first. bolt-migrate also checks the published installer every day
 # (bolt-migrate .github/workflows/installer-compat.yml).

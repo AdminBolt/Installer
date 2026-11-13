@@ -337,16 +337,19 @@ eq "--skip-apache without cPanel (no conversion): refused" 1 "$RC"
 has "--skip-apache without cPanel: reported as check_existing_server" "STEP=check_existing_server REASON=existing_server" "$OUT"
 hasnt "--skip-apache without cPanel: no conversion line" "cPanel conversion: not checking" "$OUT"
 
+# --cpanel-conversion copied onto a plain server in use: no cPanel, no conversion.
 in_use cpanel_flag_on_plain_server
 sed 's/\[ "\$EUID" -ne 0 \]/false/' "$INSTALL_SH" >"$S/install-as-root.sh"
 stage1 "--cpanel-conversion"
-eq "--cpanel-conversion is bolt-migrate's: it skips the check by itself" 0 "$RC"
-has "--cpanel-conversion alone: the conversion line" "cPanel conversion: not checking" "$OUT"
+eq "--cpanel-conversion without cPanel: refused" 1 "$RC"
+has "--cpanel-conversion without cPanel: reported as check_existing_server" "STEP=check_existing_server REASON=existing_server" "$OUT"
+hasnt "--cpanel-conversion without cPanel: no conversion line" "cPanel conversion: not checking" "$OUT"
+eq "--cpanel-conversion without cPanel: no backup directory" 0 "$(backups)"
 
 section=$(sed -n '/^## Servers already in use/,/^## Install report/p' "$HERE/../README.md")
 has "README: a cPanel conversion is not checked" "A cPanel server that bolt-migrate converts in place" "$section"
 run 'print_usage'
-has "usage: a cPanel conversion is not checked" "A cPanel conversion (--cpanel-conversion, or cPanel with --skip-apache) is not checked" "$OUT"
+has "usage: a cPanel conversion is not checked" "A cPanel server that bolt-migrate converts in place (--cpanel-conversion or --skip-apache, with cPanel installed) is not checked" "$OUT"
 
 in_use forced
 run 'FORCE_EXISTING_SERVER=1; check_existing_server; echo PASSED'
@@ -389,7 +392,8 @@ if ((FORCE_EXISTING_SERVER && !ADMINBOLT_ALREADY_INSTALLED)); then
 backup_existing_configuration;" "$body"
 
 end_call=$(ADMINBOLT_INSTALL_SOURCE_ONLY=1 "$BASH" -c ". '$INSTALL_SH'; declare -f stage_configuration" | grep -A1 'install_report_replaced_files' | sed 's/^ *//' | tr '\n' ' ')
-eq "Stage 3 ends with the list of replaced files" 'install_report_replaced_files; print_progress "100% — post-install"; ' "$end_call"
+# The progress line right after it (its text is install.sh's, not repeated here).
+if [[ "$end_call" == 'install_report_replaced_files; print_progress "100%'* ]]; then ok "Stage 3 ends with the list of replaced files"; else nok "Stage 3 ends with the list of replaced files" "$end_call"; fi
 
 # ---------------------------------------------------------------------------
 echo "# backup with --force-existing-server"
@@ -453,6 +457,58 @@ has "failed install after a backup: the exit names the backup again" "The config
 eq "failed install after a backup: exit code kept" 3 "$RC"
 run "trap report_on_exit EXIT; PREINSTALL_BACKUP_DIR='$dir'; exit 0"
 hasnt "successful install: the exit does not repeat it" "The configuration from before this install" "$OUT"
+
+# A backup that is only partly complete goes on, but says what is missing,
+# on the screen and in README.txt (nothing of it is silently left out).
+backup_partial() {
+    new_server "$1"
+    mkdir -p "$S/var/spool/cron"
+    echo "secret" >"$S/etc/shadow-like"
+    echo x >"$S/etc/a.conf"
+}
+backup_partial backup_sum_fails
+# xargs runs sha256sum as a program: one in front of PATH that fails for one file.
+mkdir -p "$S/badsum"
+printf '#!/bin/sh\nrc=0\nfor f; do case "$f" in *shadow-like) echo "sha256sum: $f: Permission denied" >&2; rc=1 ;; *) %s "$f" ;; esac; done\nexit $rc\n' "$(command -v sha256sum)" >"$S/badsum/sha256sum"
+chmod +x "$S/badsum/sha256sum"
+run 'PATH="$S/badsum:$PATH"; backup_existing_configuration; echo "DIR=$PREINSTALL_BACKUP_DIR"; echo PASSED'
+dir=$(sed -n 's/^DIR=//p' <<<"$OUT")
+has "a file without a checksum: the backup goes on" PASSED "$OUT"
+has "a file without a checksum: says so" "WARNING: some files could not be checksummed (see $dir/manifest-errors.log)" "$(sed 's/\x1b\[[0-9;]*m//g' <<<"$OUT")"
+has "a file without a checksum: the error is kept" "shadow-like: Permission denied" "$(cat "$dir/manifest-errors.log" 2>/dev/null)"
+has "a file without a checksum: README.txt says it is never listed as replaced" "never listed as replaced" "$(cat "$dir/README.txt" 2>/dev/null)"
+has "a file without a checksum: the step is not failed" "STEP= REASON=" "$OUT"
+
+backup_partial backup_all_ok_no_extra_files
+run 'backup_existing_configuration; echo "DIR=$PREINSTALL_BACKUP_DIR"'
+dir=$(sed -n 's/^DIR=//p' <<<"$OUT")
+hasnt "complete backup: no warning" "WARNING" "$OUT"
+eq "complete backup: no error logs left in it" "" "$(cd "$dir" 2>/dev/null && ls manifest-errors.log nft-errors.log 2>/dev/null)"
+
+backup_partial backup_nft_fails
+run 'nft() { case "$*" in "list ruleset") echo "netlink: Error: cache initialization failed" >&2; return 1 ;; esac; }; backup_existing_configuration; echo "DIR=$PREINSTALL_BACKUP_DIR"; echo PASSED'
+dir=$(sed -n 's/^DIR=//p' <<<"$OUT")
+has "nft fails: the backup goes on" PASSED "$OUT"
+has "nft fails: says the ruleset is not in the backup" "the firewall's live ruleset could not be read (nft list ruleset failed" "$OUT"
+eq "nft fails: no empty ruleset file to restore from" 0 "$(ls "$dir/nft-ruleset.nft" 2>/dev/null | wc -l | tr -d ' ')"
+has "nft fails: the error is kept" "cache initialization failed" "$(cat "$dir/nft-errors.log" 2>/dev/null)"
+has "nft fails: README.txt says there is no copy" "could NOT be read (nft list ruleset failed); there is no copy of it" "$(cat "$dir/README.txt" 2>/dev/null)"
+hasnt "nft fails: README.txt does not offer a restore from it" "restore: nft -f" "$(cat "$dir/README.txt" 2>/dev/null)"
+
+backup_partial backup_getenforce_fails
+run 'getenforce() { return 1; }; backup_existing_configuration; echo "DIR=$PREINSTALL_BACKUP_DIR"; echo PASSED'
+dir=$(sed -n 's/^DIR=//p' <<<"$OUT")
+has "getenforce fails: the backup goes on" PASSED "$OUT"
+has "getenforce fails: says so" "the SELinux mode could not be read (getenforce failed)" "$OUT"
+eq "getenforce fails: no empty mode file" 0 "$(ls "$dir/selinux-mode.txt" 2>/dev/null | wc -l | tr -d ' ')"
+has "getenforce fails: README.txt says the mode is not known" "getenforce failed, the SELinux mode before the install is not known" "$(cat "$dir/README.txt" 2>/dev/null)"
+
+backup_partial backup_tar_changed
+run 'tar() { command tar "$@"; return 1; }; backup_existing_configuration; echo "DIR=$PREINSTALL_BACKUP_DIR"; echo PASSED'
+dir=$(sed -n 's/^DIR=//p' <<<"$OUT")
+has "tar exit 1 (a file changed while read): the backup goes on" PASSED "$OUT"
+has "tar exit 1: says so and where the details are" "some files changed while they were copied; each is in the backup as it was at that moment (see $dir/tar-warnings.log)" "$OUT"
+has "tar exit 1: README.txt names tar-warnings.log" "tar-warnings.log" "$(cat "$dir/README.txt" 2>/dev/null)"
 
 # A failed backup stops the install by itself (the runs above are without
 # set -e): one error, nothing after it, nothing reported as backed up.

@@ -1462,8 +1462,13 @@ check_existing_server() {
     # installer on a live cPanel server, which is in use by design: cPanel's
     # web, mail, DNS and database services keep running until the cutover,
     # and the conversion has its own rollback. The backup is taken only when
-    # --force-existing-server is given as well.
-    if in_cpanel_conversion; then
+    # --force-existing-server is given as well. Only with cPanel really
+    # there: --cpanel-conversion copied onto a plain server is checked as
+    # any install (bolt-migrate convert itself refuses to start without
+    # cPanel). in_cpanel_conversion also counts cPanel + --skip-apache, for
+    # bolt-migrate releases before AB-2480 that do not pass
+    # --cpanel-conversion; that part can go once those are gone.
+    if in_cpanel_conversion && [[ -e "$CPANEL_BINARY" ]]; then
         print_info "cPanel conversion: not checking this cPanel server for an existing web, mail, DNS or database setup (bolt-migrate converts it in place and keeps cPanel's services until the cutover)"
         report_step_result check_existing_server ok
         return 0
@@ -1527,7 +1532,7 @@ _backup_install_archivers() {
 # installed, with a checksum list that install_report_replaced_files compares
 # against at the end. The install does not start when the copy fails.
 backup_existing_configuration() {
-    local dir present path need avail rc umask_before
+    local dir present path need avail rc umask_before sum_rc nft_line selinux_line notes=""
     report_step_start preinstall_backup
     _backup_install_archivers
     dir="${BACKUP_PARENT}/adminbolt-preinstall-backup-$(date +%Y%m%d-%H%M%S)"
@@ -1549,26 +1554,55 @@ backup_existing_configuration() {
     rc=0
     tar --create --gzip --file "$dir/files.tar.gz" --preserve-permissions --numeric-owner \
         --xattrs --acls --selinux "${present[@]}" 2>"$dir/tar-warnings.log" || rc=$?
-    # 1: a file changed while it was read; the archive is still complete.
     if ((rc > 1)); then
         _backup_abort "$dir" "The backup failed (tar exit ${rc}): $(tail -n 3 "$dir/tar-warnings.log" 2>/dev/null | tr '\n' ' ')"
     fi
-    find "${present[@]}" -type f -print0 2>/dev/null | xargs -0 -r sha256sum >"$dir/manifest.sha256" 2>/dev/null || true
+    # 1: a file changed while it was read; the archive is still complete, but
+    # that file is in it as it was at that moment.
+    if ((rc == 1)); then
+        echo -e "${YELLOW}WARNING:${NC} some files changed while they were copied; each is in the backup as it was at that moment (see ${dir}/tar-warnings.log)"
+        notes+="tar-warnings.log   files that changed while they were copied (tar exit 1)"$'\n'
+    fi
+    sum_rc=0
+    find "${present[@]}" -type f -print0 2>/dev/null | xargs -0 -r sha256sum >"$dir/manifest.sha256" 2>"$dir/manifest-errors.log" || sum_rc=$?
     # Without the checksums the end of the install could not tell what it replaced.
     if [[ ! -s "$dir/manifest.sha256" ]]; then
         _backup_abort "$dir" "The backup failed: no checksums could be taken of ${present[*]}"
     fi
-    if command -v nft >/dev/null 2>&1; then nft list ruleset >"$dir/nft-ruleset.nft" 2>/dev/null || true; fi
-    if command -v getenforce >/dev/null 2>&1; then getenforce >"$dir/selinux-mode.txt" 2>/dev/null || true; fi
+    # Some files without a checksum: they cannot be listed as replaced at the end.
+    if ((sum_rc != 0)); then
+        echo -e "${YELLOW}WARNING:${NC} some files could not be checksummed (see ${dir}/manifest-errors.log); the end of the install cannot say whether it replaced them"
+        notes+="manifest-errors.log files that could not be checksummed: they are not in manifest.sha256 and never listed as replaced"$'\n'
+    else
+        rm -f "$dir/manifest-errors.log"
+    fi
+    nft_line="nft-ruleset.nft     the firewall's live ruleset (restore: nft -f nft-ruleset.nft)"
+    if ! command -v nft >/dev/null 2>&1; then
+        nft_line="(no nft-ruleset.nft: nft is not installed, so there was no nftables ruleset to copy)"
+    elif ! nft list ruleset >"$dir/nft-ruleset.nft" 2>"$dir/nft-errors.log"; then
+        echo -e "${YELLOW}WARNING:${NC} the firewall's live ruleset could not be read (nft list ruleset failed, see ${dir}/nft-errors.log); it is not in the backup"
+        rm -f "$dir/nft-ruleset.nft"
+        nft_line="nft-errors.log      the firewall's live ruleset could NOT be read (nft list ruleset failed); there is no copy of it"
+    else
+        rm -f "$dir/nft-errors.log"
+    fi
+    selinux_line="selinux-mode.txt    SELinux mode before the install"
+    if ! command -v getenforce >/dev/null 2>&1; then
+        selinux_line="(no selinux-mode.txt: getenforce is not installed; the SELinux setting is in etc/selinux/config in files.tar.gz)"
+    elif ! getenforce >"$dir/selinux-mode.txt" 2>/dev/null; then
+        echo -e "${YELLOW}WARNING:${NC} the SELinux mode could not be read (getenforce failed); it is not in the backup"
+        rm -f "$dir/selinux-mode.txt"
+        selinux_line="(no selinux-mode.txt: getenforce failed, the SELinux mode before the install is not known)"
+    fi
     cat >"$dir/README.txt" <<NOTE
 Backup made by the AdminBolt installer before installing on a server that was already in use.
 
 files.tar.gz        ${present[*]}
 manifest.sha256     sha256 of every file in files.tar.gz, as it was
 replaced-files.txt  files the install changed or removed (written at the end of the install)
-nft-ruleset.nft     the firewall's live ruleset (restore: nft -f nft-ruleset.nft)
-selinux-mode.txt    SELinux mode before the install
-
+${nft_line}
+${selinux_line}
+${notes}
 Restore one file:  tar -xzpf files.tar.gz -C / etc/postfix/main.cf
 Do not unpack the whole archive over an installed panel: it would undo the panel's own configuration.
 Site files and databases are not in this backup.
@@ -3459,7 +3493,7 @@ print_usage() {
     echo "If --mariadb-version is not provided, MariaDB ${DEFAULT_MARIADB_SERIES} is installed (long-term series, supported until 2029); --mariadb-version=10.11 installs the previous long-term series (supported until 2028). A server that already has a database server keeps it as it is (see --skip-database)."
     echo "If --email is provided, a 24h trial licence is requested for that address at the very end of the install (clicking the e-mailed confirmation link extends it to the full trial period); the install completes even if the request is refused."
     echo "Without --email the install proceeds unlicensed; activate on the panel's License page."
-    echo "The installer is meant for a fresh server. It stops when it finds a web, mail, DNS or database server, a firewall with rules of its own, or files in /home or /var/www, and lists what the install would replace. --force-existing-server installs anyway, after backing up /etc, /var/spool/cron, /root/.my.cnf, /usr/bin/mlmmj-make-ml.sh and the files the install writes in /var/www/html to /root/adminbolt-preinstall-backup-<date>/. A cPanel conversion (--cpanel-conversion, or cPanel with --skip-apache) is not checked, and is backed up only with --force-existing-server."
+    echo "The installer is meant for a fresh server. It stops when it finds a web, mail, DNS or database server, a firewall with rules of its own, or files in /home or /var/www, and lists what the install would replace. --force-existing-server installs anyway, after backing up /etc, /var/spool/cron, /root/.my.cnf, /usr/bin/mlmmj-make-ml.sh and the files the install writes in /var/www/html to /root/adminbolt-preinstall-backup-<date>/. A cPanel server that bolt-migrate converts in place (--cpanel-conversion or --skip-apache, with cPanel installed) is not checked, and is backed up only with --force-existing-server."
     echo "--without leaves optional components out, for servers with little memory (comma-separated; everything is installed by default):"
     local component
     for component in $OPTIONAL_COMPONENTS; do
