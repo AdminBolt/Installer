@@ -269,6 +269,85 @@ echo bolt-panel >>"$S/fake/rpm"
 run 'FORCE_EXISTING_SERVER=1; check_existing_server; if ((FORCE_EXISTING_SERVER && !ADMINBOLT_ALREADY_INSTALLED)); then echo WOULD-BACKUP; fi'
 hasnt "reinstall with the flag: no backup (the configuration is the panel's own)" WOULD-BACKUP "$OUT"
 
+# ---------------------------------------------------------------------------
+echo "# cPanel conversion (bolt-migrate convert)"
+# ---------------------------------------------------------------------------
+# A live cPanel server is in use by design: bolt-migrate runs the installer
+# next to cPanel and converts it. The real Stage 1 runs through main() with
+# the arguments bolt-migrate passes; only what needs root or the network is
+# stubbed (the root check is turned off in a copy of install.sh).
+cpanel_server() {
+    in_use "$1"
+    printf "cpanel-exim\ncpanel-dovecot\ncpanel-pdns\n" >>"$S/fake/rpm"
+    mkdir -p "$S/usr/local/cpanel" "$S/home/acct1/public_html"
+    echo "#!/bin/sh" >"$S/usr/local/cpanel/cpanel"
+    echo "<h1>account site</h1>" >"$S/home/acct1/public_html/index.html"
+    sed 's/\[ "\$EUID" -ne 0 \]/false/' "$INSTALL_SH" >"$S/install-as-root.sh"
+}
+# stage1 <args>: main() with these arguments up to the end of the real Stage 1.
+stage1() {
+    CHILD_INSTALL_SH="$S/install-as-root.sh" run "CPANEL_BINARY=\"\$S/usr/local/cpanel/cpanel\"; REPORT_MARKER=\"\$S/marker\"
+report_init() { :; }; detect_distribution() { echo 'cloudlinux|9.6'; }
+check_port_8443() { :; }; check_selinux_state() { :; }; probe_external_repositories() { :; }; database_skip_decide() { :; }
+eval \"real_\$(declare -f stage_prerequisites)\"
+stage_prerequisites() { real_stage_prerequisites; echo \"STAGE1-DONE BACKUP=\${PREINSTALL_BACKUP_DIR:-none}\"; exit 0; }
+main $*"
+}
+backups() { find "$S/root" -mindepth 1 -maxdepth 1 -name 'adminbolt-preinstall-backup-*' | wc -l | tr -d ' '; }
+BOLT_MIGRATE_ARGS="--auto-upgrade=1 --skip-database --skip-apache --cpanel-conversion --channel=convert"
+
+cpanel_server conversion
+stage1 "$BOLT_MIGRATE_ARGS"
+eq "conversion (bolt-migrate's arguments): Stage 1 passes" 0 "$RC"
+has "conversion: Stage 1 completes without a backup" "STAGE1-DONE BACKUP=none" "$OUT"
+has "conversion: says why the server is not checked" "cPanel conversion: not checking this cPanel server for an existing web, mail, DNS or database setup" "$OUT"
+hasnt "conversion: not refused" "This server is already in use" "$OUT"
+hasnt "conversion: nothing listed" "package httpd is installed" "$OUT"
+has "conversion: no failure reported" "STEP= REASON=" "$OUT"
+eq "conversion: no backup directory" 0 "$(backups)"
+# bolt-migrate runs the installer again over a stopped attempt.
+stage1 "$BOLT_MIGRATE_ARGS"
+eq "conversion run again: Stage 1 passes again" 0 "$RC"
+has "conversion run again: still no backup" "STAGE1-DONE BACKUP=none" "$OUT"
+eq "conversion run again: no backup directory" 0 "$(backups)"
+
+cpanel_server conversion_old_migrate
+stage1 "--auto-upgrade=1 --skip-database --skip-apache"
+eq "conversion by a bolt-migrate without --cpanel-conversion (cPanel + --skip-apache): passes" 0 "$RC"
+has "older bolt-migrate: says why the server is not checked" "cPanel conversion: not checking" "$OUT"
+eq "older bolt-migrate: no backup directory" 0 "$(backups)"
+
+cpanel_server conversion_rerun_installed
+echo bolt-agent >>"$S/fake/rpm"
+stage1 "$BOLT_MIGRATE_ARGS"
+eq "conversion with AdminBolt already installed: passes" 0 "$RC"
+has "conversion with AdminBolt installed: the reinstall line" "AdminBolt is already installed on this server" "$OUT"
+eq "conversion with AdminBolt installed: no backup directory" 0 "$(backups)"
+
+cpanel_server conversion_forced
+stage1 "$BOLT_MIGRATE_ARGS --force-existing-server"
+eq "conversion with --force-existing-server asked for: passes" 0 "$RC"
+hasnt "conversion with the flag: the backup is taken because it was asked for" "STAGE1-DONE BACKUP=none" "$OUT"
+eq "conversion with the flag: one backup directory" 1 "$(backups)"
+
+in_use skip_apache_no_cpanel
+sed 's/\[ "\$EUID" -ne 0 \]/false/' "$INSTALL_SH" >"$S/install-as-root.sh"
+stage1 "--skip-apache"
+eq "--skip-apache without cPanel (no conversion): refused" 1 "$RC"
+has "--skip-apache without cPanel: reported as check_existing_server" "STEP=check_existing_server REASON=existing_server" "$OUT"
+hasnt "--skip-apache without cPanel: no conversion line" "cPanel conversion: not checking" "$OUT"
+
+in_use cpanel_flag_on_plain_server
+sed 's/\[ "\$EUID" -ne 0 \]/false/' "$INSTALL_SH" >"$S/install-as-root.sh"
+stage1 "--cpanel-conversion"
+eq "--cpanel-conversion is bolt-migrate's: it skips the check by itself" 0 "$RC"
+has "--cpanel-conversion alone: the conversion line" "cPanel conversion: not checking" "$OUT"
+
+section=$(sed -n '/^## Servers already in use/,/^## Install report/p' "$HERE/../README.md")
+has "README: a cPanel conversion is not checked" "A cPanel server that bolt-migrate converts in place" "$section"
+run 'print_usage'
+has "usage: a cPanel conversion is not checked" "A cPanel conversion (--cpanel-conversion, or cPanel with --skip-apache) is not checked" "$OUT"
+
 in_use forced
 run 'FORCE_EXISTING_SERVER=1; check_existing_server; echo PASSED'
 eq "--force-existing-server: passes" 0 "$RC"

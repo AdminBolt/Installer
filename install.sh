@@ -1447,13 +1447,24 @@ existing_server_changes() {
 # Stops the install on a server that is already in use, unless
 # --force-existing-server was given. A server that already has AdminBolt is
 # a reinstall or a rerun after a failed install: its web, mail and database
-# services are the install's own, so it is not checked.
+# services are the install's own, so it is not checked. Neither is a cPanel
+# server bolt-migrate converts in place (in_cpanel_conversion).
 check_existing_server() {
     local findings line
     report_step_start check_existing_server
     if rpm -q bolt-agent >/dev/null 2>&1 || rpm -q bolt-panel >/dev/null 2>&1; then
         print_info "AdminBolt is already installed on this server; not checking it for an existing web, mail, DNS or database setup"
         ADMINBOLT_ALREADY_INSTALLED=1
+        report_step_result check_existing_server ok
+        return 0
+    fi
+    # bolt-migrate's in-place conversion (in_cpanel_conversion) runs the
+    # installer on a live cPanel server, which is in use by design: cPanel's
+    # web, mail, DNS and database services keep running until the cutover,
+    # and the conversion has its own rollback. The backup is taken only when
+    # --force-existing-server is given as well.
+    if in_cpanel_conversion; then
+        print_info "cPanel conversion: not checking this cPanel server for an existing web, mail, DNS or database setup (bolt-migrate converts it in place and keeps cPanel's services until the cutover)"
         report_step_result check_existing_server ok
         return 0
     fi
@@ -3448,7 +3459,7 @@ print_usage() {
     echo "If --mariadb-version is not provided, MariaDB ${DEFAULT_MARIADB_SERIES} is installed (long-term series, supported until 2029); --mariadb-version=10.11 installs the previous long-term series (supported until 2028). A server that already has a database server keeps it as it is (see --skip-database)."
     echo "If --email is provided, a 24h trial licence is requested for that address at the very end of the install (clicking the e-mailed confirmation link extends it to the full trial period); the install completes even if the request is refused."
     echo "Without --email the install proceeds unlicensed; activate on the panel's License page."
-    echo "The installer is meant for a fresh server. It stops when it finds a web, mail, DNS or database server, a firewall with rules of its own, or files in /home or /var/www, and lists what the install would replace. --force-existing-server installs anyway, after backing up /etc, /var/spool/cron, /root/.my.cnf, /usr/bin/mlmmj-make-ml.sh and the files the install writes in /var/www/html to /root/adminbolt-preinstall-backup-<date>/."
+    echo "The installer is meant for a fresh server. It stops when it finds a web, mail, DNS or database server, a firewall with rules of its own, or files in /home or /var/www, and lists what the install would replace. --force-existing-server installs anyway, after backing up /etc, /var/spool/cron, /root/.my.cnf, /usr/bin/mlmmj-make-ml.sh and the files the install writes in /var/www/html to /root/adminbolt-preinstall-backup-<date>/. A cPanel conversion (--cpanel-conversion, or cPanel with --skip-apache) is not checked, and is backed up only with --force-existing-server."
     echo "--without leaves optional components out, for servers with little memory (comma-separated; everything is installed by default):"
     local component
     for component in $OPTIONAL_COMPONENTS; do
