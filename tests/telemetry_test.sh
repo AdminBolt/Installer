@@ -260,6 +260,7 @@ echo "# steps: class and reason code (KONTRAKT list)"
 declare -A WANT=(
     [check_root]="required not_root" [check_os]="required unsupported_os" [check_commands]="required missing_command"
     [check_port_8443]="required port_in_use" [parse_arguments]="required invalid_argument"
+    [check_existing_server]="required existing_server" [preinstall_backup]="required required_step_failed"
     [repo_setup]="required repo_download_failed" [prerequisite_packages]="required package_install_failed"
     [agent_install]="required agent_install_failed" [agent_scriptlet]="required agent_install_failed"
     [panel_install]="required package_install_failed" [panel_scriptlet]="required panel_scriptlet_failed"
@@ -464,6 +465,17 @@ fin=$(event install_finished)
 eq "port 8443 taken: port_in_use" "failed check_port_8443 port_in_use 1" "$(field "$fin" .result) $(field "$fin" .failed_step) $(field "$fin" .reason) $(field "$fin" .exit_code)"
 eq "exit code unchanged (1)" 1 "$CHILD_RC"
 eq "stage prerequisites closed as failed" failed "$(spool_events | jq -r 'select(.type=="stage_finished") | .result')"
+
+child existing_server '
+report_init
+report_step_result parse_arguments ok
+rpm() { return 1; }
+existing_server_findings() { echo "package httpd is installed"; }
+check_existing_server'
+fin=$(event install_finished)
+eq "server already in use: existing_server" "failed check_existing_server existing_server 1" "$(field "$fin" .result) $(field "$fin" .failed_step) $(field "$fin" .reason) $(field "$fin" .exit_code)"
+eq "server already in use: exit code 1" 1 "$CHILD_RC"
+eq "server already in use: failed required step listed" check_existing_server "$(field "$fin" .failed_required_steps)"
 
 child repo '
 report_init
@@ -1556,7 +1568,7 @@ common and (
     and (if has("cutover_steps") then (.cutover_steps | steps) and (.cutover_steps | length > 0) else true end)
     and (.result | IN("succeeded","succeeded_with_warnings","failed","cancelled"))
     and (.failed_step | re("^[a-z0-9_-]{0,48}$"))
-    and (.reason | IN("","not_root","unsupported_os","invalid_argument","missing_command","port_in_use","repo_download_failed","package_install_failed","agent_install_failed","panel_scriptlet_failed","agent_panel_connect_failed","required_step_failed","readiness_check_failed","interrupted","unclassified"))
+    and (.reason | IN("","not_root","unsupported_os","invalid_argument","missing_command","port_in_use","existing_server","repo_download_failed","package_install_failed","agent_install_failed","panel_scriptlet_failed","agent_panel_connect_failed","required_step_failed","readiness_check_failed","interrupted","unclassified"))
     and ((.reason == "") == (.result | IN("succeeded","succeeded_with_warnings")))
     and (.exit_code | int(0; 255)) and (.signal | IN("INT","TERM","HUP",""))
     and (.failed_optional_steps | steps) and (.failed_required_steps | steps)
