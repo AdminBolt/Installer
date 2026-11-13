@@ -13,7 +13,9 @@
 #   sudo ./install.sh --version=1.0.0.beta3-v46.el9 # install specific bolt-panel version from repo
 #   sudo ./install.sh --source=staging         # use staging pulp repos (stable|staging|testing); default unchanged
 #   sudo ./install.sh --email=user@example.com # activate a 24h trial license for this e-mail (confirmation link extends it to 30 days)
+#   sudo ./install.sh --admin-username=random  # first administrator: admin-<6 random characters> instead of "admin" (or a name of your choice)
 #   sudo ./install.sh --mariadb-version=10.11  # MariaDB 10.11 instead of the default 11.4 (10.11 or 11.4)
+#   sudo ./install.sh --without=mail,dns,ftp   # leave optional components out (small servers); the end of the install says how to add them later
 #   sudo ./install.sh --skip-database          # keep the database server already on the box (no MariaDB steps)
 #   sudo ./install.sh --skip-apache            # no Apache steps (the caller sets the web server up)
 #   sudo ./install.sh --source=testing --agent-version=1.30.4-pr230.1.el9 --package=bolt-php=8.4.14-1.el9
@@ -36,6 +38,12 @@ BOLT_SOURCE=""
 ADMIN_EMAIL=""
 # --mariadb-version=; empty = the default below on a new box (see stage_configuration).
 MARIADB_SERIES=""
+# --force-existing-server: install on a server that is already in use (see check_existing_server).
+FORCE_EXISTING_SERVER=0
+# AB-2104: name of the first panel administrator; empty = "admin". "random" = admin-<6 random characters>.
+# ADMIN_USERNAME_GIVEN: the option was given, so an empty value is refused.
+ADMIN_USERNAME=""
+ADMIN_USERNAME_GIVEN=0
 # AB-2228: the MariaDB series of a new install (10.11 until then).
 readonly DEFAULT_MARIADB_SERIES="11.4"
 # AB-2331: --skip-database / --skip-apache. A database server already on the
@@ -74,6 +82,58 @@ SSH_KEY_LOGIN_ADDR=""
 SSH_KEY_PROOF_SINCE=0
 # Outcome line for the end of the install.
 SSH_PASSWORD_NOTE=""
+# Raw --without= values as given (comma-separated, every occurrence joined),
+# and whether the option was given at all, so an empty value is refused.
+WITHOUT_ARG=""
+WITHOUT_GIVEN=0
+# Components left out, in the order of OPTIONAL_COMPONENTS (set by set_left_out_components).
+LEFT_OUT_COMPONENTS=""
+# "<component> <command>" for every step skipped for them, in the order Stage 3 reached it.
+SKIPPED_COMMANDS=()
+# AB-1379: steps that failed (run_or_warn), "<step>: <last error line>", and
+# the components without which the server cannot serve sites, mail or
+# databases. A failed critical component ends the install with a non-zero
+# exit status; every failure is listed in the closing summary either way.
+FAILED_STEPS=()
+readonly CRITICAL_COMPONENTS=("MariaDB" "Postfix" "Dovecot" "PHP 8.4")
+CRITICAL_FAILED=0
+# Set once the closing summary is printed; an install that stops early
+# prints it from the EXIT trap instead (AB-1379 QA finding 2).
+SUMMARY_PRINTED=0
+# The step that stopped the install, "<step>: <reason>" (run_or_fail,
+# install_packages); listed first in that summary.
+STOPPED_STEP=""
+# AB-472: steps that wait for an external package repository the server
+# cannot reach. The install does not fail on them: the panel installs them
+# on its own once the repository answers (post-install setup on the
+# dashboard). "<step>: <what it waits for>".
+DEFERRED_STEPS=()
+# AB-2480: bolt-migrate converts a live cPanel server in place by running
+# this installer next to cPanel. There cPanel's own packages still own mail
+# and DNS, so dnf cannot install AdminBolt's (cpanel-exim obsoletes postfix,
+# cpanel-dovecot and cpanel-pdns conflict with dovecot and pdns). bolt-migrate
+# installs them itself at the cutover, once cPanel's services are stopped.
+# CPANEL_CONVERSION is set by --cpanel-conversion (bolt-migrate passes it),
+# or found by itself: cPanel is installed and --skip-apache was given, which
+# every bolt-migrate conversion passes and nothing else needs on a cPanel
+# server (see in_cpanel_conversion). Only then, and only while the cPanel
+# package below is installed, does a failed step count as left to the
+# conversion instead of failed. "<step id> <cPanel package>" per entry.
+CPANEL_CONVERSION=0
+CPANEL_BINARY="/usr/local/cpanel/cpanel"
+readonly CPANEL_OWNED_STEPS=(
+    "powerdns cpanel-pdns"
+    "postfix cpanel-exim"
+    "postfix_profiles cpanel-exim"
+    "dovecot cpanel-dovecot"
+    "dovecot_profiles cpanel-dovecot"
+)
+# Steps left to the conversion, "<step>: <why>", listed in the closing summary.
+CONVERSION_STEPS=()
+# Outcome of the last run_or_warn: ok, failed, deferred or conversion.
+LAST_STEP_RESULT=""
+# External repositories that did not answer the Stage 1 probe, by name.
+UNREACHABLE_REPOSITORIES=()
 readonly WEB_INSTALL_ROOT="/usr/local/bolt/web"
 
 # Colors
@@ -196,6 +256,9 @@ REPORT_FAILED_STEP=""
 REPORT_REASON=""
 REPORT_FAILED_REQUIRED=""
 REPORT_FAILED_OPTIONAL=""
+# AB-2447: steps a cPanel conversion leaves to the cutover (report_step_cutover):
+# neither failed nor warnings, sent as cutover_steps.
+REPORT_CUTOVER_STEPS=""
 REPORT_SIGNAL=""
 REPORT_SUPPRESS=0
 REPORT_TRIAL=""
@@ -204,15 +267,16 @@ REPORT_READINESS=""
 REPORT_REPO_UNREACHABLE=0
 INSTALL_MARKER_CREATED=0
 
-REPORT_CHANNELS="direct get-script web-installer vultr akamai node image-build test hostinger digitalocean aws azure"
-REPORT_REASONS="not_root unsupported_os invalid_argument missing_command port_in_use repo_download_failed package_install_failed agent_install_failed panel_scriptlet_failed agent_panel_connect_failed required_step_failed readiness_check_failed interrupted unclassified"
+# convert: bolt-migrate's in-place conversion of a cPanel server (AB-2447).
+REPORT_CHANNELS="direct get-script web-installer vultr akamai node image-build test hostinger digitalocean aws azure convert"
+REPORT_REASONS="not_root unsupported_os invalid_argument missing_command port_in_use existing_server repo_download_failed package_install_failed agent_install_failed panel_scriptlet_failed agent_panel_connect_failed required_step_failed readiness_check_failed interrupted unclassified"
 
 # Prints the class of one install step id for the report: required (its failure
 # is the install's failure), optional (its failure only adds a warning) or
 # unknown (not a step id).
 report_step_class() {
     case "$1" in
-        check_root|check_os|check_commands|check_port_8443|parse_arguments) echo required ;;
+        check_root|check_os|check_commands|check_port_8443|check_existing_server|preinstall_backup|parse_arguments) echo required ;;
         repo_setup|prerequisite_packages|agent_install|agent_scriptlet|panel_install|panel_scriptlet|web_services_enable) echo required ;;
         agent_panel_connect|nftables|ssh_server|powerdns|mariadb|postfix|dovecot|redis|php84|myapache) echo required ;;
         firewall_setup|mariadb_profile|myapache_profile|php84_profile|postinstall_queue|readiness) echo required ;;
@@ -231,6 +295,7 @@ report_reason_for_step() {
         check_os) echo unsupported_os ;;
         check_commands) echo missing_command ;;
         check_port_8443) echo port_in_use ;;
+        check_existing_server) echo existing_server ;;
         parse_arguments) echo invalid_argument ;;
         repo_setup) echo repo_download_failed ;;
         prerequisite_packages|panel_install) echo package_install_failed ;;
@@ -736,9 +801,13 @@ _report_finish() {
     _report_pkg_versions
     local duration=$(($(date +%s) - REPORT_START))
     ((duration >= 0 && duration <= 86400)) || duration=0
-    local trial
+    local trial cutover=""
     trial=$(_report_clean "$REPORT_TRIAL" '^(ok|failed|skipped)$' "")
-    _report_emit install_finished "\"result\":$(_report_json_str "$result"),\"failed_step\":$(_report_json_str "$failed_step"),\"reason\":$(_report_json_str "$reason"),\"exit_code\":${rc},\"signal\":$(_report_json_str "$sig"),\"failed_optional_steps\":$(_report_json_steps "$REPORT_FAILED_OPTIONAL"),\"failed_required_steps\":$(_report_json_steps "$REPORT_FAILED_REQUIRED"),\"panel_version\":$(_report_json_str "$REPORT_PANEL_VERSION"),\"agent_version\":$(_report_json_str "$REPORT_AGENT_VERSION"),\"trial_licence\":$(_report_json_str "$trial"),\"duration_s\":${duration}" final
+    # AB-2447: only a conversion that left steps to the cutover sends the field.
+    if [[ -n "$REPORT_CUTOVER_STEPS" ]]; then
+        cutover=",\"cutover_steps\":$(_report_json_steps "$REPORT_CUTOVER_STEPS")"
+    fi
+    _report_emit install_finished "\"result\":$(_report_json_str "$result"),\"failed_step\":$(_report_json_str "$failed_step"),\"reason\":$(_report_json_str "$reason"),\"exit_code\":${rc},\"signal\":$(_report_json_str "$sig"),\"failed_optional_steps\":$(_report_json_steps "$REPORT_FAILED_OPTIONAL"),\"failed_required_steps\":$(_report_json_steps "$REPORT_FAILED_REQUIRED")${cutover},\"panel_version\":$(_report_json_str "$REPORT_PANEL_VERSION"),\"agent_version\":$(_report_json_str "$REPORT_AGENT_VERSION"),\"trial_licence\":$(_report_json_str "$trial"),\"duration_s\":${duration}" final
     _report_spool_mark_finished
     REPORT_SPENT_MS=$((REPORT_SPENT_MS + $(_report_now_ms) - REPORT_FINISH_START))
     _report_flush
@@ -752,8 +821,21 @@ report_on_exit() {
     trap '' PIPE INT TERM HUP
     set +e
     if ((INSTALL_MARKER_CREATED)); then rm -f "$REPORT_MARKER"; fi
+    # A failed install with --force-existing-server: the backup path again,
+    # since the install never reaches the summary that names it.
+    if ((rc != 0)) && [[ -n "$PREINSTALL_BACKUP_DIR" ]]; then
+        echo "The configuration from before this install is in ${PREINSTALL_BACKUP_DIR} (see README.txt there)." >&2
+    fi
     REPORT_FINISH_START=$(_report_now_ms)
     [[ "$REPORT_MODE" == off ]] || _report_finish "$rc" </dev/null >/dev/null 2>&1
+    # AB-1379 QA finding 2: an install that stops early (a Stage 2 package
+    # install, connecting bolt-agent to the panel) still lists the steps
+    # that failed before it, which the closing summary never got to print.
+    if ((rc != 0)) && [[ -z "$REPORT_SIGNAL" ]] && ((!SUMMARY_PRINTED)) && { [[ -n "$STOPPED_STEP" ]] || ((${#FAILED_STEPS[@]} > 0)); }; then
+        echo -e ""
+        print_failure_summary
+        echo -e "${BOLD}${RED}Installation stopped early (exit status ${rc}).${NC}"
+    fi
     if [[ -n "$REPORT_SIGNAL" ]]; then
         trap - "$REPORT_SIGNAL"
         kill -s "$REPORT_SIGNAL" "$$"
@@ -891,7 +973,13 @@ _report_put_timer() {
 
 _report_init() {
     REPORT_START=$(date +%s)
-    if _report_in_list "$REPORT_CHANNEL_ARG" "$REPORT_CHANNELS"; then REPORT_CHANNEL="$REPORT_CHANNEL_ARG"; fi
+    if _report_in_list "$REPORT_CHANNEL_ARG" "$REPORT_CHANNELS"; then
+        REPORT_CHANNEL="$REPORT_CHANNEL_ARG"
+    elif ((!REPORT_CHANNEL_GIVEN)) && in_cpanel_conversion; then
+        # AB-2447: a conversion is reported as one also when the caller names
+        # no channel (a bolt-migrate from before --channel=convert).
+        REPORT_CHANNEL="convert"
+    fi
     case "${ADMINBOLT_NO_TELEMETRY:-}" in 1|true|TRUE|yes|YES) REPORT_NO_TELEMETRY=1 ;; esac
     if ((REPORT_NO_TELEMETRY)); then
         REPORT_MODE="off"
@@ -1010,14 +1098,24 @@ _report_write_panel_settings() {
 _report_ready() {
     local states code
     # One bounded call; it prints one state per unit, in the order asked. The
-    # five services must all be "active", and the database server under one
-    # of its unit names (AB-2331: mariadb, or mysqld / mysql for MySQL, such
-    # as cl-MySQL on CloudLinux; MariaDB answers to all three). systemctl
-    # prints "inactive" for a unit that does not exist.
-    # shellcheck disable=SC2086
-    states=$(_report_bounded systemctl is-active bolt-agent bolt-nginx bolt-php postfix dovecot $DATABASE_UNITS </dev/null 2>/dev/null)
-    [[ "$(printf '%s\n' "$states" | head -n 5 | grep -cx active)" -eq 5 ]] || return 1
-    printf '%s\n' "$states" | tail -n +6 | grep -qx active || return 1
+    # services must all be "active" (with --without=mail, Postfix and Dovecot
+    # are not expected), and the database server under one of its unit names
+    # (AB-2331: mariadb, or mysqld / mysql for MySQL, such as cl-MySQL on
+    # CloudLinux; MariaDB answers to all three). systemctl prints "inactive"
+    # for a unit that does not exist. AB-2447: a service whose step a cPanel
+    # conversion left to the cutover is not expected either; cPanel still
+    # serves mail until then.
+    local -a units=(bolt-agent bolt-nginx bolt-php) db_units
+    local unit
+    if ! _report_in_list mail "$LEFT_OUT_COMPONENTS"; then
+        for unit in postfix dovecot; do
+            _report_in_list "$unit" "$REPORT_CUTOVER_STEPS" || units+=("$unit")
+        done
+    fi
+    read -r -a db_units <<<"$DATABASE_UNITS"
+    states=$(_report_bounded systemctl is-active "${units[@]}" "${db_units[@]}" </dev/null 2>/dev/null)
+    [[ "$(printf '%s\n' "$states" | head -n "${#units[@]}" | grep -cx active)" -eq "${#units[@]}" ]] || return 1
+    printf '%s\n' "$states" | tail -n "+$((${#units[@]} + 1))" | grep -qx active || return 1
     code=$(curl -k -s -o /dev/null -w '%{http_code}' --connect-timeout 2 --max-time 3 "$REPORT_PANEL_URL" </dev/null 2>/dev/null) || true
     [[ "$code" =~ ^[1-4][0-9][0-9]$ ]]
 }
@@ -1049,6 +1147,27 @@ report_step_result() { _report_step_result "$@" 2>/dev/null || true; }
 # report_fail [step] [reason]: the step failed (default: the current one).
 report_fail() { _report_step_result "${1:-$REPORT_STEP}" failed "${2:-}" 2>/dev/null || true; }
 report_trial_licence() { REPORT_TRIAL="$1"; }
+# AB-472: a step that waits for an external repository is reported like a
+# failed optional step (the result becomes succeeded_with_warnings), never as
+# the failure of a required one.
+report_step_deferred() {
+    {
+        [[ "$REPORT_STEP" == "$1" ]] && REPORT_STEP=""
+        [[ -n "$1" ]] || return 0
+        _report_in_list "$1" "$REPORT_FAILED_OPTIONAL" || REPORT_FAILED_OPTIONAL+="${REPORT_FAILED_OPTIONAL:+ }$1"
+        [[ "$REPORT_STAGE_RESULT" == failed ]] || REPORT_STAGE_RESULT="warnings"
+    } 2>/dev/null || true
+}
+# AB-2447: a step a cPanel conversion leaves to the cutover (cpanel_owner_of_step)
+# is not a failure and not a warning: the install report lists it as
+# cutover_steps, and the readiness check does not wait for its service.
+report_step_cutover() {
+    {
+        [[ "$REPORT_STEP" == "$1" ]] && REPORT_STEP=""
+        [[ -n "$1" ]] || return 0
+        _report_in_list "$1" "$REPORT_CUTOVER_STEPS" || REPORT_CUTOVER_STEPS+="${REPORT_CUTOVER_STEPS:+ }$1"
+    } 2>/dev/null || true
+}
 report_write_panel_settings() { _report_write_panel_settings 2>/dev/null || true; }
 report_readiness_check() { _report_timed _report_readiness_check 2>/dev/null || true; }
 
@@ -1082,6 +1201,451 @@ check_port_8443() {
     exit 1
 }
 
+# SELinux policy tooling without a policy store (AB-1379). With SELINUX=
+# enforcing or permissive in /etc/selinux/config, every package step that
+# manages SELinux policy runs semanage, which aborts with "SELinux policy is
+# not managed or store cannot be accessed" when the store of the configured
+# policy is missing - and the install used to go on without Postfix, Dovecot
+# and Rspamd. Whether the store can be used is asked of semanage itself, not
+# guessed from the kernel command line: selinux=0 with SELINUX=enforcing
+# installs fine on a stock image, whose store is there (QA finding 1).
+# Without semanage (a minimal image; it arrives with the packages) the
+# store directory of the configured policy type is looked for instead.
+# SELINUX=disabled, or no config at all, needs nothing. Paths overridable
+# for tests.
+check_selinux_state() {
+    local config="${SELINUX_CONFIG_FILE:-/etc/selinux/config}" mode type out
+    mode=$(sed -n 's/^[[:space:]]*SELINUX[[:space:]]*=[[:space:]]*//p' "$config" 2>/dev/null | tail -n 1 | tr -d '[:space:]"')
+    case "$mode" in
+        enforcing|permissive) ;;
+        *) return 0 ;;
+    esac
+    type=$(sed -n 's/^[[:space:]]*SELINUXTYPE[[:space:]]*=[[:space:]]*//p' "$config" 2>/dev/null | tail -n 1 | tr -d '[:space:]"')
+    type="${type:-targeted}"
+    if command -v semanage >/dev/null 2>&1; then
+        out=$(semanage login -l 2>&1) && return 0
+        # Any other semanage failure is not this problem; the package steps report it.
+        grep -qi 'not managed or store cannot be accessed' <<<"$out" || return 0
+    elif [ -d "${SELINUX_STORE_ROOT:-/var/lib/selinux}/${type}/active" ]; then
+        return 0
+    fi
+    print_error "${config} sets SELINUX=${mode}, but the SELinux policy store (${type}) cannot be used."
+    echo "Package steps that manage SELinux policy fail in this state, so Postfix, Dovecot and Rspamd would not install."
+    echo "Install the policy (dnf install selinux-policy-${type}), or set SELINUX=disabled in ${config} (this installer disables SELinux anyway), then run the installer again."
+    exit 1
+}
+
+# ---------- Existing server check (Stage 1) ----------
+#
+# The install sets up its own web, mail, DNS, database and firewall stack:
+# whole configuration files are written over, SELinux is switched off and the
+# firewall is replaced. On a server that already runs something of the kind
+# that breaks it without a warning, so the install stops there, lists what
+# it found and what it would replace, and goes on only with
+# --force-existing-server, after backup_existing_configuration.
+#
+# A fresh AlmaLinux 9 / Rocky Linux 9 cloud image must pass. Checked on
+# Vultr's: they run firewalld with its default zone (ssh, dhcpv6-client,
+# cockpit) and have a cloud user (uid 1000) whose home holds only the
+# skeleton files, ~/.ssh and a tool cache. None of that counts.
+EXISTING_PACKAGES="httpd nginx lighttpd caddy haproxy postfix sendmail exim dovecot bind pdns vsftpd redis mariadb-server MariaDB-server mysql-server community-mysql-server mysql-community-server percona-server-server postgresql-server"
+EXISTING_UNITS="httpd nginx lighttpd caddy haproxy postfix sendmail exim dovecot named pdns vsftpd redis mariadb mysqld postgresql"
+EXISTING_PORTS="21 25 53 80 110 143 443 465 587 993 995 3306 5432"
+# Services an image's firewalld allows by itself in its default zone.
+FIREWALLD_IMAGE_SERVICES="ssh dhcpv6-client cockpit"
+# What in a home is not its owner's data: the skeleton and these files at
+# the top level, and these directories (keys and tool caches) as a whole.
+HOME_IGNORED_FILES=".bash_history .lesshst .viminfo .python_history .wget-hsts .sudo_as_admin_successful .cloud-locale-test.skip"
+HOME_IGNORED_DIRS=".ssh .cache .ansible"
+EXISTING_HOME_DIR="/home"
+EXISTING_WWW_DIR="/var/www"
+EXISTING_DATABASE_DIRS="/var/lib/mysql /var/lib/pgsql/data"
+EXISTING_SKEL_DIR="/etc/skel"
+EXISTING_PASSWD="/etc/passwd"
+SELINUX_CONFIG="/etc/selinux/config"
+# --force-existing-server: what is copied before the install, and where to.
+# /etc holds every configuration file the install writes over, the rest are
+# the few it writes elsewhere. Site files and databases are not copied.
+BACKUP_PATHS="/etc /var/spool/cron /root/.my.cnf /usr/bin/mlmmj-make-ml.sh /var/www/html/index.html /var/www/html/index.php"
+BACKUP_PARENT="/root"
+PREINSTALL_BACKUP_DIR=""
+# Set by check_existing_server when bolt-agent or bolt-panel is installed.
+ADMINBOLT_ALREADY_INSTALLED=0
+
+# Names of the packages in EXISTING_PACKAGES that are installed.
+_existing_packages() {
+    local name
+    # A missing package is a "package X is not installed" line, never a name.
+    rpm -q --qf '%{NAME}\n' $EXISTING_PACKAGES 2>/dev/null | while read -r name; do
+        if _report_in_list "$name" "$EXISTING_PACKAGES"; then echo "$name"; fi
+    done
+    return 0
+}
+
+# Running units of EXISTING_UNITS, each once: mysqld is an alias of mariadb.
+_existing_running_units() {
+    local unit id seen=" "
+    command -v systemctl >/dev/null 2>&1 || return 0
+    for unit in $EXISTING_UNITS; do
+        systemctl is-active --quiet "$unit" 2>/dev/null || continue
+        id=$(systemctl show -p Id --value "$unit" 2>/dev/null)
+        id="${id:-$unit.service}"
+        [[ "$seen" != *" $id "* ]] || continue
+        seen+="$id "
+        echo "$unit"
+    done
+    return 0
+}
+
+# "<port> <process>" for each port in EXISTING_PORTS something listens on.
+# TCP only: a DNS server on UDP 53 is found by its package or unit.
+_existing_listeners() {
+    command -v ss >/dev/null 2>&1 || return 0
+    ss -Htlnp 2>/dev/null | awk -v ports=" $EXISTING_PORTS " '{
+        port = $4; sub(/.*:/, "", port)
+        if (index(ports, " " port " ") == 0) next
+        proc = "an unknown process"
+        if (match($0, /\(\("[^"]+"/)) proc = substr($0, RSTART + 3, RLENGTH - 4)
+        print port " " proc
+    }' | sort -n -u -k1,1
+    return 0
+}
+
+# nftables tables firewalld did not create ("<family> <name>").
+_existing_nft_tables() {
+    command -v nft >/dev/null 2>&1 || return 0
+    nft list tables 2>/dev/null | awk '$1 == "table" && $3 != "firewalld" { print $2 " " $3 }'
+    return 0
+}
+
+# What a running firewalld allows beyond an image's default zone.
+_existing_firewalld_rules() {
+    local zone service extra list opt
+    command -v firewall-cmd >/dev/null 2>&1 || return 0
+    firewall-cmd --state >/dev/null 2>&1 || return 0
+    # The default zone too: with no interface bound to it, it is not "active".
+    for zone in $( { firewall-cmd --get-default-zone; firewall-cmd --get-active-zones; } 2>/dev/null | awk '/^[A-Za-z0-9_-]+$/ && !seen[$0]++'); do
+        extra=""
+        for service in $(firewall-cmd --zone="$zone" --list-services 2>/dev/null); do
+            _report_in_list "$service" "$FIREWALLD_IMAGE_SERVICES" || extra+=" $service"
+        done
+        [[ -z "$extra" ]] || echo "zone ${zone} allows the services${extra}"
+        for opt in ports source-ports forward-ports protocols sources; do
+            list=$(firewall-cmd --zone="$zone" --list-"$opt" 2>/dev/null | tr '\n' ' ')
+            list="${list% }"
+            [[ -z "$list" ]] || echo "zone ${zone} ${opt}: ${list}"
+        done
+        list=$(firewall-cmd --zone="$zone" --list-rich-rules 2>/dev/null | grep -c . || true)
+        ((list == 0)) || echo "zone ${zone} has ${list} rich rule(s)"
+    done
+    list=$(firewall-cmd --direct --get-all-rules 2>/dev/null | grep -c . || true)
+    ((list == 0)) || echo "${list} direct rule(s)"
+    return 0
+}
+
+# The installer's own copy is not anyone's data: a sudo user downloads
+# install.sh into, or clones the repository under, their own home. Prints
+# the clone's directory, or the file itself. Read from a pipe, there is no
+# such file in a home to leave out.
+_installer_own_path() {
+    local src="${BASH_SOURCE[0]:-}" dir
+    [[ -n "$src" && -f "$src" ]] || return 0
+    src=$(realpath -- "$src" 2>/dev/null) || return 0
+    dir="${src%/*}"
+    if [[ -e "$dir/.git" ]]; then echo "$dir"; else echo "$src"; fi
+}
+
+# A path as a find -path pattern that matches only itself.
+_find_literal() { printf '%s' "$1" | sed 's/[][*?\\]/\\&/g'; }
+
+# Prints the first file under home directory $1 that is its owner's own data
+# (see HOME_IGNORED_FILES / HOME_IGNORED_DIRS); nothing when there is none.
+_home_first_data_file() {
+    local dir="$1" pattern name args=()
+    # find -path takes a pattern: the directory name is matched literally.
+    pattern=$(_find_literal "$dir")
+    for name in $HOME_IGNORED_DIRS $HOME_IGNORED_FILES; do
+        args+=(-path "$pattern/$name" -prune -o)
+    done
+    for name in "$EXISTING_SKEL_DIR"/* "$EXISTING_SKEL_DIR"/.[!.]*; do
+        if [[ -e "$name" ]]; then args+=(-path "$pattern/${name##*/}" -prune -o); fi
+    done
+    name=$(_installer_own_path)
+    if [[ -n "$name" ]]; then args+=(-path "$(_find_literal "$name")" -prune -o); fi
+    # -H: a home that is a symlink is followed, inside it nothing is.
+    find -H "$dir" -mindepth 1 "${args[@]}" -type f -print -quit 2>/dev/null
+    return 0
+}
+
+# Users with uid >= 1000 whose home holds their own files, then anything else
+# in /home that does.
+_existing_user_data() {
+    local user uid home homes=" " entry file
+    while IFS=: read -r user _ uid _ _ home _; do
+        [[ "$uid" =~ ^[0-9]+$ ]] && ((uid >= 1000 && uid != 65534)) || continue
+        [[ -n "$home" && "$home" != / && -d "$home" ]] || continue
+        homes+="$home "
+        file=$(_home_first_data_file "$home")
+        [[ -z "$file" ]] || echo "user ${user} (uid ${uid}) has files in ${home}"
+    done <"$EXISTING_PASSWD"
+    [[ -d "$EXISTING_HOME_DIR" ]] || return 0
+    for entry in "$EXISTING_HOME_DIR"/* "$EXISTING_HOME_DIR"/.[!.]*; do
+        [[ -e "$entry" || -L "$entry" ]] || continue
+        [[ "$homes" != *" $entry "* ]] || continue
+        if [[ -d "$entry" && ! -L "$entry" ]]; then
+            file=$(_home_first_data_file "$entry")
+            [[ -n "$file" ]] || continue
+        fi
+        echo "${entry} holds files"
+    done
+    return 0
+}
+
+# One line per sign that the server is already in use; nothing on a fresh one.
+existing_server_findings() {
+    local name port proc count
+    for name in $(_existing_packages); do echo "package ${name} is installed"; done
+    for name in $(_existing_running_units); do echo "service ${name} is running"; done
+    while read -r port proc; do
+        if [[ -n "$port" ]]; then echo "port ${port} is in use by ${proc}"; fi
+    done < <(_existing_listeners)
+    while read -r name; do
+        if [[ -n "$name" ]]; then echo "nftables table ${name} is set up (not by firewalld)"; fi
+    done < <(_existing_nft_tables)
+    while read -r name; do
+        if [[ -n "$name" ]]; then echo "firewalld: ${name}"; fi
+    done < <(_existing_firewalld_rules)
+    _existing_user_data
+    if [[ -d "$EXISTING_WWW_DIR" ]]; then
+        count=$(find -H "$EXISTING_WWW_DIR" -type f 2>/dev/null | head -n 1000 | wc -l)
+        ((count < 1000)) || count="1000 or more"
+        [[ "$count" == 0 ]] || echo "${EXISTING_WWW_DIR} holds ${count} file(s)"
+    fi
+    for name in $EXISTING_DATABASE_DIRS; do
+        if [[ -d "$name" && -n "$(find -H "$name" -type f -print -quit 2>/dev/null)" ]]; then
+            echo "${name} holds database files"
+        fi
+    done
+    return 0
+}
+
+# What the install changes on any server, as shown with the findings.
+existing_server_changes() {
+    if ! selinux_not_enforcing || grep -Eqs '^SELINUX=(enforcing|permissive)' "$SELINUX_CONFIG"; then
+        echo "SELinux: enforcement is switched off now and SELinux is disabled from the next boot (${SELINUX_CONFIG})"
+    fi
+    echo "firewall: firewalld is stopped and disabled, and the nftables tables \"ip filter\" and \"ip6 filter\" are replaced by AdminBolt's, whose INPUT and forward chains have policy drop: only the panel's own ports stay open (other nftables tables are kept)"
+    local apache_conf="/etc/httpd/conf/httpd.conf, "
+    ((SKIP_APACHE)) && apache_conf=""
+    echo "configuration files written over with AdminBolt's own, among them ${apache_conf}/etc/postfix/main.cf and master.cf, /etc/dovecot/dovecot.conf, /etc/pdns/pdns.conf, /etc/redis/redis.conf, /etc/vsftpd/vsftpd.conf, /etc/fail2ban/jail.local, /etc/ssh/sshd_config.d/00-adminbolt.conf and 99-adminbolt.conf, /etc/sysconfig/nftables.conf, /var/www/html/index.html and index.php"
+    # AB-2331: database_skip_decide ran before this; a database server already here is kept.
+    if ((SKIP_DATABASE)); then
+        echo "database: the database server already here is kept as it is (${DATABASE_SKIP_REASON}); the panel uses it with the login in ${ROOT_MY_CNF}"
+    else
+        echo "MariaDB: MariaDB from mariadb.org is installed, its root password is set (${ROOT_MY_CNF}), root logins from other hosts, anonymous users and the test database are removed"
+    fi
+}
+
+# Stops the install on a server that is already in use, unless
+# --force-existing-server was given. A server that already has AdminBolt is
+# a reinstall or a rerun after a failed install: its web, mail and database
+# services are the install's own, so it is not checked. Neither is a cPanel
+# server bolt-migrate converts in place (in_cpanel_conversion).
+check_existing_server() {
+    local findings line
+    report_step_start check_existing_server
+    if rpm -q bolt-agent >/dev/null 2>&1 || rpm -q bolt-panel >/dev/null 2>&1; then
+        print_info "AdminBolt is already installed on this server; not checking it for an existing web, mail, DNS or database setup"
+        ADMINBOLT_ALREADY_INSTALLED=1
+        report_step_result check_existing_server ok
+        return 0
+    fi
+    # bolt-migrate's in-place conversion (in_cpanel_conversion) runs the
+    # installer on a live cPanel server, which is in use by design: cPanel's
+    # web, mail, DNS and database services keep running until the cutover,
+    # and the conversion has its own rollback. The backup is taken only when
+    # --force-existing-server is given as well. Only with cPanel really
+    # there: --cpanel-conversion copied onto a plain server is checked as
+    # any install (bolt-migrate convert itself refuses to start without
+    # cPanel). in_cpanel_conversion also counts cPanel + --skip-apache, for
+    # bolt-migrate releases before AB-2480 that do not pass
+    # --cpanel-conversion; that part can go once those are gone.
+    if in_cpanel_conversion && [[ -e "$CPANEL_BINARY" ]]; then
+        print_info "cPanel conversion: not checking this cPanel server for an existing web, mail, DNS or database setup (bolt-migrate converts it in place and keeps cPanel's services until the cutover)"
+        report_step_result check_existing_server ok
+        return 0
+    fi
+    findings=$(existing_server_findings)
+    if [[ -z "$findings" ]]; then
+        print_success "No existing web, mail, DNS or database server, firewall rules or user data found"
+        report_step_result check_existing_server ok
+        return 0
+    fi
+    if ((FORCE_EXISTING_SERVER)); then
+        echo -e "${YELLOW}WARNING:${NC} This server is already in use:"
+    else
+        print_error "This server is already in use. The installer is meant for a fresh AlmaLinux 9, Rocky Linux 9 or CloudLinux 9 server. Found:"
+    fi
+    while IFS= read -r line; do echo "  - ${line}"; done <<<"$findings"
+    echo "The install would replace or change:"
+    while IFS= read -r line; do echo "  - ${line}"; done < <(existing_server_changes)
+    if ((FORCE_EXISTING_SERVER)); then
+        print_info "--force-existing-server given: installing anyway, after a backup of the current configuration"
+        report_step_result check_existing_server ok
+        return 0
+    fi
+    echo "Install on a fresh server, or rerun with --force-existing-server to install here anyway: /etc and the other files the install writes over are backed up first (site files and databases are not)."
+    report_fail check_existing_server existing_server
+    exit 1
+}
+
+# A failed backup stops the install before anything is installed. $1 is the
+# backup directory to remove (it may hold a partial copy of /etc), or empty.
+_backup_abort() {
+    print_error "$2"
+    if [[ -n "$1" && -d "$1" ]]; then rm -rf "$1"; fi
+    report_fail preinstall_backup
+    exit 1
+}
+
+# The backup runs before Stage 2 installs the base packages, and some stock
+# AlmaLinux/Rocky 9 images (Hetzner's) have no tar. Only what is missing is
+# installed, so a server that has both is left as it was.
+_backup_install_archivers() {
+    local tool missing=() pm
+    for tool in tar gzip; do
+        command -v "$tool" >/dev/null 2>&1 || missing+=("$tool")
+    done
+    ((${#missing[@]} == 0)) && return 0
+    if command -v dnf >/dev/null 2>&1; then pm=dnf
+    elif command -v yum >/dev/null 2>&1; then pm=yum
+    else _backup_abort "" "The backup needs ${missing[*]}, which is not installed, and there is no dnf or yum to install it"
+    fi
+    print_info "Installing ${missing[*]} for the backup"
+    "$pm" install -y "${missing[@]}" \
+        || _backup_abort "" "The backup needs ${missing[*]}, and installing it with ${pm} failed (see ${pm}'s output above). Install it and run the installer again."
+    for tool in "${missing[@]}"; do
+        command -v "$tool" >/dev/null 2>&1 || _backup_abort "" "The backup needs ${tool}, which is still not there after ${pm} install"
+    done
+}
+
+# --force-existing-server: copies BACKUP_PATHS, the firewall's live ruleset
+# and the SELinux mode into a new root-only directory before anything is
+# installed, with a checksum list that install_report_replaced_files compares
+# against at the end. The install does not start when the copy fails.
+backup_existing_configuration() {
+    local dir present path need avail rc umask_before sum_rc nft_line selinux_line notes=""
+    report_step_start preinstall_backup
+    _backup_install_archivers
+    dir="${BACKUP_PARENT}/adminbolt-preinstall-backup-$(date +%Y%m%d-%H%M%S)"
+    # Everything in it is root-only: /etc holds password hashes and keys.
+    umask_before=$(umask)
+    umask 077
+    if ! mkdir "$dir"; then
+        _backup_abort "" "Cannot create ${dir} for the backup"
+    fi
+    present=()
+    for path in $BACKUP_PATHS; do
+        if [[ -e "$path" ]]; then present+=("$path"); fi
+    done
+    need=$(du -sk "${present[@]}" 2>/dev/null | awk '{ s += $1 } END { print s + 0 }')
+    avail=$(df -Pk "$dir" 2>/dev/null | awk 'NR == 2 { print $4 + 0 }')
+    if [[ -z "$avail" ]] || ((avail < need + 102400)); then
+        _backup_abort "$dir" "Not enough free space in ${BACKUP_PARENT} for the backup (${need} KB needed, ${avail:-0} KB free, plus 100 MB to spare)"
+    fi
+    rc=0
+    tar --create --gzip --file "$dir/files.tar.gz" --preserve-permissions --numeric-owner \
+        --xattrs --acls --selinux "${present[@]}" 2>"$dir/tar-warnings.log" || rc=$?
+    if ((rc > 1)); then
+        _backup_abort "$dir" "The backup failed (tar exit ${rc}): $(tail -n 3 "$dir/tar-warnings.log" 2>/dev/null | tr '\n' ' ')"
+    fi
+    # 1: a file changed while it was read; the archive is still complete, but
+    # that file is in it as it was at that moment.
+    if ((rc == 1)); then
+        echo -e "${YELLOW}WARNING:${NC} some files changed while they were copied; each is in the backup as it was at that moment (see ${dir}/tar-warnings.log)"
+        notes+="tar-warnings.log   files that changed while they were copied (tar exit 1)"$'\n'
+    fi
+    sum_rc=0
+    find "${present[@]}" -type f -print0 2>/dev/null | xargs -0 -r sha256sum >"$dir/manifest.sha256" 2>"$dir/manifest-errors.log" || sum_rc=$?
+    # Without the checksums the end of the install could not tell what it replaced.
+    if [[ ! -s "$dir/manifest.sha256" ]]; then
+        _backup_abort "$dir" "The backup failed: no checksums could be taken of ${present[*]}"
+    fi
+    # Some files without a checksum: they cannot be listed as replaced at the end.
+    if ((sum_rc != 0)); then
+        echo -e "${YELLOW}WARNING:${NC} some files could not be checksummed (see ${dir}/manifest-errors.log); the end of the install cannot say whether it replaced them"
+        notes+="manifest-errors.log files that could not be checksummed: they are not in manifest.sha256 and never listed as replaced"$'\n'
+    else
+        rm -f "$dir/manifest-errors.log"
+    fi
+    nft_line="nft-ruleset.nft     the firewall's live ruleset (restore: nft -f nft-ruleset.nft)"
+    if ! command -v nft >/dev/null 2>&1; then
+        nft_line="(no nft-ruleset.nft: nft is not installed, so there was no nftables ruleset to copy)"
+    elif ! nft list ruleset >"$dir/nft-ruleset.nft" 2>"$dir/nft-errors.log"; then
+        echo -e "${YELLOW}WARNING:${NC} the firewall's live ruleset could not be read (nft list ruleset failed, see ${dir}/nft-errors.log); it is not in the backup"
+        rm -f "$dir/nft-ruleset.nft"
+        nft_line="nft-errors.log      the firewall's live ruleset could NOT be read (nft list ruleset failed); there is no copy of it"
+    else
+        rm -f "$dir/nft-errors.log"
+    fi
+    selinux_line="selinux-mode.txt    SELinux mode before the install"
+    if ! command -v getenforce >/dev/null 2>&1; then
+        selinux_line="(no selinux-mode.txt: getenforce is not installed; the SELinux setting is in etc/selinux/config in files.tar.gz)"
+    elif ! getenforce >"$dir/selinux-mode.txt" 2>/dev/null; then
+        echo -e "${YELLOW}WARNING:${NC} the SELinux mode could not be read (getenforce failed); it is not in the backup"
+        rm -f "$dir/selinux-mode.txt"
+        selinux_line="(no selinux-mode.txt: getenforce failed, the SELinux mode before the install is not known)"
+    fi
+    cat >"$dir/README.txt" <<NOTE
+Backup made by the AdminBolt installer before installing on a server that was already in use.
+
+files.tar.gz        ${present[*]}
+manifest.sha256     sha256 of every file in files.tar.gz, as it was
+replaced-files.txt  files the install changed or removed (written at the end of the install)
+${nft_line}
+${selinux_line}
+${notes}
+Restore one file:  tar -xzpf files.tar.gz -C / etc/postfix/main.cf
+Do not unpack the whole archive over an installed panel: it would undo the panel's own configuration.
+Site files and databases are not in this backup.
+NOTE
+    umask "$umask_before"
+    PREINSTALL_BACKUP_DIR="$dir"
+    report_step_result preinstall_backup ok
+    print_success "Current configuration backed up to ${dir} (root only; it holds password hashes and keys)"
+}
+
+# End of an install with a backup: lists the backed-up files the install
+# changed or removed, and where the originals are.
+install_report_replaced_files() {
+    local dir="$PREINSTALL_BACKUP_DIR" count check_rc
+    [[ -n "$dir" ]] || return 0
+    echo -e "\n${BOLD}${CYAN}--- Backup of the previous configuration ---${NC}"
+    echo "${dir}/files.tar.gz holds the files as they were before the install (see ${dir}/README.txt)."
+    check_rc=2
+    if [[ -s "$dir/manifest.sha256" ]]; then
+        # Root-only like the rest of the backup (the umask is the install's again here).
+        install -m 600 /dev/null "$dir/replaced-files.txt"
+        sha256sum --check --quiet "$dir/manifest.sha256" 2>/dev/null | sed -n 's/: FAILED.*$//p' | sort >>"$dir/replaced-files.txt"
+        check_rc=${PIPESTATUS[0]}
+    fi
+    # 0: every file as it was, 1: some changed or gone; anything else (or no
+    # checksum list) says nothing about the files, and must not read as "none".
+    if ((check_rc == 0)); then
+        echo "None of them was changed by the install."
+        return 0
+    fi
+    count=$(grep -c . "$dir/replaced-files.txt" 2>/dev/null || true)
+    if ((check_rc > 1)) || [[ "${count:-0}" == 0 ]]; then
+        echo -e "${YELLOW}WARNING:${NC} could not compare the files with the backup; compare them by hand with ${dir}/manifest.sha256"
+        return 0
+    fi
+    echo "The install changed or removed ${count} of them (full list: ${dir}/replaced-files.txt):"
+    head -n 100 "$dir/replaced-files.txt" | sed 's/^/  /'
+    ((count <= 100)) || echo "  ... and $((count - 100)) more"
+    return 0
+}
+
 # ---------- Stage 1: Check ready for installation ----------
 stage_prerequisites() {
     print_info "Stage 1: Checking that everything is in place and ready for installation"
@@ -1110,6 +1674,9 @@ stage_prerequisites() {
         exit 1
     fi
     check_port_8443
+    report_step_start ""
+    check_selinux_state
+    probe_external_repositories
     # AB-2331: decided before anything is installed, and said once.
     database_skip_decide
     # AB-2339: --database=mysql* installs a new server; it never goes over
@@ -1119,6 +1686,7 @@ stage_prerequisites() {
         report_fail check_commands invalid_argument
         exit 1
     fi
+    check_existing_server
     # AB-2106: a bad key stops the install here, before anything is changed.
     if [[ -n "$SSH_KEY_ARG" ]]; then
         # Reported as a bad argument, not as the port check that ran before it.
@@ -1127,6 +1695,8 @@ stage_prerequisites() {
         report_step_result parse_arguments ok
         print_success "SSH key checked ($(grep -c . <<<"$SSH_KEYS") key(s))"
     fi
+    # A reinstall is the panel's own configuration: nothing to back up.
+    if ((FORCE_EXISTING_SERVER && !ADMINBOLT_ALREADY_INSTALLED)); then backup_existing_configuration; fi
     print_success "Stage 1 completed: ready for installation"
     print_progress "33% — prerequisites"
 }
@@ -1450,6 +2020,11 @@ ssh_password_login_off() {
 
 # ---------- Stage 2: Install base packages ----------
 # Write bolt / bolt-noarch repos for a pulp content tier (stable, staging, testing).
+#
+# Priorities below dnf's default of 99 (lower wins, AB-1407): the AdminBolt
+# repositories carry their own builds of packages the distribution also ships
+# (httpd, httpd-core, ...), and with the previous 300/400 every such name
+# resolved to appstream/baseos instead - hosts ran the distribution Apache.
 install_bolt_repos_from_source() {
     local tier="$1"
     local repofile="$BOLT_REPO_FILE"
@@ -1460,7 +2035,7 @@ name = Adminbolt RHEL - \$releasever - \$basearch
 baseurl = https://mirror.adminbolt.com/pulp/content/${tier}/rhel/\$releasever/\$basearch
 enabled = 1
 gpgcheck = 0
-priority = 300
+priority = 30
 sslverify = 0
 
 [bolt-noarch]
@@ -1468,7 +2043,7 @@ name = Adminbolt RHEL - \$releasever - noarch
 baseurl = https://mirror.adminbolt.com/pulp/content/${tier}/rhel/\$releasever/noarch
 enabled = 1
 gpgcheck = 0
-priority = 400
+priority = 40
 sslverify = 0
 EOF
     print_success "Repository file written: ${repofile}"
@@ -1510,13 +2085,40 @@ install_repo_rhel() {
     local rpm_url="${REPO_BASE_URL}/rhel/${el_version}/noarch/Packages/b/${REPO_PACKAGE}.el${el_version}.noarch.rpm"
     local temp_rpm="/tmp/bolt-repo-${el_version}.rpm"
     print_info "Downloading repository package..."
-    curl -f -L -k -o "$temp_rpm" "$rpm_url" || { print_error "Failed to download repo"; report_fail repo_setup repo_download_failed; exit 1; }
+    curl -f -L -k -o "$temp_rpm" "$rpm_url" || { print_error "Failed to download repo"; STOPPED_STEP="Bolt repository: ${rpm_url} could not be downloaded"; report_fail repo_setup repo_download_failed; exit 1; }
     # A failed install of the downloaded package stops the script as before
     # (with rpm's exit code), reported as a package failure.
     (command -v dnf >/dev/null 2>&1 && dnf install -y "$temp_rpm") || (command -v yum >/dev/null 2>&1 && yum install -y "$temp_rpm") || rpm -ivh "$temp_rpm" \
-        || { rc=$?; report_fail repo_setup package_install_failed; exit "$rc"; }
+        || { rc=$?; STOPPED_STEP="Bolt repository: the repository package did not install"; report_fail repo_setup package_install_failed; exit "$rc"; }
     rm -f "$temp_rpm"
+    rank_bolt_repos "$BOLT_REPO_FILE"
     print_success "Repository installed"
+}
+
+# bolt-repo up to 1.0.7 ships priorities 100 to 400, which lose to dnf's
+# default 99, so a fresh server took httpd from appstream instead of the
+# AdminBolt repositories (AB-1407). Same values as bolt-agent's
+# POST /api/system/repos/bolt and the panel upgrade step; a file that already
+# has them (bolt-repo 1.0.8) is left untouched.
+rank_bolt_repos() {
+    local repo=$1 tmp
+    [[ -f "$repo" ]] || return 0
+    tmp=$(mktemp "${repo%/*}/.bolt.repo.XXXXXX") || return 0
+    awk '/^\[/{sec=$0}
+        /^[[:space:]]*priority[[:space:]]*=/{
+            if (sec=="[bolt-cdn]") {print "priority = 10"; next}
+            if (sec=="[bolt-noarch-cdn]") {print "priority = 20"; next}
+            if (sec=="[bolt]") {print "priority = 30"; next}
+            if (sec=="[bolt-noarch]") {print "priority = 40"; next}
+            if (sec ~ /^\[bolt/) {print "priority = 50"; next}
+        }
+        {print}' "$repo" >"$tmp" || { rm -f "$tmp"; return 0; }
+    # Plain bash comparison: a minimal server has no cmp (diffutils).
+    if [[ "$(<"$repo")" == "$(<"$tmp")" ]]; then
+        rm -f "$tmp"
+    else
+        chmod 0644 "$tmp" && mv -f "$tmp" "$repo" && print_success "Bolt repository priorities set below dnf's default"
+    fi
 }
 
 # Single package install helper: dnf or yum only (AlmaLinux). Skips already-installed. Optional leading args: dnf opts (e.g. --enablerepo=bolt, --exclude=bolt-bootstrap).
@@ -1537,10 +2139,121 @@ install_packages() {
     "$pm" install -y "${dnf_opts[@]}" "${missing[@]}" || {
         local status=$?
         print_error "Installing packages failed ($pm exit $status): ${missing[*]}. See $pm's output above."
+        STOPPED_STEP="Packages ${missing[*]}: $pm exit $status"
         report_fail
         exit "$status"
     }
     print_success "Packages installed"
+}
+
+# ---------------------------------------------------------------------------
+# Optional components (--without=)
+#
+# A small server can leave out whole components. Each one is a set of Stage 3
+# steps, skipped together, because their parts only work together: Postfix
+# hands mail to Dovecot, its submission ports refuse mail while Rspamd is
+# missing (milter_default_action=tempfail), webmail (Roundcube) and the
+# system e-mail account need both. A skipped step is not run and not reported
+# as a result, so the install report does not count it as a failure. The
+# panel computes each service's Installed state on the server, so every
+# skipped service shows as not installed on Health > Services. Install there
+# sets up the package only, not its profiles, so the end of the install
+# prints the skipped commands themselves: run in that order, they add the
+# component later.
+# ---------------------------------------------------------------------------
+readonly OPTIONAL_COMPONENTS="mail dns ftp"
+
+# Stage 3 step ids of an optional component.
+component_steps() {
+    case "$1" in
+        mail) echo "postfix dovecot rspamd mlmmj postfix_profiles dovecot_profiles rspamd_profiles rspamd_restart system_email app_roundcube" ;;
+        dns) echo "powerdns" ;;
+        ftp) echo "vsftpd vsftpd_profile" ;;
+    esac
+}
+
+# What leaving a component out takes away, for --help and the end of the install.
+component_description() {
+    case "$1" in
+        mail) echo "mail: Postfix, Dovecot, Rspamd (spam filter), MLMMJ (mailing lists), Roundcube webmail and the system e-mail account - no mailboxes or webmail, and the panel's own e-mail (alerts, password resets) is not sent" ;;
+        dns) echo "dns: PowerDNS - the server answers no DNS queries, so domains need DNS hosted elsewhere" ;;
+        ftp) echo "ftp: vsftpd - no FTP accounts; files can still be managed in the panel's file manager" ;;
+    esac
+}
+
+# Sets LEFT_OUT_COMPONENTS from a comma-separated list. Every item must be a
+# known component; an empty list or item, or an unknown one, is refused
+# (returns 1, LEFT_OUT_COMPONENTS unchanged) rather than installing more or
+# less than was asked for.
+set_left_out_components() {
+    local list="$1" item component chosen=" " result=""
+    # Lower-case names and commas only: nothing else can name a component,
+    # and a newline would end the split below early.
+    [[ "$list" =~ ^[a-z,]+$ ]] || return 1
+    # A trailing comma would otherwise vanish in the split below.
+    [[ "$list" != *, ]] || return 1
+    local -a items
+    IFS=',' read -r -a items <<<"$list"
+    for item in "${items[@]}"; do
+        _report_in_list "$item" "$OPTIONAL_COMPONENTS" || return 1
+        chosen+="$item "
+    done
+    for component in $OPTIONAL_COMPONENTS; do
+        [[ "$chosen" == *" $component "* ]] && result+="${result:+ }$component"
+    done
+    LEFT_OUT_COMPONENTS="$result"
+}
+
+# Prints the left-out component a Stage 3 step belongs to; returns 1 when the
+# step is to run.
+left_out_component_of_step() {
+    local step="$1" component
+    for component in $LEFT_OUT_COMPONENTS; do
+        if _report_in_list "$step" "$(component_steps "$component")"; then
+            printf '%s' "$component"
+            return 0
+        fi
+    done
+    return 1
+}
+
+# Returns 0 (after saying so, and keeping the command for the end of the
+# install) when the step belongs to a left-out component.
+skip_left_out_step() {
+    local step="$1" desc="$2" cmd="$3" component
+    component=$(left_out_component_of_step "$step") || return 1
+    SKIPPED_COMMANDS+=("$component $cmd")
+    print_info "${desc}: skipped (--without=${component})"
+    echo -e ""
+    return 0
+}
+
+# The choice is kept for the panel in bolt-config.ini, next to the install
+# ID: only the installer knows that a service is missing because it was
+# left out. Written on every install, empty when nothing was left out, so a
+# reinstall that puts everything back leaves no old list behind.
+write_left_out_components() {
+    local value="${LEFT_OUT_COMPONENTS// /,}"
+    _report_ini_set "$REPORT_BOLT_CONFIG" BOLT_INSTALL_WITHOUT "$value" \
+        || echo -e "${YELLOW}WARNING:${NC} could not write BOLT_INSTALL_WITHOUT=${value} to ${REPORT_BOLT_CONFIG}; set it with: bolt-cli set-ini-settings BOLT_INSTALL_WITHOUT ${value:-\"\"}"
+}
+
+print_left_out_components() {
+    local component
+    [[ -n "$LEFT_OUT_COMPONENTS" ]] || return 0
+    echo -e "${YELLOW}NOTE:${NC} Left out at your request (--without):"
+    for component in $LEFT_OUT_COMPONENTS; do
+        echo "  - $(component_description "$component")"
+    done
+    echo "To add one later, run the commands skipped for it as root, in this order:"
+    local entry
+    for component in $LEFT_OUT_COMPONENTS; do
+        echo "  ${component}:"
+        for entry in "${SKIPPED_COMMANDS[@]}"; do
+            [[ "${entry%% *}" == "$component" ]] && echo "    ${entry#* }"
+        done
+    done
+    echo -e ""
 }
 
 # EPEL from the distribution's own repositories (AlmaLinux and Rocky ship
@@ -1571,17 +2284,226 @@ crb_repo_ids() {
 }
 
 # $3 (optional) = step id for the install report.
+# STEP_REPOSITORY (set just before the call, cleared by it) = the external
+# repository the step installs from ("remi"): when the step fails because
+# that repository cannot be reached, it is deferred (AB-472) instead of
+# failed. A variable, not a fourth argument: the step id stays the last word
+# of the call, where the install report's tests look for it.
+STEP_REPOSITORY=""
 run_or_warn() {
-    local cmd="$1" desc="${2:-Command}" step="${3:-}"
+    local cmd="$1" desc="${2:-Command}" step="${3:-}" repository="$STEP_REPOSITORY" out rc=0 owner
+    STEP_REPOSITORY=""
+    LAST_STEP_RESULT=skipped
+    skip_left_out_step "$step" "$desc" "$cmd" && return 0
     print_info "$desc"
     report_step_start "$step"
-    if eval "$cmd"; then print_success "$desc completed"; report_step_result "$step" ok; else echo -e "${YELLOW}WARNING:${NC} $desc failed (continuing)"; report_step_result "$step" failed; fi
+    out=$(mktemp)
+    # tee through a process substitution rather than a pipe: the command still
+    # runs in this shell, so an assignment it makes survives, and its output
+    # still streams live while a copy is kept for the summary (AB-1379).
+    eval "$cmd" > >(tee "$out") 2>&1 || rc=$?
+    wait $! 2>/dev/null || true
+    if [ "$rc" -eq 0 ]; then
+        print_success "$desc completed"; report_step_result "$step" ok
+        LAST_STEP_RESULT=ok
+    elif [[ -n "$repository" ]] && step_waits_for_repository "$repository" "$out"; then
+        echo -e "${YELLOW}NOTE:${NC} $desc deferred: the $(repository_name "$repository") cannot be reached right now. The panel installs it on its own as soon as the repository answers (continuing)"
+        report_step_deferred "$step"
+        DEFERRED_STEPS+=("${desc}: waits for the $(repository_name "$repository")")
+        LAST_STEP_RESULT=deferred
+    elif owner=$(cpanel_owner_of_step "$step"); then
+        echo -e "${YELLOW}NOTE:${NC} $desc is not installed now: cPanel's ${owner} still owns it on this server. The conversion installs it at the cutover, once cPanel is stopped (continuing)"
+        # Reported as left to the cutover, not as failed (AB-2447).
+        report_step_cutover "$step"
+        CONVERSION_STEPS+=("${desc}: cPanel's ${owner} still owns it, installed at the cutover")
+        LAST_STEP_RESULT=conversion
+    else
+        echo -e "${YELLOW}WARNING:${NC} $desc failed (continuing)"; report_step_result "$step" failed
+        record_failure "$desc" "$out"
+        LAST_STEP_RESULT=failed
+    fi
+    rm -f "$out"
+    echo -e ""
+}
+
+# ---------- External package repositories (AB-472) ----------
+# The panel itself comes from the AdminBolt repositories; PHP for websites
+# comes from Remi, the database server from MariaDB, many prerequisites from
+# EPEL. None of them is ours, and an outage of one used to stop an install
+# half way. Each is probed once in Stage 1 (said, never fatal); a step that
+# then fails because Remi cannot be reached is deferred and finished by the
+# panel later.
+
+repository_name() {
+    case "$1" in
+        remi) echo "Remi package repository" ;;
+        epel) echo "EPEL package repository" ;;
+        mariadb) echo "MariaDB package repository" ;;
+        *) echo "$1 package repository" ;;
+    esac
+}
+
+# URLs that answer when the repository can be used: any one is enough. Remi:
+# its mirror list host and the fallback mirrors bolt-agent configures.
+# EL 9 only (the installer supports nothing else); the architecture is the
+# server's.
+repository_probe_urls() {
+    local arch
+    arch=$(uname -m 2>/dev/null)
+    arch="${arch:-x86_64}"
+    case "$1" in
+        remi) echo "http://cdn.remirepo.net/enterprise/9/safe/${arch}/mirror https://rpms.remirepo.net/enterprise/9/safe/${arch}/repodata/repomd.xml https://mirror.23m.com/remi/enterprise/9/safe/${arch}/repodata/repomd.xml https://mirrors.ukfast.co.uk/sites/remi/enterprise/9/safe/${arch}/repodata/repomd.xml https://mirror.team-cymru.com/remi/enterprise/9/safe/${arch}/repodata/repomd.xml" ;;
+        epel) echo "https://mirrors.fedoraproject.org/metalink?repo=epel-9&arch=${arch} https://dl.fedoraproject.org/pub/epel/9/Everything/${arch}/repodata/repomd.xml" ;;
+        mariadb) echo "https://mirror.mariadb.org/yum/ https://mirrors.gigenet.com/mariadb/yum/ https://archive.mariadb.org/" ;;
+    esac
+}
+
+# Whether any address of the repository answers; at most a few seconds each.
+repository_reachable() {
+    local url
+    for url in $(repository_probe_urls "$1"); do
+        curl -fsS -o /dev/null --connect-timeout 4 --max-time 8 "$url" </dev/null >/dev/null 2>&1 && return 0
+    done
+    return 1
+}
+
+# A failed step waits for the repository when bolt-agent said so (reason code
+# remi_repository_unreachable, from bolt-agent with AB-472), or - an agent that
+# predates it - when the step's output names the repository and the
+# repository does not answer now either.
+step_waits_for_repository() {
+    local repository="$1" out="$2"
+    case "$repository" in
+        remi)
+            # Remi answers but dnf failed on it (a lock, GPG, a broken file):
+            # a real failure, never a wait.
+            grep -qi 'remi_metadata_failed' "$out" 2>/dev/null && return 1
+            grep -qiE 'remi_repository_unreachable|Remi repository unreachable' "$out" 2>/dev/null && return 0
+            grep -qiE "remirepo\.net|repo '?remi" "$out" 2>/dev/null && ! repository_reachable remi && return 0
+            ;;
+    esac
+    return 1
+}
+
+# Stage 1: says which external repositories do not answer, before anything
+# is installed. Never stops the install; the three run side by side.
+probe_external_repositories() {
+    local name dir pids=()
+    dir=$(mktemp -d) || return 0
+    for name in remi epel mariadb; do
+        { repository_reachable "$name" || : >"$dir/$name"; } &
+        pids+=("$!")
+    done
+    # Only these three: a bare wait would also wait for the install report's
+    # background sender.
+    wait "${pids[@]}"
+    UNREACHABLE_REPOSITORIES=()
+    for name in remi epel mariadb; do
+        [[ -e "$dir/$name" ]] && UNREACHABLE_REPOSITORIES+=("$name")
+    done
+    rm -rf "$dir"
+    ((${#UNREACHABLE_REPOSITORIES[@]} == 0)) && { print_success "External package repositories answer (Remi, EPEL, MariaDB)"; return 0; }
+    for name in "${UNREACHABLE_REPOSITORIES[@]}"; do
+        case "$name" in
+            remi) echo -e "${YELLOW}NOTE:${NC} The $(repository_name remi) does not answer. The panel installs without it; PHP for websites follows on its own once it answers." ;;
+            epel) echo -e "${YELLOW}WARNING:${NC} The $(repository_name epel) does not answer. Prerequisite packages come from it, so the install may stop in Stage 2 while it is down." ;;
+            mariadb) echo -e "${YELLOW}WARNING:${NC} The $(repository_name mariadb) does not answer. The database server comes from it; the install reports it at the end if it cannot be installed." ;;
+        esac
+    done
+    return 0
+}
+
+# Remember a failed step with the line of its output that says why: the last
+# line mentioning an error, or else its last non-empty line (AB-1379).
+record_failure() {
+    local desc="$1" out="$2" reason
+    reason=$(sed 's/\x1b\[[0-9;]*m//g' "$out" 2>/dev/null | grep -v '^[[:space:]]*$' | grep -iE 'error|fail|exception|cannot|not found|denied' | tail -n 1)
+    [ -n "$reason" ] || reason=$(sed 's/\x1b\[[0-9;]*m//g' "$out" 2>/dev/null | grep -v '^[[:space:]]*$' | tail -n 1)
+    reason=$(echo "${reason:-no output}" | sed 's/^[[:space:]]*//' | cut -c1-200)
+    FAILED_STEPS+=("${desc}: ${reason}")
+}
+
+# True when a failed step ("<step>: <reason>") is the install of a critical
+# component. The name must match exactly: "PHP 8.4 profile" or "Postfix
+# profiles" are follow-up steps, not the component. The MariaDB install is
+# also named after its series ("MariaDB 11.4", "MariaDB (default series)").
+is_critical_step() {
+    local step="${1%%: *}" component
+    for component in "${CRITICAL_COMPONENTS[@]}"; do
+        [ "$step" = "$component" ] && return 0
+    done
+    [[ "$step" =~ ^MariaDB\ ([0-9][0-9.]*|\(default\ series\))$ ]] && return 0
+    return 1
+}
+
+# Whether this install is bolt-migrate's in-place conversion of a live cPanel
+# server (AB-2480): --cpanel-conversion, or cPanel installed and --skip-apache
+# given (what every bolt-migrate since AB-2331 passes, so an older
+# bolt-migrate that does not know --cpanel-conversion is recognised too).
+in_cpanel_conversion() {
+    ((CPANEL_CONVERSION)) && return 0
+    ((SKIP_APACHE)) && [[ -e "$CPANEL_BINARY" ]]
+}
+
+# For a step a conversion leaves to the cutover (CPANEL_OWNED_STEPS), prints
+# the cPanel package that owns its service and succeeds, but only while that
+# package is installed. Fails for every other step, outside a conversion,
+# and on a server without cPanel's package, so a failure there stays a
+# failure (a fresh install keeps exiting 1 when Postfix or Dovecot fail).
+cpanel_owner_of_step() {
+    local step="$1" entry
+    [[ -n "$step" ]] && in_cpanel_conversion || return 1
+    for entry in "${CPANEL_OWNED_STEPS[@]}"; do
+        [[ "${entry%% *}" == "$step" ]] || continue
+        rpm -q --quiet "${entry#* }" >/dev/null 2>&1 || return 1
+        echo "${entry#* }"
+        return 0
+    done
+    return 1
+}
+
+# Closing summary of every failed step, whatever the outcome (AB-1379).
+# Sets CRITICAL_FAILED=1 when a critical component is among them.
+print_failure_summary() {
+    local step count
+    CRITICAL_FAILED=0
+    SUMMARY_PRINTED=1
+    if ((${#DEFERRED_STEPS[@]} > 0)); then
+        echo -e "${BOLD}${YELLOW}--- Deferred: installs on its own (${#DEFERRED_STEPS[@]}) ---${NC}"
+        printf '%b  %s\n' "${YELLOW}DEFERRED${NC}" "${DEFERRED_STEPS[@]}"
+        echo "The panel tries again every few minutes and finishes it as soon as the repository answers; its dashboard shows the progress and offers Try now."
+        echo -e ""
+    fi
+    if ((${#CONVERSION_STEPS[@]} > 0)); then
+        echo -e "${BOLD}${CYAN}--- Left to the conversion: cPanel still owns them (${#CONVERSION_STEPS[@]}) ---${NC}"
+        for step in "${CONVERSION_STEPS[@]}"; do
+            printf '%b  %s\n' "${CYAN}CONVERSION${NC}" "$step"
+        done
+        echo "cPanel keeps serving mail and DNS until bolt-migrate stops its services at the cutover and installs these; nothing to fix here."
+        echo -e ""
+    fi
+    [[ -n "$STOPPED_STEP" ]] || [ "${#FAILED_STEPS[@]}" -gt 0 ] || return 0
+    count=${#FAILED_STEPS[@]}
+    [[ -z "$STOPPED_STEP" ]] || count=$((count + 1))
+    # printf %s, not echo -e: a reason is the step's own output and may carry a
+    # literal "\n" (an agent's JSON error) that must not become a line break.
+    echo -e "${BOLD}${YELLOW}--- Failed steps (${count}) ---${NC}"
+    [[ -z "$STOPPED_STEP" ]] || printf '%b  %s\n' "${RED}STOPPED${NC}" "$STOPPED_STEP"
+    for step in "${FAILED_STEPS[@]}"; do
+        if is_critical_step "$step"; then
+            CRITICAL_FAILED=1
+            printf '%b %s\n' "${RED}CRITICAL${NC}" "$step"
+        else
+            printf '%b  %s\n' "${YELLOW}WARNING${NC}" "$step"
+        fi
+    done
     echo -e ""
 }
 run_or_fail() {
     local cmd="$1" desc="${2:-Command}" step="${3:-}"
+    skip_left_out_step "$step" "$desc" "$cmd" && return 0
     report_step_start "$step"
-    if ! eval "$cmd"; then print_error "${desc} failed"; report_fail "$step"; exit 1; fi
+    if ! eval "$cmd"; then print_error "${desc} failed"; STOPPED_STEP="${desc}: failed, the installation cannot go on without it"; report_fail "$step"; exit 1; fi
     report_step_result "$step" ok
     print_success "${desc} completed"
     echo -e ""
@@ -1624,6 +2546,17 @@ stage2_prepare_settings() {
     print_success "Stage 2.1 completed: settings prepared"
 }
 
+# CloudLinux tools (X-Ray, MySQL Governor, lve-utils) call /sbin/service
+# directly; minimal EL9 images ship neither package that provides it.
+ensure_service_command() {
+    if rpm -q initscripts &>/dev/null || rpm -q initscripts-service &>/dev/null; then
+        print_success "service command already provided (initscripts/initscripts-service)"
+        return 0
+    fi
+    print_info "Installing initscripts-service (provides the service command)"
+    install_packages initscripts-service
+}
+
 # Step 2.2: Install all prerequisite packages (EPEL, CRB, libsodium, traceroute, openssl, jq, etc.)
 stage2_install_prerequisite_packages() {
     print_info "Stage 2.2: Installing prerequisite packages"
@@ -1646,6 +2579,7 @@ stage2_install_prerequisite_packages() {
         libsodium traceroute openssl jq rsync ca-certificates wget curl tar gzip unzip zip sudo apg \
         systemd openssl-libs libcurl libzip zlib gmp freetype libjpeg-turbo libpng libwebp libXpm gd \
         gettext-libs libicu sqlite-libs oniguruma libxslt shadow-utils chrony restic rclone git
+    ensure_service_command
     run_or_warn "systemctl enable --now chronyd" "Time synchronization (chronyd)" chronyd
     # pipefail: a failed download feeds sh nothing, which sh reports as success.
     run_or_warn "(set -o pipefail; curl https://get.acme.sh | sh -s email=issue-ssl@adminbolt.com)" "acme.sh" acme_sh
@@ -1783,6 +2717,7 @@ agent_setup_failed() {
         next="The installer could not record this failure in $AGENT_POST_FAILED_MARKER, so a rerun may not install the agent again by itself. Fix the cause, run 'mkdir -p $(dirname "$AGENT_POST_FAILED_MARKER") && touch $AGENT_POST_FAILED_MARKER', then rerun this installer."
     fi
     print_error "$1 $next"
+    STOPPED_STEP="bolt-agent: its setup did not finish"
     report_fail agent_scriptlet agent_install_failed
     exit 1
 }
@@ -1896,6 +2831,7 @@ install_bolt_agent_and_check_post() {
     if [[ "$dnf_status" -ne 0 ]]; then
         rm -f "$log"
         print_error "Installing bolt-agent failed"
+        STOPPED_STEP="bolt-agent: the package did not install"
         report_fail agent_install agent_install_failed
         exit 1
     fi
@@ -1973,6 +2909,7 @@ install_bolt_panel_and_check_post() {
     ((errexit)) && set -e
     if [[ "$status" -ne 0 ]]; then
         rm -f "$log"
+        STOPPED_STEP="bolt-panel: the package did not install (exit ${status})"
         report_fail panel_install package_install_failed
         exit "$status"
     fi
@@ -1999,6 +2936,7 @@ stage2_install_bolt_packages() {
     install_bolt_panel_and_check_post "$panel_pkg"
     install_pinned_extra_packages
     report_write_panel_settings
+    write_left_out_components
     report_step_start web_services_enable
     systemctl enable --now bolt-nginx bolt-php
     report_step_result web_services_enable ok
@@ -2053,7 +2991,13 @@ stage_configuration() {
     run_or_warn "bolt-cli manage-redis --action=install" "Redis" redis
     run_or_warn "bolt-cli manage-rspamd --action=install" "Rspamd" rspamd
     run_or_warn "bolt-cli manage-mlmmj --action=install" "MLMMJ" mlmmj
+    # AB-472: PHP 8.4 comes from Remi; while Remi cannot be reached it is
+    # deferred, not failed - the post-install setup queued below installs it
+    # (and its default profile) once Remi answers. Any other failure stays
+    # critical (AB-1379).
+    STEP_REPOSITORY=remi
     run_or_warn "bolt-cli manage-php --action=install --php-version=8.4" "PHP 8.4" php84
+    local php84_result="$LAST_STEP_RESULT"
     if ((SKIP_APACHE)); then
         print_info "MyApache skipped (--skip-apache)"
     else
@@ -2089,7 +3033,17 @@ stage_configuration() {
     fi
     run_or_warn "bolt-cli manage-system-email-account --action=install" "System email" system_email
     run_or_warn "bolt-cli manage-dns-records-default-template --action=install" "DNS template" dns_template
-    run_or_warn "bolt-cli manage-php-default-profile --php-version=8.4 --action=install" "PHP 8.4 profile" php84_profile
+    if [[ "$php84_result" == deferred ]]; then
+        print_info "PHP 8.4 profile: deferred, applied when PHP 8.4 installs"
+        echo -e ""
+    elif [[ "$php84_result" == failed ]]; then
+        # The profile marks the version installed in the panel; without PHP
+        # 8.4 on the server that would be untrue.
+        print_info "PHP 8.4 profile: skipped, PHP 8.4 did not install"
+        echo -e ""
+    else
+        run_or_warn "bolt-cli manage-php-default-profile --php-version=8.4 --action=install" "PHP 8.4 profile" php84_profile
+    fi
     run_or_warn "bolt-cli manage-vsftpd-profiles --action=install" "Vsftpd profile" vsftpd_profile
     run_or_warn "bolt-cli manage-fail2ban-profiles --action=install" "Fail2Ban profile" fail2ban_profile
     run_or_warn "bolt-cli setup-cron-jobs" "Setup Cron jobs" cron_jobs
@@ -2099,6 +3053,11 @@ stage_configuration() {
     # QA F2: a bare restart under set -e aborted the whole run (no trial
     # licence, no SSO URL, no banner) whenever rspamd was not installed.
     run_or_warn "systemctl restart rspamd" "Rspamd restart" rspamd_restart
+    # AB-2069: the page the web server shows on port 80 for the server IP (and
+    # for domains with no site yet). Written by the panel through bolt-agent, so
+    # it carries the brand and the panel port; never fatal. No step id: the
+    # install report takes only the step ids its receiver knows.
+    run_or_warn "bolt-cli publish-default-site-page" "Default site page"
     # Before the trial licence and the SSH password change: a failed install
     # keeps password login and does not use up the trial request.
     check_agent_setup_at_end
@@ -2115,22 +3074,102 @@ stage_configuration() {
     fi
     # AB-2106: last, after every step that configures sshd, so they cannot undo it and a failed install keeps password login.
     ssh_password_login_off || true
-    local SSO_URL
-    SSO_URL=$(bolt-cli admin-sso-generate 2>/dev/null || echo "")
-    if [ -z "${SSO_URL}" ]; then
-        echo -e "${YELLOW}WARNING:${NC} SSO URL not generated"
-    else
+    # AB-2104: the SSO link creates the first administrator, under the
+    # --admin-username= name when one was given.
+    local SSO_ARGS=()
+    [[ -n "$ADMIN_USERNAME" ]] && SSO_ARGS+=("--first-admin=${ADMIN_USERNAME}")
+    local SSO_URL=""
+    local SSO_OUT=""
+    local SSO_RETRY="bolt-cli admin-sso-generate"
+    local SSO_ERR_FILE
+    SSO_ERR_FILE=$(mktemp)
+    if SSO_OUT=$(bolt-cli admin-sso-generate "${SSO_ARGS[@]}" 2>"$SSO_ERR_FILE"); then
+        SSO_URL="${SSO_OUT}"
         print_success "SSO URL generated"
+    elif [[ -n "$ADMIN_USERNAME" ]] && { grep -qi 'option does not exist' "$SSO_ERR_FILE" || grep -qi 'option does not exist' <<<"$SSO_OUT"; }; then
+        # A panel that predates --first-admin: nothing was created, so fall back to the default name, loudly.
+        echo -e "${YELLOW}WARNING:${NC} the installed panel does not support --admin-username yet; the first administrator is named admin"
+        ADMIN_USERNAME=""
+        if SSO_OUT=$(bolt-cli admin-sso-generate 2>/dev/null); then
+            SSO_URL="${SSO_OUT}"
+            print_success "SSO URL generated"
+        else
+            echo -e "${YELLOW}WARNING:${NC} SSO URL not generated${SSO_OUT:+: ${SSO_OUT}}"
+        fi
+    else
+        echo -e "${YELLOW}WARNING:${NC} SSO URL not generated${SSO_OUT:+: ${SSO_OUT}}"
+        # The reason above says whether the panel refused the name; a refused name needs another one on retry.
+        [[ -n "$ADMIN_USERNAME" ]] && SSO_RETRY+=" --first-admin=<name|random>"
+    fi
+    rm -f "$SSO_ERR_FILE"
+    # The name to sign in with later: the one the panel reports for the link
+    # ("Logs in as administrator: <name>"), else the one asked for, else
+    # admin. Without a link the asked-for name may have been refused, so the
+    # retry command below names it.
+    local ADMIN_LOGIN_NAME=""
+    [[ -n "$SSO_URL" ]] && ADMIN_LOGIN_NAME=$(sed -n 's/^Logs in as administrator: //p' <<<"$SSO_OUT" | head -n 1)
+    if [[ -z "$ADMIN_LOGIN_NAME" ]]; then
+        if [[ -z "$ADMIN_USERNAME" ]]; then
+            ADMIN_LOGIN_NAME="admin"
+        elif [[ -n "$SSO_URL" && "$ADMIN_USERNAME" != random ]]; then
+            ADMIN_LOGIN_NAME="$ADMIN_USERNAME"
+        else
+            ADMIN_LOGIN_NAME="the one the panel shows when the sign-in link is generated"
+        fi
     fi
     [ -n "${SSH_PASSWORD_NOTE}" ] && echo -e "\n${SSH_PASSWORD_NOTE}"
-    echo -e "\n${BOLD}${GREEN}+----------------------------------------------------------+${NC}"
-    echo -e "${BOLD}${GREEN}|          Installation Completed Successfully             |${NC}"
-    echo -e "${BOLD}${GREEN}+----------------------------------------------------------+${NC}\n"
-    [ -n "${ADMIN_EMAIL}" ] && [ "${TRIAL_LICENCE_OK}" -eq 0 ] && echo -e "${YELLOW}NOTE:${NC} Trial licence not issued (request refused or licence server unreachable). The installation itself succeeded and the panel is usable; activate a licence on its License page.\n"
+    echo -e ""
+    print_failure_summary
+    if [ "$CRITICAL_FAILED" -eq 1 ]; then
+        echo -e "${BOLD}${RED}+----------------------------------------------------------+${NC}"
+        echo -e "${BOLD}${RED}|  Installation Incomplete: critical components failed     |${NC}"
+        echo -e "${BOLD}${RED}+----------------------------------------------------------+${NC}\n"
+        echo -e "${RED}This server cannot host mail, databases or PHP sites until the CRITICAL steps above are fixed and installed again (bolt-cli manage-<component> --action=install).${NC}\n"
+    elif [ "${#FAILED_STEPS[@]}" -gt 0 ]; then
+        echo -e "${BOLD}${YELLOW}+----------------------------------------------------------+${NC}"
+        echo -e "${BOLD}${YELLOW}|          Installation Completed With Warnings            |${NC}"
+        echo -e "${BOLD}${YELLOW}+----------------------------------------------------------+${NC}\n"
+    elif [ "${#DEFERRED_STEPS[@]}" -gt 0 ]; then
+        echo -e "${BOLD}${GREEN}+----------------------------------------------------------+${NC}"
+        echo -e "${BOLD}${GREEN}|      Installation Completed: deferred parts follow       |${NC}"
+        echo -e "${BOLD}${GREEN}+----------------------------------------------------------+${NC}\n"
+    elif [ "${#CONVERSION_STEPS[@]}" -gt 0 ]; then
+        echo -e "${BOLD}${GREEN}+----------------------------------------------------------+${NC}"
+        echo -e "${BOLD}${GREEN}|  Installation Completed: mail and DNS follow at cutover  |${NC}"
+        echo -e "${BOLD}${GREEN}+----------------------------------------------------------+${NC}\n"
+    else
+        echo -e "${BOLD}${GREEN}+----------------------------------------------------------+${NC}"
+        echo -e "${BOLD}${GREEN}|          Installation Completed Successfully             |${NC}"
+        echo -e "${BOLD}${GREEN}+----------------------------------------------------------+${NC}\n"
+    fi
+    if [ -n "${ADMIN_EMAIL}" ] && [ "${TRIAL_LICENCE_OK}" -eq 0 ]; then
+        # QA finding 2: "the installation itself succeeded" only when it did.
+        if [ "$CRITICAL_FAILED" -eq 1 ]; then
+            echo -e "${YELLOW}NOTE:${NC} Trial licence not issued (request refused or licence server unreachable). Activate a licence on the panel's License page.\n"
+        else
+            echo -e "${YELLOW}NOTE:${NC} Trial licence not issued (request refused or licence server unreachable). The installation itself succeeded and the panel is usable; activate a licence on its License page.\n"
+        fi
+    fi
+    print_left_out_components
     [ -n "${SSO_URL:-}" ] && echo -e "${BOLD}${CYAN}--- Access ---${NC}\n${GREEN}Admin Panel:${NC}\n${BOLD}${SSO_URL}${NC}\n"
-    echo -e "${GREEN}New SSO URL:${NC}\n${BOLD}bolt-cli admin-sso-generate${NC}"
+    # AB-2069: nothing here used to say which login the panel takes, and the
+    # guesses (root, the hosting username, an e-mail) each counted towards a
+    # Fail2Ban ban. The link above signs in once; this is for every time after.
+    echo -e "${BOLD}${CYAN}--- Signing in later ---${NC}"
+    echo -e "${GREEN}Admin username:${NC} ${BOLD}${ADMIN_LOGIN_NAME}${NC} (or the e-mail you enter in the setup wizard)"
+    echo -e "${GREEN}Password:${NC} the one you set in the setup wizard that opens with the link above"
+    echo -e "${GREEN}Until the setup wizard is finished, root can also sign in with this server's root password; the wizard offers to turn that off.${NC}\n"
+    echo -e "${BOLD}${CYAN}--- If you get locked out ---${NC}"
+    echo -e "${GREEN}New one-time sign-in link:${NC} ${BOLD}${SSO_RETRY}${NC}"
+    echo -e "${GREEN}Reset the admin password:${NC}  ${BOLD}bolt-cli reset-admin-account-password${NC}"
+    echo -e "${GREEN}Lift a Fail2Ban ban:${NC}       ${BOLD}bolt-cli fail2ban-unban <your-ip> --whitelist${NC}"
+    install_report_replaced_files
     print_progress "100% — post-install"
-    print_success "Stage 3 completed: all post-install actions done"
+    if [ "$CRITICAL_FAILED" -eq 1 ]; then
+        print_error "Stage 3 finished with failed critical components"
+    else
+        print_success "Stage 3 completed: all post-install actions done"
+    fi
 }
 
 # The MariaDB step of Stage 3, on a box without a database server.
@@ -2162,6 +3201,11 @@ stage_configuration_mariadb() {
             echo "$MARIADB_OUT"
             echo -e "${YELLOW}WARNING:${NC} MariaDB ${MARIADB_SERIES} failed (continuing)"
             report_step_result mariadb failed
+            local mariadb_out_file
+            mariadb_out_file=$(mktemp)
+            printf '%s\n' "$MARIADB_OUT" > "$mariadb_out_file"
+            record_failure "MariaDB ${MARIADB_SERIES}" "$mariadb_out_file"
+            rm -f "$mariadb_out_file"
         fi
         echo -e ""
     else
@@ -2520,7 +3564,7 @@ agent_db_credentials_from_my_cnf() {
 
 # ---------- Main ----------
 print_usage() {
-    echo "Usage: sudo $0 [--help] [--version=<PANEL_VERSION>] [--agent-version=<version-release>] [--package=<bolt-name>=<version-release> ...] [--source=<stable|staging|testing>] [--email=<address>] [--mariadb-version=<10.11|11.4>] [--database=<mariadb|mysql8.0|mysql8.4>] [--skip-database] [--skip-apache] [--channel=<name>] [--no-telemetry] [--ssh-key=<public key|https URL>]"
+    echo "Usage: sudo $0 [--help] [--version=<PANEL_VERSION>] [--agent-version=<version-release>] [--package=<bolt-name>=<version-release> ...] [--source=<stable|staging|testing>] [--email=<address>] [--mariadb-version=<10.11|11.4>] [--database=<mariadb|mysql8.0|mysql8.4>] [--without=<mail,dns,ftp>] [--skip-database] [--skip-apache] [--cpanel-conversion] [--channel=<name>] [--no-telemetry] [--ssh-key=<public key|https URL>] [--admin-username=<name|random>] [--force-existing-server]"
     echo "AlmaLinux 9 / Rocky Linux 9 / CloudLinux 9. Stages: 1=ready check, 2=(2.1 settings, 2.2 prereq packages, 2.3 bolt packages), 3=post-install."
     echo "If --version is not provided, latest bolt-panel from repo is installed."
     echo "If --source is not provided, the bolt-repo RPM from adminbolt is used (default). Otherwise repos point at pulp content stable/staging/testing."
@@ -2528,11 +3572,20 @@ print_usage() {
     echo "--skip-database runs no database step (no MariaDB package, series, root password reset or my.cnf profile); the panel uses the MySQL/MariaDB server already on this server, with the administrator login from ${ROOT_MY_CNF} ([client] user= and password=) copied into [dbservers.mariadb] of ${AGENT_CONF}. The database steps are skipped by themselves when a database server answers (mysqladmin ping) or a server package is installed (MariaDB-server, mariadb-server, mysql-server, cl-MySQL*, cl-MariaDB*, ...)."
     echo "--database=mysql8.0 or --database=mysql8.4 installs MySQL from the distribution (AppStream) instead of MariaDB, sets a random root password in ${ROOT_MY_CNF} and points the panel at it; MariaDB (the default, --database=mariadb) is not installed then. It cannot be combined with --skip-database or --mariadb-version, and it refuses a server that already has a database server."
     echo "--skip-apache runs no Apache step (manage-my-apache and its default profile); the web server is then the caller's to set up."
+    echo "--cpanel-conversion is passed by bolt-migrate when it converts a live cPanel server in place (a cPanel server with --skip-apache is recognised by itself): PowerDNS, Postfix and Dovecot that cannot install because cPanel's cpanel-pdns, cpanel-exim or cpanel-dovecot still owns them are listed as left to the conversion, which installs them at the cutover, and do not fail the install. Without cPanel's package a failure stays a failure."
     echo "If --mariadb-version is not provided, MariaDB ${DEFAULT_MARIADB_SERIES} is installed (long-term series, supported until 2029); --mariadb-version=10.11 installs the previous long-term series (supported until 2028). A server that already has a database server keeps it as it is (see --skip-database)."
     echo "If --email is provided, a 24h trial licence is requested for that address at the very end of the install (clicking the e-mailed confirmation link extends it to the full trial period); the install completes even if the request is refused."
     echo "Without --email the install proceeds unlicensed; activate on the panel's License page."
+    echo "The installer is meant for a fresh server. It stops when it finds a web, mail, DNS or database server, a firewall with rules of its own, or files in /home or /var/www, and lists what the install would replace. --force-existing-server installs anyway, after backing up /etc, /var/spool/cron, /root/.my.cnf, /usr/bin/mlmmj-make-ml.sh and the files the install writes in /var/www/html to /root/adminbolt-preinstall-backup-<date>/. A cPanel server that bolt-migrate converts in place (--cpanel-conversion or --skip-apache, with cPanel installed) is not checked, and is backed up only with --force-existing-server."
+    echo "--without leaves optional components out, for servers with little memory (comma-separated; everything is installed by default):"
+    local component
+    for component in $OPTIONAL_COMPONENTS; do
+        echo "  $(component_description "$component")"
+    done
+    echo "  The end of the install prints the skipped commands, which add a left-out component later."
     echo "--channel names what started the install (${REPORT_CHANNELS// /, }); default direct."
     echo "The installer reports its progress and result (no hostnames, e-mail addresses or passwords) to AdminBolt; --no-telemetry (or ADMINBOLT_NO_TELEMETRY=1) turns this off for the installer and the panel."
+    echo "If --admin-username is not provided, the first panel administrator is named admin. --admin-username=random names it admin- plus 6 random characters; any other value is used as the name (3-32 characters: lowercase letters, numbers, dots, dashes or underscores, starting with a letter; not a reserved system name, a hosting account or an existing Linux user). The setup wizard can still rename it."
     echo "If --ssh-key is provided (a public key, or an https:// URL serving keys), the key is added to root's authorized_keys; SSH password login for root is turned off at the end only after a root sign-in with that key is seen (at a terminal the installer waits up to 10 minutes for one), otherwise it stays on."
 }
 
@@ -2556,6 +3609,19 @@ main() {
             --mariadb-version=*)
                 MARIADB_SERIES="${arg#--mariadb-version=}"
                 ;;
+            --without=*)
+                # Joined with a comma, so an empty occurrence stays visible and is refused.
+                ((WITHOUT_GIVEN)) && WITHOUT_ARG+=","
+                WITHOUT_ARG+="${arg#--without=}"
+                WITHOUT_GIVEN=1
+                ;;
+            --[Ww][Ii][Tt][Hh][Oo][Uu][Tt]*)
+                # "--without mail", "--without-mail" or "--Without=mail" would
+                # otherwise install everything without a word: the value goes
+                # in the same argument, after "--without=".
+                ((WITHOUT_GIVEN)) && WITHOUT_ARG+=","
+                WITHOUT_GIVEN=1
+                ;;
             --skip-database)
                 SKIP_DATABASE=1
                 ;;
@@ -2564,6 +3630,9 @@ main() {
                 ;;
             --skip-apache)
                 SKIP_APACHE=1
+                ;;
+            --cpanel-conversion)
+                CPANEL_CONVERSION=1
                 ;;
             --agent-version=*)
                 AGENT_VERSION="${arg#--agent-version=}"
@@ -2580,8 +3649,21 @@ main() {
                 REPORT_CHANNEL_ARG=""
                 REPORT_CHANNEL_GIVEN=1
                 ;;
+            --force-existing-server)
+                FORCE_EXISTING_SERVER=1
+                ;;
             --no-telemetry)
                 REPORT_NO_TELEMETRY=1
+                ;;
+            --admin-username=*)
+                ADMIN_USERNAME="${arg#--admin-username=}"
+                ADMIN_USERNAME_GIVEN=1
+                ;;
+            --admin-username)
+                # "--admin-username bob" would otherwise name the account admin
+                # without a word: the value goes after "--admin-username=".
+                ADMIN_USERNAME=""
+                ADMIN_USERNAME_GIVEN=1
                 ;;
             --ssh-key=*)
                 SSH_KEY_ARG="${arg#--ssh-key=}"
@@ -2641,6 +3723,15 @@ main() {
         fi
     fi
 
+    if ((WITHOUT_GIVEN)) && ! set_left_out_components "$WITHOUT_ARG"; then
+        local shown="${WITHOUT_ARG:0:40}"
+        shown="${shown//[^[:print:]]/?}"
+        printf '%bERROR:%b Invalid --without=%s (give --without=<list>, comma-separated, of: %s)\n' "$RED" "$NC" "$shown" "${OPTIONAL_COMPONENTS// /, }" >&2
+        print_usage
+        report_fail parse_arguments invalid_argument
+        exit 1
+    fi
+
     # Before the @: letters, digits and most other characters RFC 5322 allows
     # in an address (! # % & ' * + / = ? ^ _ { | } ~ . -); after it: a domain
     # of letters, digits, hyphens and dots. Refused before anything is
@@ -2651,6 +3742,17 @@ main() {
     if [[ -n "$ADMIN_EMAIL" && ! "$ADMIN_EMAIL" =~ $email_re ]]; then
         printf '%bERROR:%b Invalid --email=%s (expected name@domain.tld; no spaces, ", $, `, ; or control characters)\n' \
             "$RED" "$NC" "$(shown_arg "$ADMIN_EMAIL")" >&2
+        print_usage
+        report_fail parse_arguments invalid_argument
+        exit 1
+    fi
+
+    # AB-2104: format only, the panel's own rule for an administrator name;
+    # the panel checks the rest (root, reserved names, hosting accounts,
+    # Linux users) when it creates the account.
+    if ((ADMIN_USERNAME_GIVEN)) && [[ "$ADMIN_USERNAME" != "random" && ! "$ADMIN_USERNAME" =~ ^[a-z][a-z0-9._-]{2,31}$ ]]; then
+        printf '%bERROR:%b Invalid --admin-username=%s (3-32 characters: lowercase letters, numbers, dots, dashes or underscores, starting with a letter; or random)\n' \
+            "$RED" "$NC" "$(shown_arg "$ADMIN_USERNAME")" >&2
         print_usage
         report_fail parse_arguments invalid_argument
         exit 1
@@ -2714,6 +3816,11 @@ main() {
     time_total_end
     # Stage 4, for the install report only: prints nothing, changes nothing.
     report_readiness_check
+
+    # AB-1379: a failed critical component makes the whole install fail, after
+    # the summary and the access details have been printed.
+    [ "${CRITICAL_FAILED:-0}" -eq 1 ] && exit 1
+    return 0
 }
 
 # ADMINBOLT_INSTALL_SOURCE_ONLY=1 loads the functions without running the
