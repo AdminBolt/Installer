@@ -33,6 +33,8 @@ jobs:
         run: bash tests/bolt_migrate_contract_test.sh
       - name: MariaDB series (AB-2228)
         run: bash tests/mariadb_default_test.sh
+      - name: Database engine, MySQL 8.0 and 8.4 (AB-2339)
+        run: bash tests/database_engine_test.sh
       - name: E-mail argument (AB-2211)
         run: bash tests/email_test.sh
       - name: Install report (AB-2067)
