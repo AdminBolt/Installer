@@ -9,7 +9,16 @@
 #   - an argument the installer does not know is ignored, not refused
 #     (bolt-migrate passes --auto-upgrade=1, and an older bolt-migrate passes
 #     flags a newer installer may have dropped);
-#   - CloudLinux 9 is accepted.
+#   - CloudLinux 9 is accepted;
+#   - the closing summary keeps the lines bolt-migrate reads when the
+#     installer exits non-zero (AB-2480): "CRITICAL <step>: <reason>",
+#     "CONVERSION  <step>: <why>", "STOPPED" and "Stage 3 finished with
+#     failed critical components", and --cpanel-conversion is parsed;
+#   - the report channel convert is in REPORT_CHANNELS (AB-2447): bolt-migrate
+#     passes --channel=convert only to an installer whose line lists it;
+#   - a conversion is not stopped by the existing-server check (AB-2109):
+#     bolt-migrate's arguments on a cPanel server pass Stage 1 without a
+#     backup. Tested in tests/preflight_test.sh, section "cPanel conversion".
 # Renaming or removing any of these needs a matching bolt-migrate release
 # first. bolt-migrate also checks the published installer every day
 # (bolt-migrate .github/workflows/installer-compat.yml).
@@ -29,7 +38,7 @@ nok() { FAIL=$((FAIL + 1)); echo "not ok - $1"; }
 
 bash -n "$INSTALL_SH" && ok "install.sh parses" || nok "install.sh parses"
 
-for arm in '--skip-database)' '--skip-apache)' '--version=*)' '--source=*)' '--agent-version=*)' '--package=*)' '--channel=*)'; do
+for arm in '--skip-database)' '--skip-apache)' '--cpanel-conversion)' '--version=*)' '--source=*)' '--agent-version=*)' '--package=*)' '--channel=*)'; do
     if grep -qF -- "$arm" "$INSTALL_SH"; then ok "parser has $arm"; else nok "parser has $arm (bolt-migrate passes it)"; fi
 done
 
@@ -45,6 +54,18 @@ else
 fi
 
 if grep -qE 'almalinux\|rocky\|cloudlinux\)|cloudlinux\)' "$INSTALL_SH"; then ok "CloudLinux 9 accepted by detect_distribution"; else nok "CloudLinux 9 accepted by detect_distribution"; fi
+
+# AB-2480: what bolt-migrate (internal/install) reads from the summary.
+for line in '"${RED}CRITICAL${NC}" "$step"' '"${CYAN}CONVERSION${NC}" "$step"' '"${RED}STOPPED${NC}" "$STOPPED_STEP"' 'print_error "Stage 3 finished with failed critical components"'; do
+    if grep -qF -- "$line" "$INSTALL_SH"; then ok "summary prints $line"; else nok "summary prints $line (bolt-migrate reads it)"; fi
+done
+for owned in 'postfix cpanel-exim' 'dovecot cpanel-dovecot' 'powerdns cpanel-pdns'; do
+    if grep -qF -- "\"$owned\"" "$INSTALL_SH"; then ok "conversion leaves $owned to the cutover"; else nok "conversion leaves $owned to the cutover (bolt-migrate expects it)"; fi
+done
+
+# AB-2447: bolt-migrate (internal/install) reads this line to decide whether
+# it passes --channel=convert.
+if grep -qE '^REPORT_CHANNELS="([^"]* )?convert( [^"]*)?"$' "$INSTALL_SH"; then ok "REPORT_CHANNELS lists convert"; else nok "REPORT_CHANNELS lists convert (bolt-migrate passes --channel=convert)"; fi
 
 echo "# passed: $PASS, failed: $FAIL"
 [[ $FAIL -eq 0 ]]
