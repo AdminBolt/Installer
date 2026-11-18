@@ -4,6 +4,7 @@
 
 - **AlmaLinux 9**, **Rocky Linux 9** or **CloudLinux 9**
 - Root access (run with `sudo`)
+- A **fresh** server: the installer sets up its own web, mail, DNS, database and firewall stack (see [Servers already in use](#servers-already-in-use))
 
 ## Installation
 
@@ -51,9 +52,11 @@ sudo ./install.sh --mariadb-version=10.11
 | `sudo ./install.sh --without=<mail,dns,ftp>` | Leave optional components out, for servers with little memory (see [Optional components](#optional-components)) |
 | `sudo ./install.sh --skip-database` | Run no database step: no MariaDB package, series, root password reset or MariaDB profile. The panel uses the database server already on this server (see below) |
 | `sudo ./install.sh --skip-apache` | Run no Apache step (`manage-my-apache` and the default Apache profile); the web server is then set up by whoever runs the installer |
+| `sudo ./install.sh --cpanel-conversion` | Passed by bolt-migrate when it converts a live cPanel server in place: the mail and DNS steps that cPanel's packages still own are left to the conversion instead of failing the install (see [How the install ends](#how-the-install-ends)) |
 | `sudo ./install.sh --agent-version=<version-release>` | Install exactly this bolt-agent build (for example `1.30.4-1.el9`) instead of the latest |
 | `sudo ./install.sh --package=<bolt-name>=<version-release>` | Install exactly this build of another `bolt-*` package (for example `--package=bolt-php=8.4.14-1.el9`); repeatable, one package per option |
-| `sudo ./install.sh --channel=<name>` | Name what started the install (`direct` by default; `get-script`, `web-installer`, `vultr`, `akamai`, `node`, `image-build`, `test`, `hostinger`, `digitalocean`, `aws`, `azure`); any other value prints a warning and the install is reported as `direct` |
+| `sudo ./install.sh --channel=<name>` | Name what started the install (`direct` by default; `get-script`, `web-installer`, `vultr`, `akamai`, `node`, `image-build`, `test`, `hostinger`, `digitalocean`, `aws`, `azure`, `convert`); any other value prints a warning and the install is reported as `direct` |
+| `sudo ./install.sh --force-existing-server` | Install on a server that is already in use, after backing up its configuration (see [Servers already in use](#servers-already-in-use)) |
 | `sudo ./install.sh --no-telemetry` | Do not send the install report (same as `ADMINBOLT_NO_TELEMETRY=1`) |
 | `sudo ./install.sh --admin-username=<name\|random>` | Name the first panel administrator (default `admin`; `random` = `admin-` plus 6 random characters) |
 | `sudo ./install.sh --ssh-key="<public key>"` | Add an SSH key for root and turn SSH password login for root off once a sign-in with that key is seen (also `--ssh-key=https://...` for a URL that serves keys) |
@@ -94,11 +97,24 @@ At the end of the install, SSH password login for root is turned off only when a
 Otherwise password login stays on and the installer prints the reason and the command to turn it off later.
 Password login for root is turned off by `/etc/ssh/sshd_config.d/00-adminbolt-ssh-key-only.conf`; remove that file and run `systemctl reload sshd` to allow it again.
 
+### How the install ends
+
+The end of the install lists every step that failed, with the line of its output that says why, and the exit status follows it:
+
+- MariaDB, Postfix, Dovecot or PHP 8.4 failed (critical components): `Installation Incomplete`, exit status 1.
+- Only other steps failed: `Installation Completed With Warnings`, exit status 0.
+- In-place conversion of a live cPanel server by bolt-migrate (`--cpanel-conversion`, or cPanel installed and `--skip-apache` given): PowerDNS, Postfix and Dovecot, and the Postfix and Dovecot profiles, cannot install while cPanel's `cpanel-pdns`, `cpanel-exim` and `cpanel-dovecot` own them. They are listed as `CONVERSION` under `Left to the conversion`, not failed, and the install ends with `Installation Completed: mail and DNS follow at cutover`, exit status 0; bolt-migrate installs them at the cutover, after it stops cPanel's services. Without cPanel's package installed the step is a failure like on any other server.
+- The install stopped early (a Stage 2 package, bolt-agent, bolt-panel, connecting the agent to the panel): the step that stopped it and the steps that failed before it, then `Installation stopped early`.
+
+Stage 1 checks that the external package repositories answer (Remi for PHP, EPEL, MariaDB) and says which do not; that never stops the install. PHP 8.4 comes from Remi: while Remi cannot be reached it is listed as `DEFERRED`, not failed, and the install ends with exit status 0. The panel installs it (and its default profile) on its own as soon as Remi answers again: its dashboard shows PHP 8.4 waiting for the Remi repository, tries again every few minutes and offers `Try now`.
+
+Stage 1 also refuses to start when `/etc/selinux/config` sets `SELINUX=enforcing` or `permissive` and `semanage` cannot use the SELinux policy store: the Postfix, Dovecot and Rspamd steps would fail. Install the policy (`dnf install selinux-policy-targeted`) or set `SELINUX=disabled`.
+
 ## Install flow
 
 The installer runs in 3 stages:
 
-1. Check prerequisites (root, supported OS, required commands, port 8443 availability, an existing database server)
+1. Check prerequisites (root, supported OS, required commands, port 8443 availability, an existing database server, no existing web/mail/DNS setup or user data)
 2. Prepare system and install prerequisite/Bolt packages
 3. Run `bolt-cli` post-install actions and print access details
 
@@ -136,13 +152,35 @@ The panel reads `BOLT_INSTALL_WITHOUT` together with what is installed now, so a
 
 PHP 8.4, Apache, MariaDB, Redis, nftables and SSH are always installed: the panel and the hosting accounts need them. So is Fail2Ban, which protects SSH and the panel login. Antivirus (ImunifyAV, Imunify360, cPGuard) is never installed by the installer; it is a module added in the panel. Backup and the AI agent are not optional either, because leaving them out would save no memory: restic and rclone are two programs that run only while a backup runs, and the AI agent is part of the panel itself, with no service of its own on the server.
 
+## Servers already in use
+
+The installer is meant for a fresh AlmaLinux 9, Rocky Linux 9 or CloudLinux 9 server. It does not import existing sites, mailboxes or databases; to bring those over, install on a fresh server and use the panel's migration tools.
+
+Before it installs anything, the installer checks whether the server is already in use and stops if it finds any of:
+
+- an installed web, mail, DNS or database server package (`httpd`, `nginx`, `lighttpd`, `caddy`, `haproxy`, `postfix`, `sendmail`, `exim`, `dovecot`, `bind`, `pdns`, `vsftpd`, `redis`, `mariadb-server`, `MariaDB-server`, `mysql-server`, `community-mysql-server`, `mysql-community-server`, `percona-server-server`, `postgresql-server`) or such a service running;
+- something listening on a web, mail, FTP, DNS or database TCP port (21, 25, 53, 80, 110, 143, 443, 465, 587, 993, 995, 3306, 5432);
+- an nftables table not created by firewalld, or firewalld rules beyond an image's default zone (services other than `ssh`, `dhcpv6-client`, `cockpit`; open ports, sources, rich or direct rules) in the default zone or an active one;
+- a user with uid 1000 or above whose home holds files of their own, or anything else in `/home` that holds files;
+- files in `/var/www`, or database files in `/var/lib/mysql` or `/var/lib/pgsql/data`.
+
+A fresh cloud image passes: its firewalld default zone and its cloud user (whose home holds only the skeleton files, `~/.ssh` and tool caches) do not count, and neither does the installer itself when a sudo user downloads `install.sh` or clones this repository into their home. A server that already has AdminBolt (a reinstall, or a rerun after a failed install) is not checked, and nothing is backed up there. A cPanel server that bolt-migrate converts in place (`--cpanel-conversion` or `--skip-apache`, on a server where cPanel is installed) is not checked either: it is in use by design, cPanel's services keep running until the conversion's cutover, and the conversion has its own rollback. The installer says so in one line (`cPanel conversion: not checking this cPanel server ...`), and takes the backup there only when `--force-existing-server` is given too.
+
+When it stops, it lists what it found and what the install would change: SELinux is switched off, firewalld is stopped and the nftables tables `ip filter` and `ip6 filter` are replaced by AdminBolt's, whose INPUT and forward chains drop everything but the panel's own ports, the main configuration files of Apache (not with `--skip-apache`), Postfix, Dovecot, PowerDNS, Redis, vsftpd, Fail2Ban and sshd are written over. A database server already on the server counts as in use too; with `--force-existing-server` it is kept as it is (see [Existing database server](#existing-database-server)), and the list says so. The refusal is reported as `check_existing_server` / `existing_server` in the install report.
+
+`--force-existing-server` installs anyway. Before anything is installed, `/etc`, `/var/spool/cron`, `/root/.my.cnf`, `/usr/bin/mlmmj-make-ml.sh` and `/var/www/html/index.html` / `index.php` are copied to `/root/adminbolt-preinstall-backup-<date>/` (root only), with the firewall's live ruleset (`nft-ruleset.nft`) and the SELinux mode; the install does not start if that copy fails. The copy needs `tar` and `gzip`; when one is missing (Hetzner's stock AlmaLinux and Rocky Linux 9 images have no `tar`), it is installed with dnf first, and the install stops if that fails. At the end the installer lists the backed-up files it changed or removed (`replaced-files.txt`). With the flag the backup is always taken, also when nothing was found. Site files and databases are not part of the backup, and nothing is restored automatically: restore single files from `files.tar.gz` as `README.txt` in that directory shows.
+
+Tests (no network, no root): `bash tests/preflight_test.sh`.
+
 ## Install report
 
 Every run reports its progress and result to `https://ai-hub.adminbolt.com/install-events`, so failed installs can be counted and fixed:
 
 - `install_started`: random install ID, channel, cloud platform (from DMI, mapped to a fixed list), OS name and version, architecture, requested bolt-panel version, package source, and the SHA-256 of the running `install.sh`;
 - `stage_finished`: stage, duration, result;
-- `install_finished`: result (`succeeded`, `succeeded_with_warnings`, `failed`, `cancelled`), the failed step and its reason code, exit code, signal, failed optional and required steps, installed bolt-panel and bolt-agent versions, trial licence result, total duration.
+- `install_finished`: result (`succeeded`, `succeeded_with_warnings`, `failed`, `cancelled`), the failed step and its reason code, exit code, signal, failed optional and required steps, installed bolt-panel and bolt-agent versions, trial licence result, total duration; in a cPanel conversion also `cutover_steps`, the steps left to the cutover.
+
+A cPanel conversion (`--cpanel-conversion`, or cPanel installed and `--skip-apache` given) is reported with the channel `convert` when the caller names no other channel; bolt-migrate passes `--channel=convert`. The steps it leaves to the cutover (PowerDNS, Postfix, Dovecot and their profiles while cPanel's packages own them) are listed as `cutover_steps`, not as failed steps, and the readiness check does not wait for Postfix or Dovecot when their step is among them; it still checks bolt-agent, bolt-nginx, bolt-php, the database server and the panel on port 8443. Such an install ends `succeeded` (or `succeeded_with_warnings` for another optional step); any other failure is reported as failed, as on any other server.
 
 No hostname, e-mail address, password, licence key or command output is sent. Sending never changes the install: errors are ignored, intermediate events go out in the background, and only the final event waits (at most 5 seconds).
 
