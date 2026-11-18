@@ -47,7 +47,7 @@ sudo ./install.sh --mariadb-version=10.11
 | Command | Description |
 |---------|-------------|
 | `sudo ./install.sh` | Install latest bolt-panel from repo |
-| `sudo ./install.sh --source=<stable\|staging\|testing>` | Install from a specific repository source |
+| `sudo ./install.sh --source=<stable\|staging\|testing>` | Install from a specific repository source (`stable` is production, the same packages as the default) |
 | `sudo ./install.sh --mariadb-version=<10.11\|11.4>` | MariaDB series to install: `11.4` (default, supported until 2029-05) or `10.11` (supported until 2028-02). A server that already has a database server keeps it as it is (see below) |
 | `sudo ./install.sh --without=<mail,dns,ftp>` | Leave optional components out, for servers with little memory (see [Optional components](#optional-components)) |
 | `sudo ./install.sh --skip-database` | Run no database step: no MariaDB package, series, root password reset or MariaDB profile. The panel uses the database server already on this server (see below) |
