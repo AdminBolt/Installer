@@ -1513,11 +1513,14 @@ fin=$(event install_finished)
 eq "only PowerDNS and Postfix left to the cutover: Dovecot still checked" "is-active bolt-agent bolt-nginx bolt-php dovecot mariadb mysqld mysql" "$(grep '^is-active' "$CHILD_DIR/fake/systemctl.log")"
 eq "only PowerDNS and Postfix left to the cutover, Dovecot down: readiness failed" "failed readiness readiness_check_failed" "$(field "$fin" .result) $(field "$fin" .failed_step) $(field "$fin" .reason)"
 eq "only PowerDNS and Postfix left to the cutover: cutover_steps without Dovecot" powerdns,postfix,postfix_profiles "$(field "$fin" .cutover_steps)"
-# A profile step left to the cutover does not take its service out of the check.
+# AB-2618: while cpanel-exim is there, Postfix and its profiles are not run
+# at all (they used to be run and fail first), even where the install of
+# Postfix would go through: both are left to the cutover, and Postfix is
+# not in the readiness check.
 convert_child conv_prof 'CPANEL_CONVERSION=1; CPANEL_BINARY="$PWD/cpanel"; REPORT_CHANNEL_ARG=convert; REPORT_CHANNEL_GIVEN=1; POSTFIX_CMD=true'
 fin=$(event install_finished)
-eq "Postfix installed, its profiles left to the cutover: Postfix still checked" "is-active bolt-agent bolt-nginx bolt-php postfix mariadb mysqld mysql" "$(grep '^is-active' "$CHILD_DIR/fake/systemctl.log")"
-eq "Postfix installed but down, its profiles left to the cutover: readiness failed" "failed readiness powerdns,dovecot,postfix_profiles" "$(field "$fin" .result) $(field "$fin" .failed_step) $(field "$fin" .cutover_steps)"
+eq "cpanel-exim owns Postfix: Postfix not checked" "is-active bolt-agent bolt-nginx bolt-php mariadb mysqld mysql" "$(grep '^is-active' "$CHILD_DIR/fake/systemctl.log")"
+eq "cpanel-exim owns Postfix: Postfix and its profiles left to the cutover, succeeded" "succeeded  powerdns,postfix,dovecot,postfix_profiles" "$(field "$fin" .result) $(field "$fin" .failed_step) $(field "$fin" .cutover_steps)"
 
 # No cPanel package, or no conversion: a failure stays a failure (AB-1379),
 # and the field is not sent.
