@@ -283,7 +283,22 @@ has "Postfix is left to the conversion" "CONVERSION  Postfix: cPanel's cpanel-ex
 has "Dovecot is left to the conversion" "CONVERSION  Dovecot: cPanel's cpanel-dovecot still owns it, installed at the cutover" "$out"
 has "PowerDNS is left to the conversion" "CONVERSION  PowerDNS: cPanel's cpanel-pdns still owns it, installed at the cutover" "$out"
 has "the Postfix profiles follow Postfix" "CONVERSION  Postfix profiles: cPanel's cpanel-exim still owns it" "$out"
-has "each step says so as it happens" "NOTE: Postfix is not installed now: cPanel's cpanel-exim still owns it on this server." "$out"
+# AB-2618: one line each, said before anything runs; dnf is never asked, so
+# no red failure and no rpm conflict list on a live cPanel server.
+has "each step says so in one line" "CONVERSION: Postfix: cPanel's cpanel-exim owns it now, installed at the cutover" "$out"
+has "PowerDNS in one line" "CONVERSION: PowerDNS: cPanel's cpanel-pdns owns it now, installed at the cutover" "$out"
+has "Dovecot in one line" "CONVERSION: Dovecot: cPanel's cpanel-dovecot owns it now, installed at the cutover" "$out"
+has "Postfix profiles in one line" "CONVERSION: Postfix profiles: cPanel's cpanel-exim owns it now, installed at the cutover" "$out"
+hasnt "Dovecot profiles runs as before" "CONVERSION: Dovecot profiles" "$out"
+hasnt "no rpm conflict line" "conflicts with" "$out"
+hasnt "no obsoletes line" "obsoletes postfix" "$out"
+hasnt "no failure line" "failed (continuing)" "$out"
+log=$(cat "$d/bolt-cli.log")
+for c in manage-powerdns manage-postfix manage-dovecot manage-postfix-profiles; do
+    hasnt "$c is not run" "$c --action=install" "$log"
+done
+has "Dovecot profiles still runs" "manage-dovecot-profiles --action=install" "$log"
+has "Redis still runs" "manage-redis --action=install" "$log"
 has "the summary names the section" "Left to the conversion: cPanel still owns them (4)" "$out"
 has "the install completes" "Installation Completed: mail and DNS follow at cutover" "$out"
 hasnt "nothing is critical" "CRITICAL" "$out"
