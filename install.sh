@@ -38,6 +38,9 @@ BOLT_SOURCE=""
 ADMIN_EMAIL=""
 # --mariadb-version=; empty = the default below on a new box (see stage_configuration).
 MARIADB_SERIES=""
+# Set when --mariadb-version= is on the command line, so an empty value is
+# refused instead of being taken as the default.
+MARIADB_SERIES_GIVEN=0
 # --force-existing-server: install on a server that is already in use (see check_existing_server).
 FORCE_EXISTING_SERVER=0
 # AB-2104: name of the first panel administrator; empty = "admin". "random" = admin-<6 random characters>.
@@ -3630,6 +3633,7 @@ main() {
                 ;;
             --mariadb-version=*)
                 MARIADB_SERIES="${arg#--mariadb-version=}"
+                MARIADB_SERIES_GIVEN=1
                 ;;
             --without=*)
                 # Joined with a comma, so an empty occurrence stays visible and is refused.
@@ -3712,7 +3716,7 @@ main() {
             "$YELLOW" "$NC" "$(shown_arg "$REPORT_CHANNEL_ARG")" "${REPORT_CHANNELS// /, }"
     fi
 
-    if [[ -n "$MARIADB_SERIES" ]]; then
+    if ((MARIADB_SERIES_GIVEN)); then
         case "$MARIADB_SERIES" in
             10.11|11.4) ;;
             *)

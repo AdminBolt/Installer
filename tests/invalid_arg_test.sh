@@ -101,6 +101,19 @@ for flag in source mariadb-version email; do
     eq "--$flag with U+00E9 under $UTF8_LC: its bytes shown as '?'" 'ab??cd' "$SHOWN"
 done
 
+echo "# empty values"
+run_flag mariadb-version ""
+eq "--mariadb-version= (empty): refused, exit 1, install not started" "1 no" \
+    "$RC $(grep -q REACHED-STAGE1 "$D/out" && echo yes || echo no)"
+eq "--mariadb-version= (empty): says why" "Invalid --mariadb-version= (supported: 10.11, 11.4)" \
+    "$(grep -a -o 'Invalid --mariadb-version=[^[:cntrl:]]*' "$D/err" | head -n 1)"
+run_flag database ""
+eq "--database= (empty): refused, exit 1, install not started" "1 no" \
+    "$RC $(grep -q REACHED-STAGE1 "$D/out" && echo yes || echo no)"
+run_flag mariadb-version "11.4"
+eq "--mariadb-version=11.4: accepted, the install starts" "0 yes" \
+    "$RC $(grep -q REACHED-STAGE1 "$D/out" && echo yes || echo no)"
+
 echo
 echo "# passed: $PASS, failed: $FAIL"
 ((FAIL == 0))
