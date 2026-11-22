@@ -47,7 +47,7 @@ sudo ./install.sh --mariadb-version=10.11
 | Command | Description |
 |---------|-------------|
 | `sudo ./install.sh` | Install latest bolt-panel from repo |
-| `sudo ./install.sh --source=<stable\|staging\|testing>` | Install from a specific repository source |
+| `sudo ./install.sh --source=<stable\|staging\|testing>` | Install from a specific repository source (`stable` is production, the same packages as the default) |
 | `sudo ./install.sh --mariadb-version=<10.11\|11.4>` | MariaDB series to install: `11.4` (default, supported until 2029-05) or `10.11` (supported until 2028-02). A server that already has a database server keeps it as it is (see below) |
 | `sudo ./install.sh --database=<mariadb\|mysql8.0\|mysql8.4>` | Database engine of a new server. `mariadb` is the default. `mysql8.0` installs `mysql-server` from AppStream, `mysql8.4` the `mysql:8.4` module stream; root gets a random password in `/root/.my.cnf`, the panel is pointed at the server and no MariaDB step runs. Refused with `--skip-database`, with `--mariadb-version` and on a server that already has a database server |
 | `sudo ./install.sh --without=<mail,dns,ftp>` | Leave optional components out, for servers with little memory (see [Optional components](#optional-components)) |

@@ -11,7 +11,7 @@
 # Usage:
 #   sudo ./install.sh                          # install latest bolt-panel from repo
 #   sudo ./install.sh --version=1.0.0.beta3-v46.el9 # install specific bolt-panel version from repo
-#   sudo ./install.sh --source=staging         # use staging pulp repos (stable|staging|testing); default unchanged
+#   sudo ./install.sh --source=staging         # use staging pulp repos (stable = production, staging, testing); default unchanged
 #   sudo ./install.sh --email=user@example.com # activate a 24h trial license for this e-mail (confirmation link extends it to 30 days)
 #   sudo ./install.sh --admin-username=random  # first administrator: admin-<6 random characters> instead of "admin" (or a name of your choice)
 #   sudo ./install.sh --mariadb-version=10.11  # MariaDB 10.11 instead of the default 11.4 (10.11 or 11.4)
@@ -32,7 +32,7 @@ PANEL_VERSION=""
 # from the repositories --source points at. PINNED_PACKAGES: one name=version per line.
 AGENT_VERSION=""
 PINNED_PACKAGES=""
-# Empty = current behavior (bolt-repo RPM from adminbolt). stable|staging|testing = pulp content path segment.
+# Empty = current behavior (bolt-repo RPM from adminbolt). stable|staging|testing = a pulp content tree, see source_repo_segment.
 BOLT_SOURCE=""
 # E-mail for the trial license; empty = skip the trial request (activate manually on the License page).
 ADMIN_EMAIL=""
@@ -145,6 +145,18 @@ BOLD='\033[1m'
 NC='\033[0m'
 
 REPO_BASE_URL="https://mirror.adminbolt.com/pulp/content/adminbolt"
+
+# The pulp content path segment of a --source channel; returns 1 for anything
+# else, so the accepted values live here only (AB-2614). stable is production,
+# which is published to adminbolt/, the tree the default bolt-repo RPM points
+# at; pulp/content/stable/ is a tree retired in June 2026 (bolt-panel 1.0.x).
+source_repo_segment() {
+    case "$1" in
+        stable) echo adminbolt ;;
+        staging|testing) echo "$1" ;;
+        *) return 1 ;;
+    esac
+}
 REPO_PACKAGE="bolt-repo-1.0.7-1"
 
 print_error() { echo -e "${RED}ERROR:${NC} $1" >&2; }
@@ -2019,20 +2031,27 @@ ssh_password_login_off() {
 }
 
 # ---------- Stage 2: Install base packages ----------
-# Write bolt / bolt-noarch repos for a pulp content tier (stable, staging, testing).
+# Write bolt / bolt-noarch repos for a --source channel (stable, staging,
+# testing), at the pulp content tree source_repo_segment names for it.
 #
 # Priorities below dnf's default of 99 (lower wins, AB-1407): the AdminBolt
 # repositories carry their own builds of packages the distribution also ships
 # (httpd, httpd-core, ...), and with the previous 300/400 every such name
 # resolved to appstream/baseos instead - hosts ran the distribution Apache.
 install_bolt_repos_from_source() {
-    local tier="$1"
+    local tier="$1" segment
     local repofile="$BOLT_REPO_FILE"
-    print_info "Configuring Bolt repositories (source=${tier})..."
+    if ! segment=$(source_repo_segment "$tier"); then
+        printf '%bERROR:%b Invalid --source=%s (allowed: stable, staging, testing)\n' "$RED" "$NC" "$(shown_arg "$tier")" >&2
+        STOPPED_STEP="Bolt repository: unknown --source"
+        report_fail repo_setup invalid_argument
+        exit 1
+    fi
+    print_info "Configuring Bolt repositories (source=${tier}, pulp/content/${segment})..."
     cat >"$repofile" <<EOF
 [bolt]
 name = Adminbolt RHEL - \$releasever - \$basearch
-baseurl = https://mirror.adminbolt.com/pulp/content/${tier}/rhel/\$releasever/\$basearch
+baseurl = https://mirror.adminbolt.com/pulp/content/${segment}/rhel/\$releasever/\$basearch
 enabled = 1
 gpgcheck = 0
 priority = 30
@@ -2040,7 +2059,7 @@ sslverify = 0
 
 [bolt-noarch]
 name = Adminbolt RHEL - \$releasever - noarch
-baseurl = https://mirror.adminbolt.com/pulp/content/${tier}/rhel/\$releasever/noarch
+baseurl = https://mirror.adminbolt.com/pulp/content/${segment}/rhel/\$releasever/noarch
 enabled = 1
 gpgcheck = 0
 priority = 40
@@ -3567,7 +3586,7 @@ print_usage() {
     echo "Usage: sudo $0 [--help] [--version=<PANEL_VERSION>] [--agent-version=<version-release>] [--package=<bolt-name>=<version-release> ...] [--source=<stable|staging|testing>] [--email=<address>] [--mariadb-version=<10.11|11.4>] [--database=<mariadb|mysql8.0|mysql8.4>] [--without=<mail,dns,ftp>] [--skip-database] [--skip-apache] [--cpanel-conversion] [--channel=<name>] [--no-telemetry] [--ssh-key=<public key|https URL>] [--admin-username=<name|random>] [--force-existing-server]"
     echo "AlmaLinux 9 / Rocky Linux 9 / CloudLinux 9. Stages: 1=ready check, 2=(2.1 settings, 2.2 prereq packages, 2.3 bolt packages), 3=post-install."
     echo "If --version is not provided, latest bolt-panel from repo is installed."
-    echo "If --source is not provided, the bolt-repo RPM from adminbolt is used (default). Otherwise repos point at pulp content stable/staging/testing."
+    echo "If --source is not provided, the bolt-repo RPM from adminbolt is used (default). Otherwise the repos point at that channel: stable is production (the same packages as the default), staging and testing are the pre-release channels (PR builds: testing)."
     echo "--agent-version installs exactly that bolt-agent build (e.g. 1.30.4-1.el9); --package=<bolt-name>=<version-release> does the same for another bolt-* package (repeatable, e.g. --package=bolt-php=8.4.14-1.el9). Both come from the repositories --source selects (PR builds: --source=testing); the install stops before any Bolt package is installed when a version is not there."
     echo "--skip-database runs no database step (no MariaDB package, series, root password reset or my.cnf profile); the panel uses the MySQL/MariaDB server already on this server, with the administrator login from ${ROOT_MY_CNF} ([client] user= and password=) copied into [dbservers.mariadb] of ${AGENT_CONF}. The database steps are skipped by themselves when a database server answers (mysqladmin ping) or a server package is installed (MariaDB-server, mariadb-server, mysql-server, cl-MySQL*, cl-MariaDB*, ...)."
     echo "--database=mysql8.0 or --database=mysql8.4 installs MySQL from the distribution (AppStream) instead of MariaDB, sets a random root password in ${ROOT_MY_CNF} and points the panel at it; MariaDB (the default, --database=mariadb) is not installed then. It cannot be combined with --skip-database or --mariadb-version, and it refuses a server that already has a database server."
@@ -3766,16 +3785,13 @@ main() {
     fi
 
     if [[ -n "$BOLT_SOURCE" ]]; then
-        case "$BOLT_SOURCE" in
-            stable|staging|testing) ;;
-            *)
-                printf '%bERROR:%b Invalid --source=%s (allowed: stable, staging, testing)\n' \
-                    "$RED" "$NC" "$(shown_arg "$BOLT_SOURCE")" >&2
-                print_usage
-                report_fail parse_arguments invalid_argument
-                exit 1
-                ;;
-        esac
+        if ! source_repo_segment "$BOLT_SOURCE" >/dev/null; then
+            printf '%bERROR:%b Invalid --source=%s (allowed: stable, staging, testing)\n' \
+                "$RED" "$NC" "$(shown_arg "$BOLT_SOURCE")" >&2
+            print_usage
+            report_fail parse_arguments invalid_argument
+            exit 1
+        fi
     fi
 
     # bolt-agent's %post (Stage 2) starts the box with a self-signed
