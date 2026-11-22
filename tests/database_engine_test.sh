@@ -156,6 +156,14 @@ has "--database=mariadb accepted" "STAGE1 engine=mariadb db=0" "$(out)"
 parse --database=postgresql
 eq "unknown engine refused" "1" "$RC"
 has "unknown engine: says why" "Invalid --database=postgresql (supported: mariadb, mysql8.0, mysql8.4)" "$(out)"
+parse --database=
+eq "empty --database= refused" "1" "$RC"
+has "empty --database=: says why" "Invalid --database= (supported: mariadb, mysql8.0, mysql8.4)" "$(out)"
+hasnt "empty --database=: the install does not start" "STAGE1" "$(out)"
+parse --database= --database=mysql8.4
+has "the last --database wins: mysql8.4 after an empty one" "STAGE1 engine=mysql8.4 db=0" "$(out)"
+parse
+has "no --database: the default (MariaDB) install starts" "STAGE1 engine=none db=0" "$(out)"
 parse --database=mysql8.4 --skip-database
 eq "mysql with --skip-database refused" "1" "$RC"
 has "mysql with --skip-database: says why" "cannot be combined with --skip-database or --mariadb-version" "$(out)"

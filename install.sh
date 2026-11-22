@@ -51,8 +51,11 @@ readonly DEFAULT_MARIADB_SERIES="11.4"
 # installer run never replaces one.
 SKIP_DATABASE=0
 SKIP_APACHE=0
-# AB-2339: --database=<mariadb|mysql8.0|mysql8.4>; empty = mariadb.
+# AB-2339: --database=<mariadb|mysql8.0|mysql8.4>; not given = mariadb.
 DATABASE_ENGINE=""
+# Set when --database= is on the command line, so an empty value is refused
+# instead of being taken as the default.
+DATABASE_GIVEN=0
 DATABASE_SKIP_REASON=""
 DATABASE_SKIP_DECIDED=0
 # Packages that mean a database server is installed. The globs go to rpm -qa.
@@ -3646,6 +3649,7 @@ main() {
                 ;;
             --database=*)
                 DATABASE_ENGINE="${arg#--database=}"
+                DATABASE_GIVEN=1
                 ;;
             --skip-apache)
                 SKIP_APACHE=1
@@ -3721,8 +3725,9 @@ main() {
         esac
     fi
 
-    # AB-2339: the database engine of a new server.
-    if [[ -n "$DATABASE_ENGINE" ]]; then
+    # AB-2339: the database engine of a new server. An empty --database= is
+    # refused like any other value it does not know.
+    if ((DATABASE_GIVEN)); then
         case "$DATABASE_ENGINE" in
             mariadb|mysql8.0|mysql8.4) ;;
             *)
