@@ -3372,8 +3372,12 @@ MYSQL_READY_WAIT_SECONDS=60
 # Set from the start of mysqld until root has its password: the package
 # initialises root with none, so a mysqld left running then lets any local
 # user sign in as root. Every way out of the install in that window stops
-# mysqld (mysql_engine_failed, and report_on_exit for the others).
+# mysqld (mysql_engine_failed, and report_on_exit for the others). mysqld is
+# enabled only once root has its password, and the marker file is there for
+# the whole window: an install killed in it (SIGKILL, a reboot) leaves the
+# marker, and the next run refuses the server (database_skip_decide).
 MYSQL_ROOT_OPEN=0
+MYSQL_ROOT_OPEN_MARKER="/root/.adminbolt-mysql-root-without-password"
 install_mysql_engine() {
     local version="${DATABASE_ENGINE#mysql}" password waited=0 running login
     # Reported under the database server's step id (mariadb): the install
@@ -3391,8 +3395,11 @@ install_mysql_engine() {
     if ! dnf -y install mysql-server; then
         mysql_engine_failed "mysql-server could not be installed"
     fi
+    if ! : >"$MYSQL_ROOT_OPEN_MARKER"; then
+        mysql_engine_failed "${MYSQL_ROOT_OPEN_MARKER} could not be written"
+    fi
     MYSQL_ROOT_OPEN=1
-    if ! systemctl enable --now mysqld; then
+    if ! systemctl start mysqld; then
         mysql_engine_failed "mysqld could not be started"
     fi
     # --no-defaults until root has its password: a [client] password left in
@@ -3424,9 +3431,20 @@ install_mysql_engine() {
     # while the client runs.
     if ! printf "ALTER USER 'root'@'localhost' IDENTIFIED BY '%s';\n" "$password" | mysql --no-defaults -uroot -NB >/dev/null 2>&1; then
         rm -f "$login"
+        # A data directory kept from an earlier install where root already
+        # has a password: root is not open, so mysqld is not stopped.
+        if ! mysql --no-defaults -uroot -NBe 'SELECT 1' >/dev/null 2>&1; then
+            MYSQL_ROOT_OPEN=0
+            rm -f "$MYSQL_ROOT_OPEN_MARKER"
+            mysql_engine_failed "root's password could not be set: root already has a password on this server's data directory (/var/lib/mysql, kept from an earlier install?)"
+        fi
         mysql_engine_failed "root's password could not be set"
     fi
     MYSQL_ROOT_OPEN=0
+    rm -f "$MYSQL_ROOT_OPEN_MARKER"
+    if ! systemctl enable mysqld; then
+        mysql_engine_failed "mysqld could not be enabled (systemctl enable mysqld)"
+    fi
     if ! mv -f "$login" "$ROOT_MY_CNF"; then
         mysql_engine_failed "root's new login could not be moved to ${ROOT_MY_CNF}; it is in ${login}"
     fi
@@ -3451,12 +3469,16 @@ mysql_engine_failed() {
 # Stops and disables mysqld while root still has no password (MYSQL_ROOT_OPEN).
 mysql_engine_close_open_root() {
     ((MYSQL_ROOT_OPEN)) || return 0
-    MYSQL_ROOT_OPEN=0
     if systemctl disable --now mysqld >/dev/null 2>&1; then
-        print_error "mysqld was stopped and disabled: its root account had no password yet. Remove the mysql-server package before you run the installer again."
+        print_error "mysqld was stopped and disabled: its root account had no password yet. $(mysql_engine_remove_advice)"
     else
-        print_error "mysqld could not be stopped and its root account has no password: run 'systemctl disable --now mysqld' now."
+        print_error "mysqld could not be stopped and its root account has no password: run 'systemctl disable --now mysqld' now. $(mysql_engine_remove_advice)"
     fi
+    MYSQL_ROOT_OPEN=0
+}
+
+mysql_engine_remove_advice() {
+    echo "The installer refuses this server until it is removed: dnf -y remove mysql-server, and move /var/lib/mysql away (this install put no data in it)."
 }
 
 # Prints why the box counts as having a database server; fails when it has
@@ -3496,6 +3518,16 @@ database_skip_decide() {
     ((DATABASE_SKIP_DECIDED)) && return 0
     DATABASE_SKIP_DECIDED=1
     local found
+    # AB-2339: a MySQL server an earlier --database run started and left
+    # with root's empty password is never kept or finished over.
+    if [[ -e "$MYSQL_ROOT_OPEN_MARKER" ]]; then
+        if database_server_found >/dev/null; then
+            print_error "An earlier run of this installer started a MySQL server here and stopped before root had a password (${MYSQL_ROOT_OPEN_MARKER}). $(mysql_engine_remove_advice)"
+            report_fail check_existing_server existing_server
+            exit 1
+        fi
+        rm -f "$MYSQL_ROOT_OPEN_MARKER"
+    fi
     if ((SKIP_DATABASE)); then
         DATABASE_SKIP_REASON="--skip-database"
     elif found=$(database_server_found); then

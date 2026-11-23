@@ -19,7 +19,7 @@ INSTALL_SH=$(cd "$(dirname "$INSTALL_SH")" && pwd)/$(basename "$INSTALL_SH")
 if ((BASH_VERSINFO[0] < 4)); then echo "bash 4 or newer required (this is $BASH_VERSION)" >&2; exit 2; fi
 
 T=$(mktemp -d)
-trap 'rm -rf "$T"' EXIT
+trap '[[ -n "${KEEP_T:-}" ]] || rm -rf "$T"' EXIT
 export LC_ALL=C
 
 PASS=0
@@ -113,6 +113,10 @@ if [[ -e "$FAKE_DIR/stale_cnf" && "$1" != --no-defaults && "$1" != --defaults-fi
     echo "ERROR 1045 (28000): Access denied for user 'root'@'localhost' (using password: YES)" >&2
     exit 1
 fi
+if [[ -e "$FAKE_DIR/root_has_password" && "$1" == --no-defaults ]]; then
+    echo "ERROR 1045 (28000): Access denied for user 'root'@'localhost' (using password: NO)" >&2
+    exit 1
+fi
 case "$* $stdin" in
     *"SELECT VERSION()"*) cat "$FAKE_DIR/version" 2>/dev/null; exit 0 ;;
     *"ALTER USER"*) [[ -e "$FAKE_DIR/alter_fails" ]] && exit 1; exit 0 ;;
@@ -139,6 +143,7 @@ REPORT_MARKER="$D/install-marker"
 REPORT_EUID=0
 OS_RELEASE_FILE="$D/os-release"
 ROOT_MY_CNF="$D/my.cnf"
+MYSQL_ROOT_OPEN_MARKER="$D/root-open-marker"
 AGENT_CONF="$D/agent.conf"
 $2
 EOF
@@ -198,7 +203,10 @@ mysql_install mysql8.4 8.4.3
 has "8.4: finished" "DONE skip=1 reason=MySQL 8.4 installed by --database=mysql8.4" "$(out)"
 has "8.4: the module stream is enabled" "-y -q module enable mysql:8.4" "$(cat "$D/fake/dnf.log")"
 has "8.4: mysql-server installed" "-y install mysql-server" "$(cat "$D/fake/dnf.log")"
-has "8.4: mysqld enabled and started" "enable --now mysqld" "$(cat "$D/fake/systemctl.log")"
+has "8.4: mysqld started" "start mysqld" "$(cat "$D/fake/systemctl.log")"
+has "8.4: mysqld enabled" "enable mysqld" "$(cat "$D/fake/systemctl.log")"
+hasnt "8.4: never enabled with --now (before root's password)" "enable --now mysqld" "$(cat "$D/fake/systemctl.log")"
+[[ ! -e "$D/root-open-marker" ]] && ok "8.4: no root-open marker once root has its password" || nok "8.4: no root-open marker once root has its password"
 pw=$(sed -n 's/^password="\([0-9a-f]*\)"$/\1/p' "$D/my.cnf")
 eq "8.4: a 48-hex root password in my.cnf" "48" "${#pw}"
 has "8.4: root's password set to it, on stdin" "STDIN: ALTER USER 'root'@'localhost' IDENTIFIED BY '${pw}'" "$(cat "$D/fake/mysql.log")"
@@ -266,6 +274,53 @@ eq "wrong version: the login is in my.cnf" "48" "${#pw}"
 
 at mysqlalter
 stopped && ok "ALTER USER fails: mysqld is stopped and disabled" || nok "ALTER USER fails: mysqld is stopped and disabled" "$(cat "$D/fake/systemctl.log")"
+grep -qxF "enable mysqld" "$D/fake/systemctl.log" && nok "ALTER USER fails: mysqld was never enabled" || ok "ALTER USER fails: mysqld was never enabled"
+[[ -e "$D/root-open-marker" ]] && ok "ALTER USER fails: the root-open marker stays" || nok "ALTER USER fails: the root-open marker stays"
+has "ALTER USER fails: says how to go on" "dnf -y remove mysql-server" "$(out)"
+
+# The next run, with or without --database, refuses that server while the
+# marker is there; once the package is gone it goes on.
+decide() { # $1: rpm list
+    child decide "report_fail() { echo \"FAIL \$*\"; }
+database_skip_decide
+echo \"DECIDED skip=\$SKIP_DATABASE\""
+    touch "$D/root-open-marker"
+    printf '%s\n' "$1" >"$D/fake/rpm"
+    run
+}
+decide mysql-server
+eq "marker and mysql-server: the next run is refused" "1" "$RC"
+has "marker and mysql-server: says why" "stopped before root had a password" "$(out)"
+hasnt "marker and mysql-server: the server is not kept" "DECIDED" "$(out)"
+decide ""
+has "marker, server removed: the run goes on" "DECIDED skip=0" "$(out)"
+[[ ! -e "$D/root-open-marker" ]] && ok "marker, server removed: the marker is cleared" || nok "marker, server removed: the marker is cleared"
+
+# A kill no trap sees, while mysqld waits to answer: the marker stays, and
+# mysqld was only started, never enabled.
+child mysqlkill "$STUBS
+DATABASE_ENGINE=mysql8.0
+sleep() { kill -9 \$\$; }
+install_mysql_engine
+echo DONE"
+run
+hasnt "killed while waiting: did not finish" "DONE" "$(out)"
+[[ -e "$D/root-open-marker" ]] && ok "killed while waiting: the root-open marker stays" || nok "killed while waiting: the root-open marker stays"
+grep -qxF "enable mysqld" "$D/fake/systemctl.log" && nok "killed while waiting: mysqld not enabled" || ok "killed while waiting: mysqld not enabled"
+
+# root already has a password (a data directory kept from an earlier install):
+# root is not open, mysqld keeps running, the message says why.
+child mysqlkept "$STUBS
+DATABASE_ENGINE=mysql8.0
+install_mysql_engine
+echo DONE"
+echo 8.0.46 >"$D/fake/version"; touch "$D/fake/ping" "$D/fake/root_has_password"
+run
+eq "kept data directory: the install stops" "1" "$RC"
+has "kept data directory: says why" "root already has a password on this server's data directory" "$(out)"
+stopped && nok "kept data directory: mysqld is not stopped" || ok "kept data directory: mysqld is not stopped"
+[[ ! -e "$D/root-open-marker" ]] && ok "kept data directory: no root-open marker" || nok "kept data directory: no root-open marker"
+at mysqlalter
 has "ALTER USER fails: says so" "mysqld was stopped and disabled" "$(out)"
 ls "$D"/my.cnf.new.* >/dev/null 2>&1 && nok "ALTER USER fails: no new login file is left" || ok "ALTER USER fails: no new login file is left"
 
