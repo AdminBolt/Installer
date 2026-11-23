@@ -104,6 +104,7 @@ cat >"$T/bin/mysql" <<'EOF'
 # The command line and, for a call without -e, what came on stdin, each on
 # its own ARGS / STDIN line.
 echo "ARGS: $*" >>"$FAKE_DIR/mysql.log"
+[[ " $* " == *" --no-defaults "* ]] && printf '%s' "${MYSQL_TEST_LOGIN_FILE:-unset}" >"$FAKE_DIR/login-file"
 stdin=""
 if [[ " $* " != *" -NBe "* && " $* " != *" -e "* ]]; then
     stdin=$(cat)
@@ -262,8 +263,9 @@ run
 eq "stale my.cnf: the install goes on" "0" "$RC"
 has "stale my.cnf: finished" "DONE skip=1" "$(out)"
 altered && ok "stale my.cnf: root gets its password" || nok "stale my.cnf: root gets its password" "$(cat "$D/fake/mysql.log")"
-has "stale my.cnf: the password is set with --no-defaults" "ARGS: --no-defaults -uroot -NB" "$(cat "$D/fake/mysql.log")"
-has "stale my.cnf: the ping skips it" "--no-defaults -uroot --connect-timeout=5 ping" "$(cat "$D/fake/mysqladmin.log")"
+has "stale my.cnf: the password is set with --no-defaults" "ARGS: --no-defaults --socket=/var/lib/mysql/mysql.sock -uroot --connect-timeout=10 -NB" "$(cat "$D/fake/mysql.log")"
+has "stale my.cnf: the ping skips it" "--no-defaults --socket=/var/lib/mysql/mysql.sock -uroot --connect-timeout=5 ping" "$(cat "$D/fake/mysqladmin.log")"
+eq "stale my.cnf: ~/.mylogin.cnf is not read either" "/dev/null" "$(cat "$D/fake/login-file" 2>/dev/null)"
 pw=$(sed -n 's/^password="\([0-9a-f]*\)"$/\1/p' "$D/my.cnf")
 eq "stale my.cnf: replaced by the new login" "48" "${#pw}"
 ls "$D"/my.cnf.bak-* >/dev/null 2>&1 && ok "stale my.cnf: the old file is kept" || nok "stale my.cnf: the old file is kept"
@@ -350,6 +352,20 @@ eq "package install fails: the install stops" "1" "$RC"
 at mysqlalter
 has "ALTER USER fails: says so" "mysqld was stopped and disabled" "$(out)"
 ls "$D"/my.cnf.new.* >/dev/null 2>&1 && nok "ALTER USER fails: no new login file is left" || ok "ALTER USER fails: no new login file is left"
+
+# A signal after the new login was written but before the ALTER: the EXIT
+# trap stops mysqld and removes that login (its password was never set).
+child mysqlsig "$STUBS
+trap report_on_exit EXIT
+REPORT_MODE=off
+DATABASE_ENGINE=mysql8.0
+mysql() { [[ \" \$* \" == *\" -NB \"* ]] && { kill -TERM \$\$; sleep 2; }; command mysql \"\$@\"; }
+install_mysql_engine
+echo DONE"
+echo 8.0.46 >"$D/fake/version"; touch "$D/fake/ping"
+run
+stopped && ok "cut before the ALTER: mysqld is stopped" || nok "cut before the ALTER: mysqld is stopped"
+ls "$D"/my.cnf.new.* >/dev/null 2>&1 && nok "cut before the ALTER: no new login file is left" || ok "cut before the ALTER: no new login file is left"
 
 at mysqlnoping
 stopped && ok "no answer: mysqld is stopped and disabled" || nok "no answer: mysqld is stopped and disabled" "$(cat "$D/fake/systemctl.log" 2>/dev/null)"

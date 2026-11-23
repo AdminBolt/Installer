@@ -3378,8 +3378,9 @@ MYSQL_READY_WAIT_SECONDS=60
 # marker, and the next run refuses the server (database_skip_decide).
 MYSQL_ROOT_OPEN=0
 MYSQL_ROOT_OPEN_MARKER="/root/.adminbolt-mysql-root-without-password"
+MYSQL_LOGIN_TMP=""
 install_mysql_engine() {
-    local version="${DATABASE_ENGINE#mysql}" password waited=0 running login
+    local version="${DATABASE_ENGINE#mysql}" password waited=0 running login sock
     # Reported under the database server's step id (mariadb): the install
     # report knows a fixed set of steps (AB-2067).
     report_step_start mariadb
@@ -3406,8 +3407,11 @@ install_mysql_engine() {
     fi
     # --no-defaults until root has its password: a [client] password left in
     # ROOT_MY_CNF by an earlier setup is not the new server's, and with it
-    # the client is refused (mysqladmin ping still exits 0 then).
-    until mysqladmin --no-defaults -uroot --connect-timeout=5 ping >/dev/null 2>&1; do
+    # the client is refused (mysqladmin ping still exits 0 then). MySQL's
+    # clients still read ~/.mylogin.cnf under --no-defaults, so it is pointed
+    # at /dev/null; the socket comes from the server's own configuration.
+    sock=$(mysql_engine_socket)
+    until MYSQL_TEST_LOGIN_FILE=/dev/null mysqladmin --no-defaults --socket="$sock" -uroot --connect-timeout=5 ping >/dev/null 2>&1; do
         ((waited >= MYSQL_READY_WAIT_SECONDS)) && mysql_engine_failed "mysqld did not answer within ${MYSQL_READY_WAIT_SECONDS} seconds"
         sleep 1
         waited=$((waited + 1))
@@ -3424,6 +3428,7 @@ install_mysql_engine() {
     if ! login=$(umask 077 && mktemp "${ROOT_MY_CNF}.new.XXXXXX"); then
         mysql_engine_failed "no file for root's new login could be made next to ${ROOT_MY_CNF}"
     fi
+    MYSQL_LOGIN_TMP="$login"
     if ! printf '[client]\nuser=root\npassword="%s"\n' "$password" >"$login"; then
         rm -f "$login"
         mysql_engine_failed "root's new login could not be written"
@@ -3431,12 +3436,12 @@ install_mysql_engine() {
     # The statement goes in on stdin from the printf builtin: on the mysql
     # command line the new password would show in ps and /proc to every user
     # while the client runs.
-    if ! printf "ALTER USER 'root'@'localhost' IDENTIFIED BY '%s';\n" "$password" | mysql --no-defaults -uroot -NB >/dev/null 2>&1; then
+    if ! printf "ALTER USER 'root'@'localhost' IDENTIFIED BY '%s';\n" "$password" | MYSQL_TEST_LOGIN_FILE=/dev/null mysql --no-defaults --socket="$sock" -uroot --connect-timeout=10 -NB >/dev/null 2>&1; then
         rm -f "$login"
         # A data directory kept from an earlier install where root already
         # has a password (Access denied, ERROR 1045): root is not open, so
         # mysqld is not stopped. Any other error (mysqld gone) stops it.
-        if mysql --no-defaults -uroot -NBe 'SELECT 1' 2>&1 >/dev/null | grep -q '^ERROR 1045 '; then
+        if MYSQL_TEST_LOGIN_FILE=/dev/null mysql --no-defaults --socket="$sock" -uroot --connect-timeout=10 -NBe 'SELECT 1' 2>&1 >/dev/null | grep -q '^ERROR 1045 '; then
             MYSQL_ROOT_OPEN=0
             rm -f "$MYSQL_ROOT_OPEN_MARKER"
             mysql_engine_failed "root's password could not be set: root already has a password on this server's data directory (/var/lib/mysql, kept from an earlier install?)"
@@ -3445,6 +3450,7 @@ install_mysql_engine() {
     fi
     MYSQL_ROOT_OPEN=0
     rm -f "$MYSQL_ROOT_OPEN_MARKER"
+    MYSQL_LOGIN_TMP=""
     if ! mv -f "$login" "$ROOT_MY_CNF"; then
         mysql_engine_failed "root's new login could not be moved to ${ROOT_MY_CNF}; it is in ${login}"
     fi
@@ -3452,7 +3458,7 @@ install_mysql_engine() {
         mysql_engine_failed "mysqld could not be enabled (systemctl enable mysqld)"
     fi
     chmod 600 "$ROOT_MY_CNF" 2>/dev/null || true
-    running=$(mysql --defaults-file="$ROOT_MY_CNF" -NBe 'SELECT VERSION();' 2>/dev/null) || running=""
+    running=$(MYSQL_TEST_LOGIN_FILE=/dev/null mysql --defaults-file="$ROOT_MY_CNF" --socket="$sock" --connect-timeout=10 -NBe 'SELECT VERSION();' 2>/dev/null) || running=""
     if [[ "$running" != "${version}."* ]]; then
         mysql_engine_failed "the server reports version '${running:-none}', not MySQL ${version}"
     fi
@@ -3472,12 +3478,23 @@ mysql_engine_failed() {
 # Stops and disables mysqld while root still has no password (MYSQL_ROOT_OPEN).
 mysql_engine_close_open_root() {
     ((MYSQL_ROOT_OPEN)) || return 0
+    # A login made for a password that was never set.
+    [[ -z "$MYSQL_LOGIN_TMP" ]] || rm -f "$MYSQL_LOGIN_TMP"
     if systemctl disable --now mysqld >/dev/null 2>&1; then
         print_error "mysqld was stopped and disabled: its root account had no password yet. $(mysql_engine_remove_advice)"
     else
         print_error "mysqld could not be stopped and its root account has no password: run 'systemctl disable --now mysqld' now. $(mysql_engine_remove_advice)"
     fi
     MYSQL_ROOT_OPEN=0
+}
+
+# The socket mysqld listens on, from the server's own configuration
+# (mysql-server.cnf on AppStream, cl-MySQL's my.cnf); the packages' default
+# when it names none.
+mysql_engine_socket() {
+    local s
+    s=$(my_print_defaults mysqld 2>/dev/null | sed -n 's/^--socket=//p' | tail -n 1)
+    echo "${s:-/var/lib/mysql/mysql.sock}"
 }
 
 mysql_engine_remove_advice() {
