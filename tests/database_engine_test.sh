@@ -113,6 +113,10 @@ if [[ -e "$FAKE_DIR/stale_cnf" && "$1" != --no-defaults && "$1" != --defaults-fi
     echo "ERROR 1045 (28000): Access denied for user 'root'@'localhost' (using password: YES)" >&2
     exit 1
 fi
+if [[ -e "$FAKE_DIR/no_connect" ]]; then
+    echo "ERROR 2002 (HY000): Can't connect to local MySQL server through socket '/var/lib/mysql/mysql.sock' (2)" >&2
+    exit 1
+fi
 if [[ -e "$FAKE_DIR/root_has_password" && "$1" == --no-defaults ]]; then
     echo "ERROR 1045 (28000): Access denied for user 'root'@'localhost' (using password: NO)" >&2
     exit 1
@@ -320,6 +324,29 @@ eq "kept data directory: the install stops" "1" "$RC"
 has "kept data directory: says why" "root already has a password on this server's data directory" "$(out)"
 stopped && nok "kept data directory: mysqld is not stopped" || ok "kept data directory: mysqld is not stopped"
 [[ ! -e "$D/root-open-marker" ]] && ok "kept data directory: no root-open marker" || nok "kept data directory: no root-open marker"
+
+# mysqld gone between the ping and the ALTER (ERROR 2002 to every client):
+# that is no password on root, so mysqld is stopped and the marker stays.
+child mysqlgone "$STUBS
+DATABASE_ENGINE=mysql8.0
+install_mysql_engine
+echo DONE"
+echo 8.0.46 >"$D/fake/version"; touch "$D/fake/ping" "$D/fake/no_connect"
+run
+eq "mysqld gone before the ALTER: the install stops" "1" "$RC"
+stopped && ok "mysqld gone before the ALTER: mysqld is stopped and disabled" || nok "mysqld gone before the ALTER: mysqld is stopped and disabled"
+[[ -e "$D/root-open-marker" ]] && ok "mysqld gone before the ALTER: the root-open marker stays" || nok "mysqld gone before the ALTER: the root-open marker stays"
+
+# A failed package install leaves the marker; with no server it is cleared
+# by the next run, with a half-installed one that run refuses it.
+child mysqlpkg "$STUBS
+DATABASE_ENGINE=mysql8.0
+dnf() { [[ \" \$* \" == *\" install \"* ]] && return 1; return 0; }
+install_mysql_engine
+echo DONE"
+run
+eq "package install fails: the install stops" "1" "$RC"
+[[ -e "$D/root-open-marker" ]] && ok "package install fails: the marker was written before it" || nok "package install fails: the marker was written before it"
 at mysqlalter
 has "ALTER USER fails: says so" "mysqld was stopped and disabled" "$(out)"
 ls "$D"/my.cnf.new.* >/dev/null 2>&1 && nok "ALTER USER fails: no new login file is left" || ok "ALTER USER fails: no new login file is left"

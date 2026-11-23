@@ -3392,11 +3392,13 @@ install_mysql_engine() {
             mysql_engine_failed "the mysql:8.4 module stream could not be enabled"
         fi
     fi
-    if ! dnf -y install mysql-server; then
-        mysql_engine_failed "mysql-server could not be installed"
-    fi
+    # Before the package: a kill right after its install leaves a server
+    # that would create root without a password on its first start.
     if ! : >"$MYSQL_ROOT_OPEN_MARKER"; then
         mysql_engine_failed "${MYSQL_ROOT_OPEN_MARKER} could not be written"
+    fi
+    if ! dnf -y install mysql-server; then
+        mysql_engine_failed "mysql-server could not be installed"
     fi
     MYSQL_ROOT_OPEN=1
     if ! systemctl start mysqld; then
@@ -3432,8 +3434,9 @@ install_mysql_engine() {
     if ! printf "ALTER USER 'root'@'localhost' IDENTIFIED BY '%s';\n" "$password" | mysql --no-defaults -uroot -NB >/dev/null 2>&1; then
         rm -f "$login"
         # A data directory kept from an earlier install where root already
-        # has a password: root is not open, so mysqld is not stopped.
-        if ! mysql --no-defaults -uroot -NBe 'SELECT 1' >/dev/null 2>&1; then
+        # has a password (Access denied, ERROR 1045): root is not open, so
+        # mysqld is not stopped. Any other error (mysqld gone) stops it.
+        if mysql --no-defaults -uroot -NBe 'SELECT 1' 2>&1 >/dev/null | grep -q '^ERROR 1045 '; then
             MYSQL_ROOT_OPEN=0
             rm -f "$MYSQL_ROOT_OPEN_MARKER"
             mysql_engine_failed "root's password could not be set: root already has a password on this server's data directory (/var/lib/mysql, kept from an earlier install?)"
@@ -3442,11 +3445,11 @@ install_mysql_engine() {
     fi
     MYSQL_ROOT_OPEN=0
     rm -f "$MYSQL_ROOT_OPEN_MARKER"
-    if ! systemctl enable mysqld; then
-        mysql_engine_failed "mysqld could not be enabled (systemctl enable mysqld)"
-    fi
     if ! mv -f "$login" "$ROOT_MY_CNF"; then
         mysql_engine_failed "root's new login could not be moved to ${ROOT_MY_CNF}; it is in ${login}"
+    fi
+    if ! systemctl enable mysqld; then
+        mysql_engine_failed "mysqld could not be enabled (systemctl enable mysqld)"
     fi
     chmod 600 "$ROOT_MY_CNF" 2>/dev/null || true
     running=$(mysql --defaults-file="$ROOT_MY_CNF" -NBe 'SELECT VERSION();' 2>/dev/null) || running=""
