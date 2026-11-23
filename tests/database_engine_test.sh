@@ -56,10 +56,16 @@ grep -qxF -- "$pkg" "$FAKE_DIR/rpm" 2>/dev/null && { echo "$pkg-1-1.el9.x86_64";
 echo "package $pkg is not installed"
 exit 1
 EOF
+# stale_cnf present = ROOT_MY_CNF holds a password the new server does not
+# have: a client that reads it is refused (mysqladmin ping still exits 0, as
+# the real one does), one started with --no-defaults or --defaults-file is not.
 cat >"$T/bin/mysqladmin" <<'EOF'
 #!/usr/bin/env bash
 echo "$*" >>"$FAKE_DIR/mysqladmin.log"
-[[ -e "$FAKE_DIR/ping" ]] && { echo "mysqld is alive"; exit 0; }
+if [[ -e "$FAKE_DIR/ping" ]]; then
+    [[ -e "$FAKE_DIR/stale_cnf" && "$1" != --no-defaults ]] && echo "mysqladmin: connect to server at 'localhost' failed: Access denied for user 'root'@'localhost' (using password: YES)" >&2
+    echo "mysqld is alive"; exit 0
+fi
 exit 1
 EOF
 cp "$T/bin/mysqladmin" "$T/bin/mariadb-admin"
@@ -102,6 +108,10 @@ stdin=""
 if [[ " $* " != *" -NBe "* && " $* " != *" -e "* ]]; then
     stdin=$(cat)
     echo "STDIN: $stdin" >>"$FAKE_DIR/mysql.log"
+fi
+if [[ -e "$FAKE_DIR/stale_cnf" && "$1" != --no-defaults && "$1" != --defaults-file=* ]]; then
+    echo "ERROR 1045 (28000): Access denied for user 'root'@'localhost' (using password: YES)" >&2
+    exit 1
 fi
 case "$* $stdin" in
     *"SELECT VERSION()"*) cat "$FAKE_DIR/version" 2>/dev/null; exit 0 ;;
@@ -224,6 +234,73 @@ echo 8.0.46 >"$D/fake/version"
 run
 eq "a server that never answers stops the install" "1" "$RC"
 has "says it did not answer" "mysqld did not answer within 2 seconds" "$(out)"
+
+# Code review blocker (AB-2339 CR): mysqld must never be left running with
+# root's empty password, on any way out of the install.
+stopped() { grep -qxF "disable --now mysqld" "$D/fake/systemctl.log" 2>/dev/null; }
+altered() { grep -q "^STDIN: ALTER USER 'root'@'localhost'" "$D/fake/mysql.log" 2>/dev/null; }
+
+child mysqlstale "$STUBS
+DATABASE_ENGINE=mysql8.4
+install_mysql_engine
+echo \"DONE skip=\$SKIP_DATABASE\""
+echo 8.4.3 >"$D/fake/version"; touch "$D/fake/ping" "$D/fake/stale_cnf"
+printf '[client]\nuser=root\npassword="stale"\n' >"$D/my.cnf"
+run
+eq "stale my.cnf: the install goes on" "0" "$RC"
+has "stale my.cnf: finished" "DONE skip=1" "$(out)"
+altered && ok "stale my.cnf: root gets its password" || nok "stale my.cnf: root gets its password" "$(cat "$D/fake/mysql.log")"
+has "stale my.cnf: the password is set with --no-defaults" "ARGS: --no-defaults -uroot -NB" "$(cat "$D/fake/mysql.log")"
+has "stale my.cnf: the ping skips it" "--no-defaults -uroot --connect-timeout=5 ping" "$(cat "$D/fake/mysqladmin.log")"
+pw=$(sed -n 's/^password="\([0-9a-f]*\)"$/\1/p' "$D/my.cnf")
+eq "stale my.cnf: replaced by the new login" "48" "${#pw}"
+ls "$D"/my.cnf.bak-* >/dev/null 2>&1 && ok "stale my.cnf: the old file is kept" || nok "stale my.cnf: the old file is kept"
+grep -q 'password="stale"' "$D"/my.cnf.bak-* 2>/dev/null && ok "stale my.cnf: the copy holds the old login" || nok "stale my.cnf: the copy holds the old login"
+stopped && nok "stale my.cnf: mysqld keeps running" || ok "stale my.cnf: mysqld keeps running"
+
+mysql_install mysql8.4 8.0.46
+stopped && nok "wrong version: mysqld with root's password is not stopped" || ok "wrong version: mysqld with root's password is not stopped"
+altered && ok "wrong version: root got its password before the check" || nok "wrong version: root got its password before the check"
+pw=$(sed -n 's/^password="\([0-9a-f]*\)"$/\1/p' "$D/my.cnf")
+eq "wrong version: the login is in my.cnf" "48" "${#pw}"
+
+at mysqlalter
+stopped && ok "ALTER USER fails: mysqld is stopped and disabled" || nok "ALTER USER fails: mysqld is stopped and disabled" "$(cat "$D/fake/systemctl.log")"
+has "ALTER USER fails: says so" "mysqld was stopped and disabled" "$(out)"
+ls "$D"/my.cnf.new.* >/dev/null 2>&1 && nok "ALTER USER fails: no new login file is left" || ok "ALTER USER fails: no new login file is left"
+
+at mysqlnoping
+stopped && ok "no answer: mysqld is stopped and disabled" || nok "no answer: mysqld is stopped and disabled" "$(cat "$D/fake/systemctl.log" 2>/dev/null)"
+
+child mysqlbackup "$STUBS
+DATABASE_ENGINE=mysql8.0
+cp() { return 1; }
+install_mysql_engine
+echo DONE"
+echo 8.0.46 >"$D/fake/version"; touch "$D/fake/ping"
+printf '[client]\nuser=root\npassword="old"\n' >"$D/my.cnf"
+run
+eq "old my.cnf cannot be backed up: the install stops" "1" "$RC"
+has "old my.cnf cannot be backed up: says so" "could not be backed up" "$(out)"
+altered && nok "old my.cnf cannot be backed up: root's password is not changed" || ok "old my.cnf cannot be backed up: root's password is not changed"
+grep -q 'password="old"' "$D/my.cnf" && ok "old my.cnf cannot be backed up: it is left as it was" || nok "old my.cnf cannot be backed up: it is left as it was"
+stopped && ok "old my.cnf cannot be backed up: mysqld is stopped" || nok "old my.cnf cannot be backed up: mysqld is stopped"
+
+# Any other way out (a signal, set -e) goes through the EXIT trap.
+child mysqlexit "$STUBS
+trap report_on_exit EXIT
+REPORT_MODE=off
+MYSQL_READY_WAIT_SECONDS=5
+DATABASE_ENGINE=mysql8.0
+sleep() { exit 130; }
+install_mysql_engine
+echo DONE"
+run
+hasnt "cut off while waiting: did not finish" "DONE" "$(out)"
+stopped && ok "cut off while waiting: the EXIT trap stops mysqld" || nok "cut off while waiting: the EXIT trap stops mysqld" "$(cat "$D/fake/systemctl.log" 2>/dev/null)"
+
+mysql_install mysql8.0 8.0.46
+has "8.0: the mysql module is reset" "-y -q module reset mysql" "$(cat "$D/fake/dnf.log")"
 
 # ---------------------------------------------------------------------------
 echo "# Stage 3 with MySQL"

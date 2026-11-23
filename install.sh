@@ -838,6 +838,8 @@ report_on_exit() {
     local rc=$?
     trap '' PIPE INT TERM HUP
     set +e
+    # AB-2339: never leave a new mysqld with root's empty password behind.
+    mysql_engine_close_open_root 2>&1
     if ((INSTALL_MARKER_CREATED)); then rm -f "$REPORT_MARKER"; fi
     # A failed install with --force-existing-server: the backup path again,
     # since the install never reaches the summary that names it.
@@ -3367,14 +3369,21 @@ install_pinned_extra_packages() {
 # install. The steps after it skip MariaDB (SKIP_DATABASE). A failure stops
 # the install: the panel cannot run without its database server.
 MYSQL_READY_WAIT_SECONDS=60
+# Set from the start of mysqld until root has its password: the package
+# initialises root with none, so a mysqld left running then lets any local
+# user sign in as root. Every way out of the install in that window stops
+# mysqld (mysql_engine_failed, and report_on_exit for the others).
+MYSQL_ROOT_OPEN=0
 install_mysql_engine() {
-    local version="${DATABASE_ENGINE#mysql}" password waited=0 running
+    local version="${DATABASE_ENGINE#mysql}" password waited=0 running login
     # Reported under the database server's step id (mariadb): the install
     # report knows a fixed set of steps (AB-2067).
     report_step_start mariadb
     print_info "MySQL ${version} (--database=${DATABASE_ENGINE})"
+    # Both versions: a stream an earlier --database=mysql8.4 run enabled
+    # would otherwise give 8.0's install the 8.4 server.
+    dnf -y -q module reset mysql >/dev/null 2>&1 || true
     if [[ "$version" == "8.4" ]]; then
-        dnf -y -q module reset mysql >/dev/null 2>&1 || true
         if ! dnf -y -q module enable mysql:8.4; then
             mysql_engine_failed "the mysql:8.4 module stream could not be enabled"
         fi
@@ -3382,34 +3391,50 @@ install_mysql_engine() {
     if ! dnf -y install mysql-server; then
         mysql_engine_failed "mysql-server could not be installed"
     fi
+    MYSQL_ROOT_OPEN=1
     if ! systemctl enable --now mysqld; then
         mysql_engine_failed "mysqld could not be started"
     fi
-    until mysqladmin --connect-timeout=5 ping >/dev/null 2>&1; do
+    # --no-defaults until root has its password: a [client] password left in
+    # ROOT_MY_CNF by an earlier setup is not the new server's, and with it
+    # the client is refused (mysqladmin ping still exits 0 then).
+    until mysqladmin --no-defaults -uroot --connect-timeout=5 ping >/dev/null 2>&1; do
         ((waited >= MYSQL_READY_WAIT_SECONDS)) && mysql_engine_failed "mysqld did not answer within ${MYSQL_READY_WAIT_SECONDS} seconds"
         sleep 1
         waited=$((waited + 1))
     done
-    running=$(mysql -NBe 'SELECT VERSION();' 2>/dev/null) || running=""
-    if [[ "$running" != "${version}."* ]]; then
-        mysql_engine_failed "the server reports version '${running:-none}', not MySQL ${version}"
-    fi
     # Hex only: nothing in it needs quoting in SQL or in an option file.
     password=$(od -An -N24 -tx1 /dev/urandom 2>/dev/null | tr -d ' \n')
     [[ "$password" =~ ^[0-9a-f]{48}$ ]] || mysql_engine_failed "no random password could be made"
+    # The new login is on disk (0600, next to ROOT_MY_CNF) and the old file
+    # is kept before root's password changes, so the password is never only
+    # on the server.
+    if [[ -e "$ROOT_MY_CNF" ]] && ! cp -p "$ROOT_MY_CNF" "${ROOT_MY_CNF}.bak-$(date -u '+%Y%m%dT%H%M%SZ')"; then
+        mysql_engine_failed "the existing ${ROOT_MY_CNF} could not be backed up"
+    fi
+    if ! login=$(umask 077 && mktemp "${ROOT_MY_CNF}.new.XXXXXX"); then
+        mysql_engine_failed "no file for root's new login could be made next to ${ROOT_MY_CNF}"
+    fi
+    if ! printf '[client]\nuser=root\npassword="%s"\n' "$password" >"$login"; then
+        rm -f "$login"
+        mysql_engine_failed "root's new login could not be written"
+    fi
     # The statement goes in on stdin from the printf builtin: on the mysql
     # command line the new password would show in ps and /proc to every user
     # while the client runs.
-    if ! printf "ALTER USER 'root'@'localhost' IDENTIFIED BY '%s';\n" "$password" | mysql -NB >/dev/null 2>&1; then
+    if ! printf "ALTER USER 'root'@'localhost' IDENTIFIED BY '%s';\n" "$password" | mysql --no-defaults -uroot -NB >/dev/null 2>&1; then
+        rm -f "$login"
         mysql_engine_failed "root's password could not be set"
     fi
-    if [[ -e "$ROOT_MY_CNF" ]]; then
-        cp -p "$ROOT_MY_CNF" "${ROOT_MY_CNF}.bak-$(date -u '+%Y%m%dT%H%M%SZ')" 2>/dev/null || true
-    fi
-    if ! (umask 077 && printf '[client]\nuser=root\npassword="%s"\n' "$password" >"$ROOT_MY_CNF"); then
-        mysql_engine_failed "${ROOT_MY_CNF} could not be written"
+    MYSQL_ROOT_OPEN=0
+    if ! mv -f "$login" "$ROOT_MY_CNF"; then
+        mysql_engine_failed "root's new login could not be moved to ${ROOT_MY_CNF}; it is in ${login}"
     fi
     chmod 600 "$ROOT_MY_CNF" 2>/dev/null || true
+    running=$(mysql --defaults-file="$ROOT_MY_CNF" -NBe 'SELECT VERSION();' 2>/dev/null) || running=""
+    if [[ "$running" != "${version}."* ]]; then
+        mysql_engine_failed "the server reports version '${running:-none}', not MySQL ${version}"
+    fi
     SKIP_DATABASE=1
     DATABASE_SKIP_REASON="MySQL ${version} installed by --database=${DATABASE_ENGINE}"
     report_step_result mariadb ok
@@ -3418,8 +3443,20 @@ install_mysql_engine() {
 
 mysql_engine_failed() {
     print_error "MySQL ${DATABASE_ENGINE#mysql} was not installed: $1."
+    mysql_engine_close_open_root
     report_fail mariadb package_install_failed
     exit 1
+}
+
+# Stops and disables mysqld while root still has no password (MYSQL_ROOT_OPEN).
+mysql_engine_close_open_root() {
+    ((MYSQL_ROOT_OPEN)) || return 0
+    MYSQL_ROOT_OPEN=0
+    if systemctl disable --now mysqld >/dev/null 2>&1; then
+        print_error "mysqld was stopped and disabled: its root account had no password yet. Remove the mysql-server package before you run the installer again."
+    else
+        print_error "mysqld could not be stopped and its root account has no password: run 'systemctl disable --now mysqld' now."
+    fi
 }
 
 # Prints why the box counts as having a database server; fails when it has
