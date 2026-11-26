@@ -517,7 +517,7 @@ eq "--source, mirror reachable, bolt-agent install fails: agent_install agent_in
 # The probe reads the addresses from the repository file it just wrote.
 expected=$(sed -n 's/^baseurl = //p' "$CHILD_DIR/etc/yum.repos.d/bolt.repo" | sed -e 's/\$releasever/9/' -e "s/\\\$basearch/$(uname -m)/" -e 's#$#/repodata/repomd.xml#')
 eq "--source, mirror reachable: probes exactly the baseurls of the written bolt.repo" "$expected" "$(cat "$CHILD_DIR/fake/repomd.log")"
-eq "--source: two repositories in the file" 2 "$(printf '%s\n' "$expected" | grep -c 'pulp/content/stable/rhel/9/.*/repodata/repomd.xml')"
+eq "--source=stable: two repositories in the file, both under the production tree adminbolt/ (AB-2614)" 2 "$(printf '%s\n' "$expected" | grep -c 'pulp/content/adminbolt/rhel/9/.*/repodata/repomd.xml')"
 src_child src_notel 7 'report_step_start agent_install
 report_fail agent_install agent_install_failed
 exit 1' 'REPORT_NO_TELEMETRY=1'
