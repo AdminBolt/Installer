@@ -125,7 +125,18 @@ readonly CPANEL_OWNED_STEPS=(
     "postfix_profiles cpanel-exim"
     "dovecot cpanel-dovecot"
     "dovecot_profiles cpanel-dovecot"
+    "system_email cpanel-exim"
 )
+# AB-2618: the steps among them that cannot install while cPanel's package is
+# there (dnf refuses them with rpm conflicts or "obsoletes"); in a conversion
+# they are not run at all (skip_cpanel_owned_step). Dovecot profiles is among
+# them too (AB-2723): it does not fail, it replaces /etc/dovecot/dovecot.conf
+# with AdminBolt's and restarts dovecot, and cPanel's own Dovecot then stops
+# serving mail until the cutover. The conversion applies it at the cutover.
+# System email follows it: its accounts are mailboxes of AdminBolt's mail
+# database, which the Dovecot profiles create, and opening the database
+# before them leaves an empty file the profiles then keep.
+readonly CPANEL_SKIPPED_STEPS=(powerdns postfix postfix_profiles dovecot dovecot_profiles system_email)
 # Steps left to the conversion, "<step>: <why>", listed in the closing summary.
 CONVERSION_STEPS=()
 # Outcome of the last run_or_warn: ok, failed, deferred or conversion.
@@ -2305,6 +2316,7 @@ run_or_warn() {
     STEP_REPOSITORY=""
     LAST_STEP_RESULT=skipped
     skip_left_out_step "$step" "$desc" "$cmd" && return 0
+    skip_cpanel_owned_step "$step" "$desc" && return 0
     print_info "$desc"
     report_step_start "$step"
     out=$(mktemp)
@@ -2470,6 +2482,27 @@ cpanel_owner_of_step() {
         return 0
     done
     return 1
+}
+
+# AB-2618: in a cPanel conversion a step of CPANEL_SKIPPED_STEPS whose
+# service cPanel's own package still owns (cpanel_owner_of_step) is not run
+# at all: dnf could only fail on it with a long list of rpm conflicts, which
+# looked like a broken install on a live server. One line says it is installed at the cutover, where
+# bolt-migrate installs it once cPanel is stopped; the step is reported as
+# left to the cutover (AB-2447), never as failed. Any other step runs, and a
+# failure of it stays a failure. bolt-migrate looks for this function to
+# know the installer no longer prints those failures.
+skip_cpanel_owned_step() {
+    local step="$1" desc="$2" owner skipped=0 s
+    for s in "${CPANEL_SKIPPED_STEPS[@]}"; do [[ "$s" == "$step" ]] && skipped=1; done
+    ((skipped)) || return 1
+    owner=$(cpanel_owner_of_step "$step") || return 1
+    echo -e "${CYAN}CONVERSION:${NC} ${desc}: cPanel's ${owner} owns it now, installed at the cutover"
+    report_step_cutover "$step"
+    CONVERSION_STEPS+=("${desc}: cPanel's ${owner} still owns it, installed at the cutover")
+    LAST_STEP_RESULT=conversion
+    echo -e ""
+    return 0
 }
 
 # Closing summary of every failed step, whatever the outcome (AB-1379).

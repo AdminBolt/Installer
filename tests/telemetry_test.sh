@@ -1463,7 +1463,7 @@ convert_child conv_flag 'CPANEL_CONVERSION=1; CPANEL_BINARY="$PWD/cpanel"; REPOR
 st=$(event install_started); fin=$(event install_finished)
 eq "conversion (--channel=convert): channel convert" convert "$(field "$st" .channel)"
 eq "conversion: succeeded, no failed step, no reason, exit 0" "succeeded   0" "$(field "$fin" .result) $(field "$fin" .failed_step) $(field "$fin" .reason) $(field "$fin" .exit_code)"
-eq "conversion: the steps cPanel owns are cutover_steps" powerdns,postfix,dovecot,postfix_profiles "$(field "$fin" .cutover_steps)"
+eq "conversion: the steps cPanel owns are cutover_steps" powerdns,postfix,dovecot,postfix_profiles,dovecot_profiles "$(field "$fin" .cutover_steps)"
 eq "conversion: no failed optional step" "" "$(field "$fin" .failed_optional_steps)"
 eq "conversion: no failed required step (readiness included)" "" "$(field "$fin" .failed_required_steps)"
 eq "conversion: stages ok, readiness ok" "prerequisites:ok packages:ok configuration:ok readiness:ok" "$(spool_events | jq -r 'select(.type=="stage_finished") | "\(.stage):\(.result)"' | tr '\n' ' ' | sed 's/ $//')"
@@ -1473,7 +1473,7 @@ eq "readiness asks bolt-agent, bolt-nginx, bolt-php and the database, not Postfi
 convert_child conv_nginx 'CPANEL_CONVERSION=1; CPANEL_BINARY="$PWD/cpanel"; REPORT_CHANNEL_ARG=convert; REPORT_CHANNEL_GIVEN=1' "" bolt-nginx
 fin=$(event install_finished)
 eq "conversion, bolt-nginx down: readiness failed" "failed readiness readiness_check_failed" "$(field "$fin" .result) $(field "$fin" .failed_step) $(field "$fin" .reason)"
-eq "conversion, bolt-nginx down: cutover steps still listed apart" powerdns,postfix,dovecot,postfix_profiles "$(field "$fin" .cutover_steps)"
+eq "conversion, bolt-nginx down: cutover steps still listed apart" powerdns,postfix,dovecot,postfix_profiles,dovecot_profiles "$(field "$fin" .cutover_steps)"
 eq "conversion, bolt-nginx down: channel convert" convert "$(field "$(event install_started)" .channel)"
 
 convert_child conv_panel_down 'CPANEL_CONVERSION=1; CPANEL_BINARY="$PWD/cpanel"; REPORT_CHANNEL_ARG=convert; REPORT_CHANNEL_GIVEN=1; echo 000 >"$FAKE_DIR/panel_code"'
@@ -1497,7 +1497,7 @@ eq "conversion, Redis fails as well: only Redis is a failed required step" redis
 # bolt-migrate passes): reported as convert unless the caller names a channel.
 convert_child conv_skip 'SKIP_APACHE=1; CPANEL_BINARY="$PWD/cpanel"'
 eq "cPanel + --skip-apache, no --channel: channel convert" convert "$(field "$(event install_started)" .channel)"
-eq "cPanel + --skip-apache: cutover steps, succeeded" "succeeded powerdns,postfix,dovecot,postfix_profiles" "$(field "$(event install_finished)" .result) $(field "$(event install_finished)" .cutover_steps)"
+eq "cPanel + --skip-apache: cutover steps, succeeded" "succeeded powerdns,postfix,dovecot,postfix_profiles,dovecot_profiles" "$(field "$(event install_finished)" .result) $(field "$(event install_finished)" .cutover_steps)"
 convert_child conv_named 'SKIP_APACHE=1; CPANEL_BINARY="$PWD/cpanel"; REPORT_CHANNEL_ARG=test; REPORT_CHANNEL_GIVEN=1'
 eq "a conversion keeps a channel the caller names" test "$(field "$(event install_started)" .channel)"
 convert_child conv_typo 'SKIP_APACHE=1; CPANEL_BINARY="$PWD/cpanel"; REPORT_CHANNEL_ARG=tset; REPORT_CHANNEL_GIVEN=1'
@@ -1513,11 +1513,14 @@ fin=$(event install_finished)
 eq "only PowerDNS and Postfix left to the cutover: Dovecot still checked" "is-active bolt-agent bolt-nginx bolt-php dovecot mariadb mysqld mysql" "$(grep '^is-active' "$CHILD_DIR/fake/systemctl.log")"
 eq "only PowerDNS and Postfix left to the cutover, Dovecot down: readiness failed" "failed readiness readiness_check_failed" "$(field "$fin" .result) $(field "$fin" .failed_step) $(field "$fin" .reason)"
 eq "only PowerDNS and Postfix left to the cutover: cutover_steps without Dovecot" powerdns,postfix,postfix_profiles "$(field "$fin" .cutover_steps)"
-# A profile step left to the cutover does not take its service out of the check.
+# AB-2618: while cpanel-exim is there, Postfix and its profiles are not run
+# at all (they used to be run and fail first), even where the install of
+# Postfix would go through: both are left to the cutover, and Postfix is
+# not in the readiness check.
 convert_child conv_prof 'CPANEL_CONVERSION=1; CPANEL_BINARY="$PWD/cpanel"; REPORT_CHANNEL_ARG=convert; REPORT_CHANNEL_GIVEN=1; POSTFIX_CMD=true'
 fin=$(event install_finished)
-eq "Postfix installed, its profiles left to the cutover: Postfix still checked" "is-active bolt-agent bolt-nginx bolt-php postfix mariadb mysqld mysql" "$(grep '^is-active' "$CHILD_DIR/fake/systemctl.log")"
-eq "Postfix installed but down, its profiles left to the cutover: readiness failed" "failed readiness powerdns,dovecot,postfix_profiles" "$(field "$fin" .result) $(field "$fin" .failed_step) $(field "$fin" .cutover_steps)"
+eq "cpanel-exim owns Postfix: Postfix not checked" "is-active bolt-agent bolt-nginx bolt-php mariadb mysqld mysql" "$(grep '^is-active' "$CHILD_DIR/fake/systemctl.log")"
+eq "cpanel-exim owns Postfix: Postfix and its profiles left to the cutover, succeeded" "succeeded  powerdns,postfix,dovecot,postfix_profiles,dovecot_profiles" "$(field "$fin" .result) $(field "$fin" .failed_step) $(field "$fin" .cutover_steps)"
 
 # No cPanel package, or no conversion: a failure stays a failure (AB-1379),
 # and the field is not sent.
