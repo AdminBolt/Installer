@@ -128,9 +128,11 @@ readonly CPANEL_OWNED_STEPS=(
 )
 # AB-2618: the steps among them that cannot install while cPanel's package is
 # there (dnf refuses them with rpm conflicts or "obsoletes"); in a conversion
-# they are not run at all (skip_cpanel_owned_step). Dovecot profiles is not
-# among them: it applies on a live cPanel server, as before.
-readonly CPANEL_SKIPPED_STEPS=(powerdns postfix postfix_profiles dovecot)
+# they are not run at all (skip_cpanel_owned_step). Dovecot profiles is among
+# them too (AB-2723): it does not fail, it replaces /etc/dovecot/dovecot.conf
+# with AdminBolt's and restarts dovecot, and cPanel's own Dovecot then stops
+# serving mail until the cutover. The conversion applies it at the cutover.
+readonly CPANEL_SKIPPED_STEPS=(powerdns postfix postfix_profiles dovecot dovecot_profiles)
 # Steps left to the conversion, "<step>: <why>", listed in the closing summary.
 CONVERSION_STEPS=()
 # Outcome of the last run_or_warn: ok, failed, deferred or conversion.
