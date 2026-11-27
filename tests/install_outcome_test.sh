@@ -290,23 +290,24 @@ has "PowerDNS in one line" "CONVERSION: PowerDNS: cPanel's cpanel-pdns owns it n
 has "Dovecot in one line" "CONVERSION: Dovecot: cPanel's cpanel-dovecot owns it now, installed at the cutover" "$out"
 has "Postfix profiles in one line" "CONVERSION: Postfix profiles: cPanel's cpanel-exim owns it now, installed at the cutover" "$out"
 has "Dovecot profiles in one line" "CONVERSION: Dovecot profiles: cPanel's cpanel-dovecot owns it now, installed at the cutover" "$out"
+has "System email in one line" "CONVERSION: System email: cPanel's cpanel-exim owns it now, installed at the cutover" "$out"
 hasnt "no rpm conflict line" "conflicts with" "$out"
 hasnt "no obsoletes line" "obsoletes postfix" "$out"
 hasnt "no failure line" "failed (continuing)" "$out"
 log=$(cat "$d/bolt-cli.log")
-for c in manage-powerdns manage-postfix manage-dovecot manage-postfix-profiles manage-dovecot-profiles; do
+for c in manage-powerdns manage-postfix manage-dovecot manage-postfix-profiles manage-dovecot-profiles manage-system-email-account; do
     hasnt "$c is not run" "$c --action=install" "$log"
 done
 has "Redis still runs" "manage-redis --action=install" "$log"
-has "the summary names the section" "Left to the conversion: cPanel still owns them (5)" "$out"
+has "the summary names the section" "Left to the conversion: cPanel still owns them (6)" "$out"
 has "the install completes" "Installation Completed: mail and DNS follow at cutover" "$out"
 hasnt "nothing is critical" "CRITICAL" "$out"
 hasnt "nothing is listed as failed" "Failed steps" "$out"
 has "exit status 0" "CRITICAL_FAILED=0" "$vars"
 has "no failed step" "FAILED=0" "$vars"
-has "five steps left to the conversion" "CONVERSION=5" "$vars"
+has "six steps left to the conversion" "CONVERSION=6" "$vars"
 # AB-2447: reported as left to the cutover, not as failed optional steps.
-has "reported as left to the cutover" "REPORT_CUTOVER_STEPS=powerdns postfix dovecot postfix_profiles dovecot_profiles" "$vars"
+has "reported as left to the cutover" "REPORT_CUTOVER_STEPS=powerdns postfix dovecot postfix_profiles dovecot_profiles system_email" "$vars"
 has "not reported as optional failures" "REPORT_FAILED_OPTIONAL=" "$(grep '^REPORT_FAILED_OPTIONAL=' <<<"$vars")"
 hasnt "no step left to the cutover among the optional failures" "postfix" "$(grep '^REPORT_FAILED_OPTIONAL=' <<<"$vars")"
 has "the Stage 3 line says it completed" "Stage 3 completed: all post-install actions done" "$out"

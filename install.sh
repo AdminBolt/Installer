@@ -125,6 +125,7 @@ readonly CPANEL_OWNED_STEPS=(
     "postfix_profiles cpanel-exim"
     "dovecot cpanel-dovecot"
     "dovecot_profiles cpanel-dovecot"
+    "system_email cpanel-exim"
 )
 # AB-2618: the steps among them that cannot install while cPanel's package is
 # there (dnf refuses them with rpm conflicts or "obsoletes"); in a conversion
@@ -132,7 +133,10 @@ readonly CPANEL_OWNED_STEPS=(
 # them too (AB-2723): it does not fail, it replaces /etc/dovecot/dovecot.conf
 # with AdminBolt's and restarts dovecot, and cPanel's own Dovecot then stops
 # serving mail until the cutover. The conversion applies it at the cutover.
-readonly CPANEL_SKIPPED_STEPS=(powerdns postfix postfix_profiles dovecot dovecot_profiles)
+# System email follows it: its accounts are mailboxes of AdminBolt's mail
+# database, which the Dovecot profiles create, and opening the database
+# before them leaves an empty file the profiles then keep.
+readonly CPANEL_SKIPPED_STEPS=(powerdns postfix postfix_profiles dovecot dovecot_profiles system_email)
 # Steps left to the conversion, "<step>: <why>", listed in the closing summary.
 CONVERSION_STEPS=()
 # Outcome of the last run_or_warn: ok, failed, deferred or conversion.
