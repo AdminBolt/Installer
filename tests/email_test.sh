@@ -88,6 +88,17 @@ refused 'tab' $'a\tb@example.com'
 refused 'newline' $'a@example.com\ntouch pwned'
 refused 'control character' $'a\x01b@example.com'
 refused 'second @' 'a@b@example.com'
+# AB-2785: an empty address and --email without "=" are refused the same way.
+refused 'empty --email=' ''
+child bare_email '' 'stage_prerequisites() { echo REACHED-STAGE1; exit 0; }
+main --no-telemetry --email a@example.com'
+eq "--email without \"=\": refused, exit 1, install not started" "1 yes no" \
+    "$RC $(grep -q 'Invalid --email' "$D/out" && echo yes || echo no) $(grep -q REACHED-STAGE1 "$D/out" && echo yes || echo no)"
+check "--email without \"=\": no install marker" test ! -e "$D/install-marker"
+child no_email '' 'stage_prerequisites() { echo REACHED-STAGE1; exit 0; }
+main --no-telemetry'
+eq "no --email at all: install goes on, no refusal" "0 no yes" \
+    "$RC $(grep -q 'Invalid --email' "$D/out" && echo yes || echo no) $(grep -q REACHED-STAGE1 "$D/out" && echo yes || echo no)"
 parse shown $'x$(id)\e[31m@a.b'
 check "refusal says what is not allowed" grep -qF 'expected name@domain.tld; no spaces, ", $, `, ; or control characters' "$D/out"
 check "refusal shows the value with control characters as '?'" grep -qF 'Invalid --email=x$(id)?[31m@a.b ' "$D/out"

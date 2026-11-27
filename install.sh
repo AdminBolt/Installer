@@ -278,7 +278,10 @@ REPORT_REPO_UNREACHABLE=0
 INSTALL_MARKER_CREATED=0
 
 # convert: bolt-migrate's in-place conversion of a cPanel server (AB-2447).
-REPORT_CHANNELS="direct get-script web-installer vultr akamai node image-build test hostinger digitalocean aws azure convert"
+# ai-assistant: the one-line install an AI assistant runs for the user, as the
+# public MCP tool install_adminbolt of the AI hub hands it out (AB-2785); the
+# install events receiver accepts the same list.
+REPORT_CHANNELS="direct get-script web-installer vultr akamai node image-build test hostinger digitalocean aws azure convert ai-assistant"
 REPORT_REASONS="not_root unsupported_os invalid_argument missing_command port_in_use existing_server repo_download_failed package_install_failed agent_install_failed panel_scriptlet_failed agent_panel_connect_failed required_step_failed readiness_check_failed interrupted unclassified"
 
 # Prints the class of one install step id for the report: required (its failure
@@ -3510,7 +3513,7 @@ print_usage() {
     echo "--skip-apache runs no Apache step (manage-my-apache and its default profile); the web server is then the caller's to set up."
     echo "--cpanel-conversion is passed by bolt-migrate when it converts a live cPanel server in place (a cPanel server with --skip-apache is recognised by itself): PowerDNS, Postfix and Dovecot that cannot install because cPanel's cpanel-pdns, cpanel-exim or cpanel-dovecot still owns them are listed as left to the conversion, which installs them at the cutover, and do not fail the install. Without cPanel's package a failure stays a failure."
     echo "If --mariadb-version is not provided, MariaDB ${DEFAULT_MARIADB_SERIES} is installed (long-term series, supported until 2029); --mariadb-version=10.11 installs the previous long-term series (supported until 2028). A server that already has a database server keeps it as it is (see --skip-database)."
-    echo "If --email is provided, a 24h trial licence is requested for that address at the very end of the install (clicking the e-mailed confirmation link extends it to the full trial period); the install completes even if the request is refused."
+    echo "If --email is provided, a 24h trial licence is requested for that address at the very end of the install (clicking the e-mailed confirmation link extends it to the full trial period); the install completes even if the request is refused. An address that is not name@domain.tld, an empty --email= or --email without \"=\" stops the install before anything is installed."
     echo "Without --email the install proceeds unlicensed; activate on the panel's License page."
     echo "The installer is meant for a fresh server. It stops when it finds a web, mail, DNS or database server, a firewall with rules of its own, or files in /home or /var/www, and lists what the install would replace. --force-existing-server installs anyway, after backing up /etc, /var/spool/cron, /root/.my.cnf, /usr/bin/mlmmj-make-ml.sh and the files the install writes in /var/www/html to /root/adminbolt-preinstall-backup-<date>/. A cPanel server that bolt-migrate converts in place (--cpanel-conversion or --skip-apache, with cPanel installed) is not checked, and is backed up only with --force-existing-server."
     echo "--without leaves optional components out, for servers with little memory (comma-separated; everything is installed by default):"
@@ -3527,6 +3530,9 @@ print_usage() {
 
 main() {
     local AGENT_VERSION_GIVEN=0
+    # AB-2785: --email given at all, so an empty value is refused instead of
+    # installing without the trial that was asked for.
+    local EMAIL_GIVEN=0
     for arg in "$@"; do
         case "$arg" in
             -h|--help)
@@ -3541,6 +3547,13 @@ main() {
                 ;;
             --email=*)
                 ADMIN_EMAIL="${arg#--email=}"
+                EMAIL_GIVEN=1
+                ;;
+            --email)
+                # "--email a@b.c" would otherwise install without the trial
+                # without a word: the address goes after "--email=".
+                ADMIN_EMAIL=""
+                EMAIL_GIVEN=1
                 ;;
             --mariadb-version=*)
                 MARIADB_SERIES="${arg#--mariadb-version=}"
@@ -3650,8 +3663,14 @@ main() {
     # installed (AB-2211): $ and ` (valid by the RFC, but no real address
     # needs them), quotes, ;, any whitespace and control characters. The
     # address still only ever reaches bolt-cli as one argument.
+    # get.adminbolt.com (WebInstaller install-script.sh, AB-2785) recognises
+    # the refusal by this ERROR line at the start of a line and by the
+    # "AdminBolt Staged Install" header not printed yet: keep both in step.
+    # AB-2785: an empty value (--email=, or --email without "=") is refused
+    # the same way: the caller asked for a trial, and an unset variable in a
+    # script must not install without it.
     local email_re="^[A-Za-z0-9!#%&'*+/=?^_{|}~.-]+@[A-Za-z0-9-]+(\.[A-Za-z0-9-]+)+\$"
-    if [[ -n "$ADMIN_EMAIL" && ! "$ADMIN_EMAIL" =~ $email_re ]]; then
+    if ((EMAIL_GIVEN)) && [[ ! "$ADMIN_EMAIL" =~ $email_re ]]; then
         printf '%bERROR:%b Invalid --email=%s (expected name@domain.tld; no spaces, ", $, `, ; or control characters)\n' \
             "$RED" "$NC" "$(shown_arg "$ADMIN_EMAIL")" >&2
         print_usage
