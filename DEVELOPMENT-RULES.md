@@ -108,8 +108,8 @@ with their examples. What they mean for the installer:
 work without fails the install; a warning that is printed must also reach
 the final summary and the install report. The last line never says the
 install worked while a required step failed. Example (AB-2277, QA 2
-November, comment 38346): a rerun after a failed bolt-agent `%post`, with
-the disk still full, printed SUCCESS, cleared the rerun marker because an
+November, comment 38346): a rerun after a failed bolt-agent `%post` that
+hit a full disk again printed SUCCESS, cleared the rerun marker because an
 error line did not match, and exited 0 with the agent's setup incomplete.
 The marker is now cleared only on proof of the end state (dnf exit 0,
 `agent.conf` with its token and HTTPS on, the certificate files, a running
@@ -119,11 +119,14 @@ service), and anything less exits 1.
 conversion, by `--force-existing-server`, by a rerun and with `--source` of
 an older channel. A change to a default or to the order of steps lists
 these callers with what each got before (Panel section 21 has the
-examples). Example (AB-1379, QA 27 September, comment 32281): the new
-SELinux pre-check stopped in Stage 1 every server booted with `selinux=0`
-whose `/etc/selinux/config` said enforcing, a stock AlmaLinux 9.8 image
-that the installer on `main` installed with exit 0. The check now asks
-`semanage` whether the policy store can be used.
+examples). What each got before also covers a server setup that
+installed before. Example (AB-1379, QA 27 September, comment 32281): the
+new SELinux pre-check stopped in Stage 1 every server booted with
+`selinux=0` whose `/etc/selinux/config` said enforcing or permissive,
+among them a stock AlmaLinux 9.8 image, which the installer on `main`
+installed with exit 0. The check now asks `semanage` whether the policy
+store can be used and, where semanage is not installed yet (as on that
+stock image), looks for the store's `active` directory.
 
 **Root and links.** Where the installer works on a server in use (a
 conversion, `--force-existing-server`), it does not chown, chmod or write
@@ -140,11 +143,12 @@ which is why that work stays with bolt-agent.
 **Secrets on every exit.** A password the installer creates or receives goes
 to programs on stdin or into a root only file, never on a command line or
 into the install log, and is not left behind in a temporary file after a
-failed step. Example (AB-2339, code review 4 November, comment 38629): the
-new MySQL root password of `--database=mysql8.0|mysql8.4` was passed on
-the `mysql` command line, so it showed in the process list. Its fix, in
-review in Installer #33, sends the `ALTER USER` to `mysql` on stdin, and
-the test checks that the password is on no `mysql` command line.
+failed step. Example (AB-2339, code review 4 November, comment 38629, one
+of its smaller points): the new MySQL root password of the
+`--database=mysql8.0|mysql8.4` option (Installer #33, in review) was
+passed on the `mysql` command line, so it showed in the process list. Its
+fix, in the same pull request, sends the `ALTER USER` to `mysql` on stdin,
+and the test checks that the password is on no `mysql` command line.
 
 **Started by the old release, finished by the new one.** A rerun finds the
 state an older installer, or a stopped run, left. Section 1.
