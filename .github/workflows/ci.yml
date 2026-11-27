@@ -56,3 +56,13 @@ jobs:
           dnf -y -q install openssh-server >/dev/null
           ssh-keygen -A
           ADMINBOLT_SSH_KEY_TEST=1 bash tests/ssh_key_test.sh
+      - name: Optional components, --without= (AB-2113)
+        # diff for the printed command lists; the almalinux:9 image may lack it.
+        run: |
+          dnf -y -q install diffutils >/dev/null
+          bash tests/components_test.sh
+      - name: bolt.repo priorities (AB-1407)
+        # cmp and diff for the rewritten repository file.
+        run: |
+          dnf -y -q install diffutils >/dev/null
+          bash tests/repo_priority_test.sh

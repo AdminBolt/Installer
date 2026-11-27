@@ -29,7 +29,9 @@ to leave on the internet.
   next finds what the first one left, and handles it, or refuses with a
   sentence.
 - **Test each exit** you add or touch in `tests/`: make the step fail, and
-  check what is left running and what the exit says.
+  check what is left running and what the exit says. A new test file also
+  gets its own step in `.github/workflows/ci.yml`: CI runs only the files
+  named there, so a file that is not listed never runs.
 
 What the reviewer checks: for every new or changed step, what runs when it
 fails half way, and what the next run of the installer does then.
@@ -90,6 +92,13 @@ MariaDB, cl-MySQL under MySQL Governor).
 What the reviewer checks: every new command or option has its version on
 the oldest supported system, and the change was run on a minimal image.
 
+Example (AB-2109, QA 28 October): `--force-existing-server` ran `tar` for
+its backup in Stage 1, before Stage 2 installs the base packages, and the
+stock Hetzner AlmaLinux 9 and Rocky Linux 9 images have no tar, so the
+forced install stopped with "tar: command not found". The backup now
+installs tar and gzip first when they are missing
+(`_backup_install_archivers`).
+
 ## 4. The six kinds of return
 
 Sections 20 to 25 of `Panel/DEVELOPMENT-RULES.md` describe each in full,
@@ -137,7 +146,8 @@ word.
 - The pull request lists the failure paths with what the summary shows,
   the other callers (conversion, rerun, `--force-existing-server`) with
   before and after, and where each secret goes (section 4).
-- `tests/` covers the new behaviour, `shellcheck` passes, and the pull
+- `tests/` covers the new behaviour, a new test file has its step in
+  `.github/workflows/ci.yml` (section 1), `shellcheck` passes, and the pull
   request merges cleanly with `dev`.
 
 ## Known places that still break these rules
