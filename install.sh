@@ -3528,6 +3528,29 @@ print_usage() {
     echo "If --ssh-key is provided (a public key, or an https:// URL serving keys), the key is added to root's authorized_keys; SSH password login for root is turned off at the end only after a root sign-in with that key is seen (at a terminal the installer waits up to 10 minutes for one), otherwise it stays on."
 }
 
+# email_valid <address>: true when the panel's trial request takes the address
+# (bolt-cli request-trial-license checks it with PHP's FILTER_VALIDATE_EMAIL).
+# AB-2785, QA: the old check took addresses the panel refuses (a dot at the
+# start or end of the name, two dots in a row, a hyphen at the edge of a
+# domain part), so the whole install ran and no trial was created. The rule
+# is FILTER_VALIDATE_EMAIL's: a name of letters, digits and
+# ! # % & ' * + / = ? ^ _ { | } ~ - in dot-separated parts, at most 64
+# characters; a domain of parts made of letters and digits with hyphens only
+# inside, each at most 63 characters, the last one starting with a letter;
+# at most 254 characters in all. Refused on purpose although PHP takes them
+# (AB-2211): $ and ` (no real address needs them), quoted names and IP
+# literals. tests/email_cases.tsv lists the addresses all sides agree on.
+email_valid() {
+    local LC_ALL=C email="$1" name domain
+    local part='[A-Za-z0-9!#%&'"'"'*+/=?^_{|}~-]+'
+    local label='[A-Za-z0-9]+(-+[A-Za-z0-9]+)*'
+    local re="^${part}(\.${part})*@(${label}\.)+[A-Za-z][A-Za-z0-9]*(-+[A-Za-z0-9]+)*\$"
+    [[ "$email" =~ $re ]] || return 1
+    name="${email%@*}" domain="${email##*@}"
+    ((${#email} <= 254 && ${#name} <= 64)) || return 1
+    [[ ! "$domain" =~ [^.]{64} ]]
+}
+
 main() {
     local AGENT_VERSION_GIVEN=0
     # AB-2785: --email given at all, so an empty value is refused instead of
@@ -3657,21 +3680,18 @@ main() {
         exit 1
     fi
 
-    # Before the @: letters, digits and most other characters RFC 5322 allows
-    # in an address (! # % & ' * + / = ? ^ _ { | } ~ . -); after it: a domain
-    # of letters, digits, hyphens and dots. Refused before anything is
-    # installed (AB-2211): $ and ` (valid by the RFC, but no real address
-    # needs them), quotes, ;, any whitespace and control characters. The
-    # address still only ever reaches bolt-cli as one argument.
+    # The address is checked with email_valid (the panel's own rule for the
+    # trial request, AB-2785) before anything is installed, so the install
+    # never runs to its end only for the trial to be refused. It still only
+    # ever reaches bolt-cli as one argument.
     # get.adminbolt.com (WebInstaller install-script.sh, AB-2785) recognises
     # the refusal by this ERROR line at the start of a line and by the
     # "AdminBolt Staged Install" header not printed yet: keep both in step.
     # AB-2785: an empty value (--email=, or --email without "=") is refused
     # the same way: the caller asked for a trial, and an unset variable in a
     # script must not install without it.
-    local email_re="^[A-Za-z0-9!#%&'*+/=?^_{|}~.-]+@[A-Za-z0-9-]+(\.[A-Za-z0-9-]+)+\$"
-    if ((EMAIL_GIVEN)) && [[ ! "$ADMIN_EMAIL" =~ $email_re ]]; then
-        printf '%bERROR:%b Invalid --email=%s (expected name@domain.tld; no spaces, ", $, `, ; or control characters)\n' \
+    if ((EMAIL_GIVEN)) && ! email_valid "$ADMIN_EMAIL"; then
+        printf '%bERROR:%b Invalid --email=%s (expected name@domain.tld: no spaces, ", $, `, ; or control characters, no dot at the start or end of the name or two in a row, no hyphen at the start or end of a domain part)\n' \
             "$RED" "$NC" "$(shown_arg "$ADMIN_EMAIL")" >&2
         print_usage
         report_fail parse_arguments invalid_argument

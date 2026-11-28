@@ -1,0 +1,56 @@
+# AB-2785: e-mail addresses the panel's trial request (PHP FILTER_VALIDATE_EMAIL),
+# the installer's --email check and the AI hub's install_adminbolt must agree on.
+# <1 accepted | 0 refused><TAB><address>. Generated with PHP 8.4.22: php tests/email_cases.php > tests/email_cases.tsv
+# in AdminBolt/Installer (bolt-ai-hub keeps a copy in testdata/); do not edit by hand.
+1	jane@example.com
+1	jane.doe+trial@example.co.uk
+1	o'neil@example.com
+1	a!#%&*/=?^_{|}~-z@example.com
+1	a@example.c
+1	a@example.c0m
+1	a@ex-ample.co-m
+1	a@xn--p1ai.xn--p1ai
+1	jane@example.xn--p1ai
+1	a@sub-1.example.museum
+1	a@b.c
+1	UPPER@EXAMPLE.COM
+1	a--b@ex--ample.com
+1	a@e--x.com
+1	aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa@example.com
+0	aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa@example.com
+1	a@bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb.com
+0	a@bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb.com
+1	a@bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb.bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb.bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb.cccccccccccccccccccccccccccccccccccccccccccccccccccccccc.com
+0	a@bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb.bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb.bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb.ccccccccccccccccccccccccccccccccccccccccccccccccccccccccc.com
+0	.a@example.com
+0	a.@example.com
+0	a..b@example.com
+0	a@-example.com
+0	a@example-.com
+0	a@.example.com
+0	a@example..com
+0	a@example.com.
+0	a@example
+0	a@example.123
+0	a@1.2
+0	a@example.1com
+0	a@example.-com
+0	a@example.com-
+0	a@exa_mple.com
+0	a@ex ample.com
+0	a b@example.com
+0	a"b@example.com
+0	"a b"@example.com
+0	a;b@example.com
+0	a,b@example.com
+0	a(b)@example.com
+0	a@b@example.com
+0	a\b@example.com
+0	@example.com
+0	a@
+# php-accepts: valid for PHP, refused on purpose before the install ($, backtick, quoted names, IP literals)
+0	a$b@example.com
+0	a`b@example.com
+0	"ab"@example.com
+0	a@[127.0.0.1]
+0	a@[IPv6:::1]
