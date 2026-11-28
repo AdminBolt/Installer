@@ -88,8 +88,19 @@ refused 'tab' $'a\tb@example.com'
 refused 'newline' $'a@example.com\ntouch pwned'
 refused 'control character' $'a\x01b@example.com'
 refused 'second @' 'a@b@example.com'
+# AB-2785: an empty address and --email without "=" are refused the same way.
+refused 'empty --email=' ''
+child bare_email '' 'stage_prerequisites() { echo REACHED-STAGE1; exit 0; }
+main --no-telemetry --email a@example.com'
+eq "--email without \"=\": refused, exit 1, install not started" "1 yes no" \
+    "$RC $(grep -q 'Invalid --email' "$D/out" && echo yes || echo no) $(grep -q REACHED-STAGE1 "$D/out" && echo yes || echo no)"
+check "--email without \"=\": no install marker" test ! -e "$D/install-marker"
+child no_email '' 'stage_prerequisites() { echo REACHED-STAGE1; exit 0; }
+main --no-telemetry'
+eq "no --email at all: install goes on, no refusal" "0 no yes" \
+    "$RC $(grep -q 'Invalid --email' "$D/out" && echo yes || echo no) $(grep -q REACHED-STAGE1 "$D/out" && echo yes || echo no)"
 parse shown $'x$(id)\e[31m@a.b'
-check "refusal says what is not allowed" grep -qF 'expected name@domain.tld; no spaces, ", $, `, ; or control characters' "$D/out"
+check "refusal says what is not allowed" grep -qF 'expected name@domain.tld: no spaces, ", $, `, ; or control characters, no dot at the start or end of the name or two in a row, no hyphen at the start or end of a domain part' "$D/out"
 check "refusal shows the value with control characters as '?'" grep -qF 'Invalid --email=x$(id)?[31m@a.b ' "$D/out"
 
 accepted() { # $1 label, $2 address
@@ -100,6 +111,27 @@ accepted() { # $1 label, $2 address
 accepted 'plain address' 'first.last+tag@mail-1.example.co.uk'
 accepted 'apostrophe' "o'brien@example.com"
 accepted '& | and the other RFC characters' 'a!#%&*/=?^_{|}~-z@example.com'
+
+# ---------------------------------------------------------------------------
+echo "# AB-2785: the check agrees with the panel's trial request (FILTER_VALIDATE_EMAIL)"
+# ---------------------------------------------------------------------------
+# tests/email_cases.tsv: <1 accepted | 0 refused><TAB><address>, generated with
+# PHP's filter_var; the same table is in the AI hub's tests.
+CASES="$HERE/email_cases.tsv"
+check "the shared address table is there" test -s "$CASES"
+n=0
+while IFS=$'\t' read -r want addr; do
+    case "$want" in '#'*|'') continue ;; esac
+    n=$((n + 1))
+    child table "$addr" 'email_valid "$EMAIL" && echo VERDICT=1 || echo VERDICT=0'
+    eq "table: $(printf '%q' "$addr" | cut -c1-70)" "VERDICT=$want" "$(grep -o 'VERDICT=[01]' "$D/out")"
+done <"$CASES"
+check "the table has its cases" test "$n" -ge 40
+# Through the real main: an address the panel would refuse stops before Stage 1.
+for addr in '.a@example.com' 'a.@example.com' 'a..b@example.com' 'a@-example.com' 'a@example-.com' 'a@example.123'; do
+    refused "$addr (panel refuses)" "$addr"
+done
+accepted 'one-letter top-level domain (panel takes it)' 'a@example.c'
 
 # ---------------------------------------------------------------------------
 echo "# trial request: the address is one argument to bolt-cli, no eval"

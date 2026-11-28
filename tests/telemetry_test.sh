@@ -727,6 +727,10 @@ chan_child spacechannel "'--channel= direct'"
 eq "--channel with a space: one warning, direct, install goes on" "0 continued direct 1" "$CHAN_OUT"
 chan_child goodchannel '--channel=web-installer'
 eq "known --channel: no warning, kept" "0 continued web-installer 0" "$CHAN_OUT"
+# AB-2785: the channel of installs an AI assistant runs (get.adminbolt.com/install.sh
+# passes --channel=ai-assistant on).
+chan_child aichannel '--channel=ai-assistant'
+eq "--channel=ai-assistant: no warning, kept" "0 continued ai-assistant 0" "$CHAN_OUT"
 chan_child ctlchannel "\$'--channel=bo\\e[31mgus\\ttab\\\\n'"
 eq "--channel with control characters: one warning, direct, install goes on" "0 continued direct 1" "$CHAN_OUT"
 check "control characters shown as '?', backslash as typed" grep -qF 'unknown --channel=bo?[31mgus?tab\n,' "$CHILD_DIR/out"
@@ -1539,7 +1543,7 @@ eq "--channel=convert is known: no warning, reported as convert" "0 convert 0" "
 child conv_main_old "CPANEL_BINARY=\"\$PWD/cpanel\"; : >\"\$PWD/cpanel\"; stage_prerequisites() { echo REACHED-STAGE1; exit 0; }
 main --auto-upgrade=1 --skip-database --skip-apache"
 eq "a released bolt-migrate's arguments on cPanel: reported as convert" convert "$(field "$(event install_started)" .channel)"
-check "--help lists convert among the channels" grep -q 'azure, convert); default direct' <<<"$( { cat "$INSTALL_SH"; } | PATH="$FAKEPATH" "$BASH" -s -- --help 2>&1)"
+check "--help lists convert and ai-assistant among the channels" grep -q 'azure, convert, ai-assistant); default direct' <<<"$( { cat "$INSTALL_SH"; } | PATH="$FAKEPATH" "$BASH" -s -- --help 2>&1)"
 
 # ---------------------------------------------------------------------------
 echo "# every event of every run above against the KONTRAKT field rules"
@@ -1554,7 +1558,7 @@ def common: (keys - ["schema","install_id","event_id","type","sent_at"]) as $res
 common and (
   if .type == "install_started" then
     (keys | sort) == (["schema","install_id","event_id","type","sent_at","channel","platform","installer_rev","os_name","os_version","arch","requested_version","source","telemetry_notice"] | sort)
-    and (.channel | IN("direct","get-script","web-installer","vultr","akamai","node","image-build","test","hostinger","digitalocean","aws","azure","convert"))
+    and (.channel | IN("direct","get-script","web-installer","vultr","akamai","node","image-build","test","hostinger","digitalocean","aws","azure","convert","ai-assistant"))
     and (.platform | IN("hetzner","vultr","akamai","digitalocean","aws","azure","gcp","ovh","contabo","kvm","vmware","other","unknown"))
     and (.installer_rev | re("^[0-9a-f]{64}$")) and (.os_name | re("^[a-z0-9._-]{1,32}$")) and (.os_version | re("^[0-9A-Za-z._-]{1,16}$"))
     and (.arch | IN("x86_64","aarch64","other")) and (.requested_version | re("^[0-9A-Za-z.+~_-]{0,40}$"))
